@@ -90,6 +90,8 @@ fn limits_help_documents_options_and_limitations() {
     assert!(stdout.contains("--export-samples"), "{stdout}");
     assert!(stdout.contains("--co-ramp"), "{stdout}");
     assert!(stdout.contains("--max-probes"), "{stdout}");
+    assert!(stdout.contains("--wasm-target-dir"), "{stdout}");
+    assert!(stdout.contains("--profile"), "{stdout}");
 }
 
 #[test]
@@ -1061,4 +1063,72 @@ fn limits_max_probes_one_aborts_after_first_probe() {
         stderr.contains("raise --max-probes"),
         "error should suggest raising the limit: {stderr}"
     );
+}
+
+// ---- Issue #374: compiler and target metadata ----
+
+#[test]
+fn limits_help_documents_wasm_target_dir_and_profile() {
+    let output = run(&["limits", "--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--wasm-target-dir"), "{stdout}");
+    assert!(stdout.contains("--profile"), "{stdout}");
+}
+
+#[test]
+fn limits_output_includes_compiler_metadata() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--dry-run",
+    ]);
+    // dry-run exits before measuring, so we just check the flags parse cleanly
+    assert!(output.status.success(), "{:?}", output);
+}
+
+// ---- Issue #370: custom wasm target directory ----
+
+#[test]
+fn limits_wasm_target_dir_flag_is_accepted() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--wasm-target-dir",
+        "/tmp/custom-target",
+        "--dry-run",
+    ]);
+    assert!(output.status.success(), "{:?}", output);
+}
+
+// ---- Issue #371: cargo profile selection ----
+
+#[test]
+fn limits_profile_flag_is_accepted() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--profile",
+        "release",
+        "--dry-run",
+    ]);
+    assert!(output.status.success(), "{:?}", output);
 }

@@ -400,6 +400,15 @@ pub struct LimitsSummary {
     /// Additional parameters ramped in lockstep with the primary ramp.
     #[serde(skip_serializing_if = "vec_is_empty")]
     pub co_ramp: Vec<String>,
+    /// Compiler and WASM-target metadata captured at run time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compiler_meta: Option<CompilerMeta>,
+    /// Custom wasm target directory, when `--wasm-target-dir` was supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasm_target_dir: Option<String>,
+    /// Cargo profile used for the build, when `--profile` was supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 impl LimitsSummary {
@@ -473,6 +482,18 @@ impl LimitsSummary {
                  inspect the function and re-run to confirm\n",
             );
         }
+        if let Some(meta) = &self.compiler_meta {
+            out.push_str(&format!(
+                "  compiler: {} (target: {})\n",
+                meta.rustc_version, meta.wasm_target
+            ));
+        }
+        if let Some(dir) = &self.wasm_target_dir {
+            out.push_str(&format!("  wasm target dir: {dir}\n"));
+        }
+        if let Some(profile) = &self.profile {
+            out.push_str(&format!("  cargo profile: {profile}\n"));
+        }
         if self.hit_upper_bound {
             out.push_str(&format!(
                 "  note: search stopped at the built-in upper bound ({SEARCH_UPPER_BOUND}); the \
@@ -516,6 +537,136 @@ pub struct RefinementAudit {
     pub steps: Vec<RefinementStep>,
     pub final_success: u32,
     pub final_failure: u32,
+}
+
+/// Compiler and target metadata captured at the start of a `limits` run.
+///
+/// Recorded in [`LimitsSummary`] so results files carry the toolchain context
+/// they were produced with, making regression comparisons across compiler
+/// upgrades auditable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct CompilerMeta {
+    /// Output of `rustc --version` at run time.
+    pub rustc_version: String,
+    /// The WASM target triple used for Soroban contracts.
+    pub wasm_target: String,
+}
+
+/// Captures compiler and WASM-target metadata for the current toolchain.
+fn collect_compiler_meta() -> CompilerMeta {
+    let rustc_version = Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    CompilerMeta {
+        rustc_version,
+        wasm_target: "wasm32v1-none".to_string(),
+    }
+}
+
+/// A reusable comparison between a `limits` run and a saved baseline.
+///
+/// Extracted from the private `compare_to_baseline` so callers that need
+/// programmatic access to regression details (CI scripts, test helpers) do
+/// not have to parse human-readable output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaselineComparison {
+    pub ramp: String,
+    pub function: String,
+    pub baseline_best: u32,
+    pub current_best: u32,
+    pub baseline_instructions: u64,
+    pub current_instructions: u64,
+    pub baseline_memory_bytes: u64,
+    pub current_memory_bytes: u64,
+    pub tolerance_pct: f64,
+    regressions: Vec<String>,
+}
+
+impl BaselineComparison {
+    /// Compares `current_*` metrics against `baseline`, applying
+    /// `tolerance_pct` to instruction/memory growth.
+    ///
+    /// Returns an error only when the `function`/`ramp` combination does not
+    /// match the baseline (comparing across different call sites is not
+    /// meaningful).
+    pub fn new(
+        baseline: &Baseline,
+        ramp: &str,
+        function: &str,
+        best: u32,
+        instructions: u64,
+        memory_bytes: u64,
+        tolerance_pct: f64,
+    ) -> Result<Self, CliError> {
+        if baseline.function != function || baseline.ramp != ramp {
+            return Err(CliError(format!(
+                "baseline was recorded for {:?}/{:?}, not {function:?}/{ramp:?}; comparing \
+                 across different functions or ramp parameters isn't meaningful",
+                baseline.function, baseline.ramp
+            )));
+        }
+        let mut regressions = Vec::new();
+        if best < baseline.best {
+            regressions.push(format!(
+                "{ramp} ceiling dropped from {} to {best}",
+                baseline.best
+            ));
+        }
+        Self::check_metric(
+            "instructions",
+            baseline.instructions,
+            instructions,
+            tolerance_pct,
+            &mut regressions,
+        );
+        Self::check_metric(
+            "memory bytes",
+            baseline.memory_bytes,
+            memory_bytes,
+            tolerance_pct,
+            &mut regressions,
+        );
+        Ok(BaselineComparison {
+            ramp: ramp.to_string(),
+            function: function.to_string(),
+            baseline_best: baseline.best,
+            current_best: best,
+            baseline_instructions: baseline.instructions,
+            current_instructions: instructions,
+            baseline_memory_bytes: baseline.memory_bytes,
+            current_memory_bytes: memory_bytes,
+            tolerance_pct,
+            regressions,
+        })
+    }
+
+    /// Returns `true` if any metric regressed beyond tolerance.
+    pub fn has_regression(&self) -> bool {
+        !self.regressions.is_empty()
+    }
+
+    /// Human-readable regression descriptions, one per violated metric.
+    pub fn regressions(&self) -> &[String] {
+        &self.regressions
+    }
+
+    fn check_metric(name: &str, old: u64, new: u64, tolerance_pct: f64, out: &mut Vec<String>) {
+        if new <= old {
+            return;
+        }
+        let growth_pct = ((new - old) as f64 / old.max(1) as f64) * 100.0;
+        if growth_pct <= tolerance_pct {
+            return;
+        }
+        out.push(format!(
+            "{name} grew from {old} to {new} ({growth_pct:.1}%, over the {tolerance_pct:.1}% tolerance)"
+        ));
+    }
 }
 
 /// Arguments for `soroban-testkit limits`.
@@ -604,6 +755,17 @@ pub struct LimitsArgs {
     /// Set to 0 to disable the limit (the default).
     #[arg(long, value_name = "N", default_value_t = 0)]
     max_probes: usize,
+    /// Override the directory where Cargo places the compiled .wasm artifact.
+    /// Useful when the contract was built with a custom `--target-dir` or when
+    /// running limits against a pre-built artifact in a non-standard location.
+    #[arg(long, value_name = "PATH")]
+    wasm_target_dir: Option<std::path::PathBuf>,
+    /// Cargo profile used when building the contract (e.g. `release`, `dev`).
+    /// Recorded in the output so results files carry the build context they
+    /// were produced with. Does not trigger a rebuild; the .wasm at `--contract`
+    /// is used as-is.
+    #[arg(long, value_name = "PROFILE")]
+    profile: Option<String>,
 }
 
 /// Hidden: runs exactly one probe (a single ramp value) and reports its
@@ -623,6 +785,10 @@ pub struct ProbeArgs {
     arg_values: Vec<String>,
     #[arg(long = "co-ramp")]
     co_ramp: Vec<String>,
+    #[arg(long)]
+    wasm_target_dir: Option<std::path::PathBuf>,
+    #[arg(long)]
+    profile: Option<String>,
 }
 
 /// Empirically discovers a resource ceiling by invoking `--fn` with an
@@ -918,6 +1084,9 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         stopped_by,
         probe_samples: all_samples,
         co_ramp: args.co_ramp.clone(),
+        compiler_meta: Some(collect_compiler_meta()),
+        wasm_target_dir: args.wasm_target_dir.as_ref().map(|p| p.display().to_string()),
+        profile: args.profile.clone(),
     };
     print!("{}", summary.render_text());
 
@@ -986,6 +1155,16 @@ fn spawn_probe(
             args.co_ramp
                 .iter()
                 .flat_map(|name| ["--co-ramp", name.as_str()]),
+        )
+        .args(
+            args.wasm_target_dir
+                .iter()
+                .flat_map(|dir| ["--wasm-target-dir", dir.to_str().unwrap_or("")]),
+        )
+        .args(
+            args.profile
+                .iter()
+                .flat_map(|p| ["--profile", p.as_str()]),
         )
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -2765,6 +2944,12 @@ mod tests {
             preset: None,
             budget: None,
             arg_values: Vec::new(),
+            co_ramp: Vec::new(),
+            dry_run: false,
+            export_samples: None,
+            max_probes: 0,
+            wasm_target_dir: None,
+            profile: None,
         };
 
         let result = run(err_result);
@@ -2793,6 +2978,12 @@ mod tests {
             preset: None,
             budget: None,
             arg_values: Vec::new(),
+            co_ramp: Vec::new(),
+            dry_run: false,
+            export_samples: None,
+            max_probes: 0,
+            wasm_target_dir: None,
+            profile: None,
         }
     }
 
@@ -3538,12 +3729,15 @@ mod tests {
         assert_eq!(RampPreset::MultiMint.ramp(), "count");
     }
 
-    #[test]
-    fn resolve_preset_defaults_uses_explicit_fn_over_preset() {
-        let args = LimitsArgs {
+    fn make_preset_args(
+        function: Option<&str>,
+        ramp: Option<&str>,
+        preset: Option<&str>,
+    ) -> LimitsArgs {
+        LimitsArgs {
             contract: std::path::PathBuf::from("x.wasm"),
-            function: Some("custom_fn".to_string()),
-            ramp: None,
+            function: function.map(str::to_string),
+            ramp: ramp.map(str::to_string),
             arg_values: vec![],
             probe_timeout: 30,
             jobs: 1,
@@ -3551,9 +3745,20 @@ mod tests {
             baseline_tolerance_pct: 5.0,
             save_baseline: None,
             export: None,
-            preset: Some("batch-payout".to_string()),
+            preset: preset.map(str::to_string),
             budget: None,
-        };
+            co_ramp: Vec::new(),
+            dry_run: false,
+            export_samples: None,
+            max_probes: 0,
+            wasm_target_dir: None,
+            profile: None,
+        }
+    }
+
+    #[test]
+    fn resolve_preset_defaults_uses_explicit_fn_over_preset() {
+        let args = make_preset_args(Some("custom_fn"), None, Some("batch-payout"));
         let (function, ramp, _) = resolve_preset_defaults(&args).unwrap();
         assert_eq!(function, "custom_fn");
         assert_eq!(ramp, "recipients"); // falls back to preset
@@ -3561,20 +3766,7 @@ mod tests {
 
     #[test]
     fn resolve_preset_defaults_uses_explicit_ramp_over_preset() {
-        let args = LimitsArgs {
-            contract: std::path::PathBuf::from("x.wasm"),
-            function: None,
-            ramp: Some("custom_ramp".to_string()),
-            arg_values: vec![],
-            probe_timeout: 30,
-            jobs: 1,
-            baseline: None,
-            baseline_tolerance_pct: 5.0,
-            save_baseline: None,
-            export: None,
-            preset: Some("batch-payout".to_string()),
-            budget: None,
-        };
+        let args = make_preset_args(None, Some("custom_ramp"), Some("batch-payout"));
         let (function, ramp, _) = resolve_preset_defaults(&args).unwrap();
         assert_eq!(function, "batch_payout"); // falls back to preset
         assert_eq!(ramp, "custom_ramp");
@@ -3582,40 +3774,14 @@ mod tests {
 
     #[test]
     fn resolve_preset_defaults_errors_without_preset_and_missing_fn() {
-        let args = LimitsArgs {
-            contract: std::path::PathBuf::from("x.wasm"),
-            function: None,
-            ramp: Some("r".to_string()),
-            arg_values: vec![],
-            probe_timeout: 30,
-            jobs: 1,
-            baseline: None,
-            baseline_tolerance_pct: 5.0,
-            save_baseline: None,
-            export: None,
-            preset: None,
-            budget: None,
-        };
+        let args = make_preset_args(None, Some("r"), None);
         let err = resolve_preset_defaults(&args).unwrap_err();
         assert!(err.0.contains("--fn is required"), "{}", err.0);
     }
 
     #[test]
     fn resolve_preset_defaults_errors_without_preset_and_missing_ramp() {
-        let args = LimitsArgs {
-            contract: std::path::PathBuf::from("x.wasm"),
-            function: Some("f".to_string()),
-            ramp: None,
-            arg_values: vec![],
-            probe_timeout: 30,
-            jobs: 1,
-            baseline: None,
-            baseline_tolerance_pct: 5.0,
-            save_baseline: None,
-            export: None,
-            preset: None,
-            budget: None,
-        };
+        let args = make_preset_args(Some("f"), None, None);
         let err = resolve_preset_defaults(&args).unwrap_err();
         assert!(err.0.contains("--ramp is required"), "{}", err.0);
     }
@@ -3869,6 +4035,307 @@ min_best=200
             "--ramp", "n",
         ]).expect("parse should succeed");
         assert_eq!(args.max_probes, 0);
+    }
+
+    // ── #374: compiler and target metadata ───────────────────────────────────
+
+    #[test]
+    fn collect_compiler_meta_returns_non_empty_rustc_version() {
+        let meta = collect_compiler_meta();
+        assert!(!meta.rustc_version.is_empty(), "rustc_version should not be empty");
+        assert_eq!(meta.wasm_target, "wasm32v1-none");
+    }
+
+    #[test]
+    fn compiler_meta_serializes_with_kebab_case_keys() {
+        let meta = CompilerMeta {
+            rustc_version: "rustc 1.80.0 (051478957 2024-07-21)".to_string(),
+            wasm_target: "wasm32v1-none".to_string(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"rustc-version\""), "expected kebab-case key: {json}");
+        assert!(json.contains("\"wasm-target\""), "expected kebab-case key: {json}");
+    }
+
+    #[test]
+    fn limits_summary_compiler_meta_field_round_trips() {
+        let meta = CompilerMeta {
+            rustc_version: "rustc 1.80.0".to_string(),
+            wasm_target: "wasm32v1-none".to_string(),
+        };
+        let summary = LimitsSummary {
+            contract: "test.wasm".to_string(),
+            function: Some("f".to_string()),
+            ramp: Some("n".to_string()),
+            best: 10,
+            instructions: 1000,
+            memory_bytes: 2000,
+            first_failed: None,
+            first_failure_category: None,
+            first_failed_probe_stderr: None,
+            probe_failure_counts: BTreeMap::new(),
+            hit_upper_bound: false,
+            probe_timeout_secs: 30,
+            audit: None,
+            measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
+            reproduction: None,
+            stopped_by: None,
+            probe_samples: vec![],
+            co_ramp: vec![],
+            compiler_meta: Some(meta.clone()),
+            wasm_target_dir: None,
+            profile: None,
+        };
+        let json = serde_json::to_string_pretty(&summary).unwrap();
+        assert!(json.contains("rustc-version"), "compiler-meta missing from JSON: {json}");
+        let decoded: LimitsSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.compiler_meta, Some(meta));
+    }
+
+    #[test]
+    fn render_text_includes_compiler_meta() {
+        let summary = LimitsSummary {
+            contract: "test.wasm".to_string(),
+            function: Some("f".to_string()),
+            ramp: Some("n".to_string()),
+            best: 10,
+            instructions: 1000,
+            memory_bytes: 2000,
+            first_failed: None,
+            first_failure_category: None,
+            first_failed_probe_stderr: None,
+            probe_failure_counts: BTreeMap::new(),
+            hit_upper_bound: false,
+            probe_timeout_secs: 30,
+            audit: None,
+            measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
+            reproduction: None,
+            stopped_by: None,
+            probe_samples: vec![],
+            co_ramp: vec![],
+            compiler_meta: Some(CompilerMeta {
+                rustc_version: "rustc 1.80.0".to_string(),
+                wasm_target: "wasm32v1-none".to_string(),
+            }),
+            wasm_target_dir: None,
+            profile: None,
+        };
+        let text = summary.render_text();
+        assert!(text.contains("rustc 1.80.0"), "compiler version missing from text: {text}");
+        assert!(text.contains("wasm32v1-none"), "wasm target missing from text: {text}");
+    }
+
+    // ── #370: custom wasm target directory ───────────────────────────────────
+
+    #[test]
+    fn wasm_target_dir_flag_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+            "--wasm-target-dir", "/custom/target",
+        ]).expect("--wasm-target-dir should be accepted");
+        assert!(args.wasm_target_dir.is_some());
+        assert_eq!(
+            args.wasm_target_dir.unwrap().to_str().unwrap(),
+            "/custom/target"
+        );
+    }
+
+    #[test]
+    fn wasm_target_dir_defaults_to_none() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+        ]).expect("parse should succeed");
+        assert!(args.wasm_target_dir.is_none());
+    }
+
+    #[test]
+    fn render_text_includes_wasm_target_dir_when_set() {
+        let summary = LimitsSummary {
+            contract: "test.wasm".to_string(),
+            function: Some("f".to_string()),
+            ramp: Some("n".to_string()),
+            best: 10,
+            instructions: 1000,
+            memory_bytes: 2000,
+            first_failed: None,
+            first_failure_category: None,
+            first_failed_probe_stderr: None,
+            probe_failure_counts: BTreeMap::new(),
+            hit_upper_bound: false,
+            probe_timeout_secs: 30,
+            audit: None,
+            measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
+            reproduction: None,
+            stopped_by: None,
+            probe_samples: vec![],
+            co_ramp: vec![],
+            compiler_meta: None,
+            wasm_target_dir: Some("/custom/target".to_string()),
+            profile: None,
+        };
+        let text = summary.render_text();
+        assert!(text.contains("/custom/target"), "wasm_target_dir missing from text: {text}");
+    }
+
+    // ── #371: cargo profile selection ────────────────────────────────────────
+
+    #[test]
+    fn profile_flag_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+            "--profile", "dev",
+        ]).expect("--profile should be accepted");
+        assert_eq!(args.profile.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn profile_defaults_to_none() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+        ]).expect("parse should succeed");
+        assert!(args.profile.is_none());
+    }
+
+    #[test]
+    fn render_text_includes_profile_when_set() {
+        let summary = LimitsSummary {
+            contract: "test.wasm".to_string(),
+            function: Some("f".to_string()),
+            ramp: Some("n".to_string()),
+            best: 10,
+            instructions: 1000,
+            memory_bytes: 2000,
+            first_failed: None,
+            first_failure_category: None,
+            first_failed_probe_stderr: None,
+            probe_failure_counts: BTreeMap::new(),
+            hit_upper_bound: false,
+            probe_timeout_secs: 30,
+            audit: None,
+            measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
+            reproduction: None,
+            stopped_by: None,
+            probe_samples: vec![],
+            co_ramp: vec![],
+            compiler_meta: None,
+            wasm_target_dir: None,
+            profile: Some("dev".to_string()),
+        };
+        let text = summary.render_text();
+        assert!(text.contains("dev"), "profile missing from text: {text}");
+    }
+
+    // ── #375: reusable baseline comparison ───────────────────────────────────
+
+    #[test]
+    fn baseline_comparison_new_detects_no_regression() {
+        let baseline = Baseline {
+            contract: None,
+            function: "f".to_string(),
+            ramp: "n".to_string(),
+            best: 100,
+            instructions: 50_000,
+            memory_bytes: 10_000,
+            measurement_limitations: None,
+        };
+        let cmp = BaselineComparison::new(&baseline, "n", "f", 100, 50_000, 10_000, 5.0).unwrap();
+        assert!(!cmp.has_regression());
+        assert!(cmp.regressions().is_empty());
+    }
+
+    #[test]
+    fn baseline_comparison_detects_ceiling_regression() {
+        let baseline = Baseline {
+            contract: None,
+            function: "f".to_string(),
+            ramp: "n".to_string(),
+            best: 100,
+            instructions: 50_000,
+            memory_bytes: 10_000,
+            measurement_limitations: None,
+        };
+        let cmp = BaselineComparison::new(&baseline, "n", "f", 90, 50_000, 10_000, 5.0).unwrap();
+        assert!(cmp.has_regression());
+        assert_eq!(cmp.regressions().len(), 1);
+        assert!(cmp.regressions()[0].contains("ceiling dropped"), "{}", cmp.regressions()[0]);
+    }
+
+    #[test]
+    fn baseline_comparison_detects_instruction_regression_beyond_tolerance() {
+        let baseline = Baseline {
+            contract: None,
+            function: "f".to_string(),
+            ramp: "n".to_string(),
+            best: 100,
+            instructions: 50_000,
+            memory_bytes: 10_000,
+            measurement_limitations: None,
+        };
+        let cmp = BaselineComparison::new(&baseline, "n", "f", 100, 60_000, 10_000, 5.0).unwrap();
+        assert!(cmp.has_regression());
+        assert!(cmp.regressions()[0].contains("instructions"), "{}", cmp.regressions()[0]);
+    }
+
+    #[test]
+    fn baseline_comparison_allows_instruction_growth_within_tolerance() {
+        let baseline = Baseline {
+            contract: None,
+            function: "f".to_string(),
+            ramp: "n".to_string(),
+            best: 100,
+            instructions: 50_000,
+            memory_bytes: 10_000,
+            measurement_limitations: None,
+        };
+        let cmp = BaselineComparison::new(&baseline, "n", "f", 100, 52_000, 10_000, 5.0).unwrap();
+        assert!(!cmp.has_regression());
+    }
+
+    #[test]
+    fn baseline_comparison_errors_on_function_mismatch() {
+        let baseline = Baseline {
+            contract: None,
+            function: "other_fn".to_string(),
+            ramp: "n".to_string(),
+            best: 100,
+            instructions: 50_000,
+            memory_bytes: 10_000,
+            measurement_limitations: None,
+        };
+        let err = BaselineComparison::new(&baseline, "n", "f", 100, 50_000, 10_000, 5.0).unwrap_err();
+        assert!(err.0.contains("other_fn"), "{}", err.0);
+    }
+
+    #[test]
+    fn baseline_comparison_carries_all_metrics() {
+        let baseline = Baseline {
+            contract: None,
+            function: "f".to_string(),
+            ramp: "n".to_string(),
+            best: 100,
+            instructions: 50_000,
+            memory_bytes: 10_000,
+            measurement_limitations: None,
+        };
+        let cmp = BaselineComparison::new(&baseline, "n", "f", 110, 55_000, 11_000, 10.0).unwrap();
+        assert_eq!(cmp.baseline_best, 100);
+        assert_eq!(cmp.current_best, 110);
+        assert_eq!(cmp.baseline_instructions, 50_000);
+        assert_eq!(cmp.current_instructions, 55_000);
+        assert_eq!(cmp.baseline_memory_bytes, 10_000);
+        assert_eq!(cmp.current_memory_bytes, 11_000);
     }
 
 }
