@@ -127,7 +127,8 @@ fn format_names_are_consistent_in_errors_and_help() {
     assert!(!output_text_out.status.success());
     let stderr_text = String::from_utf8_lossy(&output_text_out.stderr);
     assert!(
-        stderr_text.contains("--output is only valid with --format json or lcov (got --format text)"),
+        stderr_text
+            .contains("--output is only valid with --format json or lcov (got --format text)"),
         "{stderr_text}"
     );
 

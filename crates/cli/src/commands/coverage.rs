@@ -69,6 +69,8 @@ pub struct FileSummary {
     pub lines_covered: usize,
     pub lines_total: usize,
     pub line_percent: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncovered_lines: Vec<usize>,
 }
 
 /// Generates an actionable error message when actual coverage is below the expected --fail-under threshold.
@@ -261,7 +263,10 @@ fn print_text_summary(args: &CoverageArgs) -> Result<(), CliError> {
         .map(|dir| dir.join("coverage.json"))
         .unwrap_or_else(|| std::path::PathBuf::from("coverage.json"));
     if !json_path.exists() {
-        return Ok(());
+        return Err(CliError(format!(
+            "temporary coverage JSON was not created at '{}'; no source files may have been instrumented",
+            json_path.display()
+        )));
     }
     let raw = std::fs::read_to_string(&json_path).map_err(|err| {
         CliError(format!(
@@ -269,11 +274,78 @@ fn print_text_summary(args: &CoverageArgs) -> Result<(), CliError> {
             json_path.display()
         ))
     })?;
-    let (_, summary) = augment_coverage_json(&raw, &args.exclude)?;
+    let (augmented, summary) = augment_coverage_json(&raw, &args.exclude)?;
+    let report: serde_json::Value = serde_json::from_str(&augmented)
+        .map_err(|err| CliError(format!("failed to parse coverage summary: {err}")))?;
+    if let Some(packages) = report
+        .get("package_summaries")
+        .and_then(|value| value.as_array())
+    {
+        println!("\nCoverage by workspace package:");
+        for package in packages {
+            println!(
+                "  {:<28} {:>6.2}% ({}/{})",
+                package
+                    .get("package_name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("workspace"),
+                package
+                    .get("line_percent")
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(0.0),
+                package
+                    .get("lines_covered")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                package
+                    .get("lines_total")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+            );
+        }
+    }
+    if let Some(files) = report
+        .get("file_summaries")
+        .and_then(|value| value.as_array())
+    {
+        let missing = files
+            .iter()
+            .filter_map(|file| {
+                let lines = file.get("uncovered_lines")?.as_array()?;
+                if lines.is_empty() {
+                    return None;
+                }
+                Some(format!(
+                    "  {}: {}",
+                    file.get("filename")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<unknown>"),
+                    lines
+                        .iter()
+                        .filter_map(|line| line.as_u64())
+                        .map(|line| line.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            println!("\nUncovered source lines:");
+            for line in missing {
+                println!("{line}");
+            }
+        }
+    }
     println!(
         "\nCoverage summary: {:.2}% ({}/{}) lines",
         summary.line_percent, summary.lines_covered, summary.lines_total
     );
+    std::fs::remove_file(&json_path).map_err(|err| {
+        CliError(format!(
+            "failed to remove temporary coverage report '{}': {err}",
+            json_path.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -299,7 +371,7 @@ fn json_output_path(args: &CoverageArgs) -> std::path::PathBuf {
 /// `target/llvm-cov/html` when no `--output-dir` is given, cargo-llvm-cov's default.
 fn expected_artifacts(args: &CoverageArgs) -> Vec<std::path::PathBuf> {
     match args.format {
-        Format::Text if !args.open => Vec::new(),
+        Format::Text if !args.open => vec![std::path::PathBuf::from("coverage.json")],
         Format::Text | Format::Html => {
             let dir = args
                 .output_dir
@@ -583,11 +655,28 @@ pub fn augment_coverage_json(
                     total_covered += lines_covered;
                     total_lines += lines_total;
 
+                    let mut uncovered_lines = file_obj
+                        .get("segments")
+                        .and_then(|segments| segments.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|segment| {
+                            let values = segment.as_array()?;
+                            let line = values.first()?.as_u64()? as usize;
+                            let count = values.get(2)?.as_u64()?;
+                            let has_count = values.get(3)?.as_bool()?;
+                            (has_count && count == 0).then_some(line)
+                        })
+                        .collect::<Vec<_>>();
+                    uncovered_lines.sort_unstable();
+                    uncovered_lines.dedup();
+
                     file_summaries.push(FileSummary {
                         filename,
                         lines_covered,
                         lines_total,
                         line_percent,
+                        uncovered_lines,
                     });
                 }
             }
@@ -855,6 +944,9 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
                 if let Some(dir) = &args.output_dir {
                     cmd.arg("--output-dir").arg(dir);
                 }
+            } else {
+                cmd.arg("--json");
+                cmd.arg("--output-path").arg("coverage.json");
             }
         }
         Format::Lcov => {
@@ -942,6 +1034,21 @@ mod tests {
         a.branch = true;
         let rendered = rendered_args(&build_command(&a).unwrap());
         assert!(rendered.contains(&"--branch".to_string()), "{rendered:?}");
+    }
+
+    #[test]
+    fn text_mode_collects_json_for_package_and_missing_line_reporting() {
+        let rendered = rendered_args(&build_command(&args(&[], &[])).unwrap());
+        assert_eq!(
+            rendered,
+            vec![
+                "llvm-cov",
+                "test",
+                "--json",
+                "--output-path",
+                "coverage.json"
+            ]
+        );
     }
 
     #[test]
@@ -1623,6 +1730,26 @@ mod tests {
         assert_eq!(files[0]["lines_covered"], 85);
         assert_eq!(files[0]["lines_total"], 100);
         assert_eq!(files[0]["line_percent"], 85.0);
+    }
+
+    #[test]
+    fn augment_coverage_json_reports_unique_uncovered_source_lines() {
+        let raw_json = r#"{
+            "data": [{
+                "files": [{
+                    "filename": "crates/cli/src/main.rs",
+                    "segments": [[10, 1, 0, true, true], [10, 4, 0, true, false], [11, 1, 1, true, true]],
+                    "summary": { "lines": { "count": 2, "covered": 1, "percent": 50.0 } }
+                }]
+            }]
+        }"#;
+
+        let (augmented, _) = augment_coverage_json(raw_json, &[]).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&augmented).unwrap();
+        assert_eq!(
+            value["file_summaries"][0]["uncovered_lines"],
+            serde_json::json!([10])
+        );
     }
 
     // ── Bug #461 regression: excluded files must not be treated as uncovered ──
