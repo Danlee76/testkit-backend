@@ -380,7 +380,7 @@ pub struct LimitsSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_failed_probe_stderr: Option<String>,
     /// How many probes failed in each category over the whole run.
-    #[serde(skip_serializing_if = "map_is_empty")]
+    #[serde(default, skip_serializing_if = "map_is_empty")]
     pub probe_failure_counts: BTreeMap<ProbeFailureCategory, usize>,
     /// Whether the search stopped at [`SEARCH_UPPER_BOUND`] without finding a
     /// failure.
@@ -400,10 +400,10 @@ pub struct LimitsSummary {
     pub stopped_by: Option<ResourceBoundary>,
     /// All individual probe samples recorded during the run, in call order.
     /// Populated only when `--export-samples` is requested.
-    #[serde(skip_serializing_if = "vec_is_empty")]
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
     pub probe_samples: Vec<ProbeSample>,
     /// Additional parameters ramped in lockstep with the primary ramp.
-    #[serde(skip_serializing_if = "vec_is_empty")]
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
     pub co_ramp: Vec<String>,
     /// Compiler and WASM-target metadata captured at run time.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2446,6 +2446,26 @@ mod tests {
     use super::*;
     use soroban_sdk::xdr::ScSpecTypeVec;
     use std::collections::BTreeMap;
+    use std::str::FromStr;
+
+    /// `LimitsArgs` derives `clap::Args` (it is flattened into the top-level
+    /// CLI), which has no `try_parse_from`. Parse through a one-field wrapper
+    /// so the flag tests exercise the real clap definitions.
+    #[derive(clap::Parser)]
+    struct LimitsCli {
+        #[command(flatten)]
+        args: LimitsArgs,
+    }
+
+    impl LimitsArgs {
+        fn try_parse_from<I, T>(argv: I) -> Result<Self, clap::Error>
+        where
+            I: IntoIterator<Item = T>,
+            T: Into<std::ffi::OsString> + Clone,
+        {
+            <LimitsCli as clap::Parser>::try_parse_from(argv).map(|cli| cli.args)
+        }
+    }
 
     // ---- #239: Vec<T> ramp support ----
 
@@ -2609,8 +2629,8 @@ mod tests {
     fn sample_baseline() -> Baseline {
         Baseline {
             contract: Some("vault.wasm".to_string()),
-            function: Some("batch_payout".to_string()),
-            ramp: Some("recipients".to_string()),
+            function: "batch_payout".to_string(),
+            ramp: "recipients".to_string(),
             best: 100,
             instructions: 1_000_000,
             memory_bytes: 50_000,
@@ -2640,6 +2660,9 @@ mod tests {
             stopped_by: None,
             probe_samples: Vec::new(),
             co_ramp: Vec::new(),
+            compiler_meta: None,
+            wasm_target_dir: None,
+            profile: None,
         }
     }
 
@@ -4074,12 +4097,11 @@ min_best=200
 
     #[test]
     fn export_probe_samples_writes_json_array() {
-        use std::io::Write;
         let dir = std::env::temp_dir();
         let path = dir.join("test_probe_samples.json");
         let samples = vec![
-            ProbeSample { value: 1, succeeded: true, failure_category: None },
-            ProbeSample { value: 2, succeeded: false, failure_category: Some(ProbeFailureCategory::ExitFailure) },
+            ProbeSample { value: 1, succeeded: true, failure_category: None, duration_ms: None },
+            ProbeSample { value: 2, succeeded: false, failure_category: Some(ProbeFailureCategory::ExitFailure), duration_ms: None },
         ];
         export_probe_samples(&path, &samples).expect("export should succeed");
         let content = std::fs::read_to_string(&path).unwrap();
@@ -4124,7 +4146,7 @@ min_best=200
         ]).unwrap();
         let function_spec = soroban_sdk::xdr::ScSpecFunctionV0 {
             doc: soroban_sdk::xdr::StringM::default(),
-            name: soroban_sdk::xdr::StringM::try_from(b"f".to_vec()).unwrap(),
+            name: soroban_sdk::xdr::ScSymbol(soroban_sdk::xdr::StringM::try_from(b"f".to_vec()).unwrap()),
             inputs,
             outputs: soroban_sdk::xdr::VecM::default(),
         };
