@@ -140,6 +140,9 @@ pub struct CoverageArgs {
     /// repeated runs collect coverage incrementally (passes `--no-clean`).
     #[arg(long)]
     no_clean: bool,
+    /// Include branch coverage when the installed cargo-llvm-cov supports it.
+    #[arg(long)]
+    branch: bool,
 }
 
 /// Path regex matching generated and fixture code. Used by `--exclude-generated`.
@@ -227,12 +230,8 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     }
 
     if !output.status.success() {
-        let mut message = coverage_failure_message(
-            output.status,
-            args.open,
-            args.fail_under,
-            &captured_stderr,
-        );
+        let mut message =
+            coverage_failure_message(output.status, args.open, args.fail_under, &captured_stderr);
         // Nothing is deleted on failure. Name any output files still on disk so
         // the user can inspect them, and say they were not validated.
         let kept = existing_artifacts(&args);
@@ -244,6 +243,10 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
 
     validate_coverage_outputs(&args)?;
 
+    if matches!(args.format, Format::Text) {
+        print_text_summary(&args)?;
+    }
+
     if args.open {
         open_html_report(args.output_dir.as_deref())?;
     }
@@ -251,11 +254,35 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+fn print_text_summary(args: &CoverageArgs) -> Result<(), CliError> {
+    let json_path = args
+        .output_dir
+        .as_ref()
+        .map(|dir| dir.join("coverage.json"))
+        .unwrap_or_else(|| std::path::PathBuf::from("coverage.json"));
+    if !json_path.exists() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&json_path).map_err(|err| {
+        CliError(format!(
+            "failed to read temporary coverage summary '{}': {err}",
+            json_path.display()
+        ))
+    })?;
+    let (_, summary) = augment_coverage_json(&raw, &args.exclude)?;
+    println!(
+        "\nCoverage summary: {:.2}% ({}/{}) lines",
+        summary.line_percent, summary.lines_covered, summary.lines_total
+    );
+    Ok(())
+}
+
 /// `lcov.info` path, inside `--output-dir` when given.
 fn lcov_output_path(args: &CoverageArgs) -> std::path::PathBuf {
-    args.output_dir
-        .as_ref()
-        .map_or_else(|| std::path::PathBuf::from("lcov.info"), |dir| dir.join("lcov.info"))
+    args.output
+        .clone()
+        .or_else(|| args.output_dir.as_ref().map(|dir| dir.join("lcov.info")))
+        .unwrap_or_else(|| std::path::PathBuf::from("lcov.info"))
 }
 
 /// JSON report path: `--output`, else `coverage.json` inside `--output-dir`.
@@ -379,11 +406,7 @@ pub(crate) fn validate_coverage_outputs(args: &CoverageArgs) -> Result<(), CliEr
             Ok(())
         }
         Format::Lcov => {
-            let output_path = if let Some(dir) = &args.output_dir {
-                dir.join("lcov.info")
-            } else {
-                std::path::PathBuf::from("lcov.info")
-            };
+            let output_path = lcov_output_path(args);
 
             if !output_path.exists() {
                 return Err(CliError(format!(
@@ -773,9 +796,9 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
                 .to_string(),
         ));
     }
-    if args.output.is_some() && !matches!(args.format, Format::Json) {
+    if args.output.is_some() && !matches!(args.format, Format::Json | Format::Lcov) {
         return Err(CliError(format!(
-            "--output is only valid with --format json (got --format {})",
+            "--output is only valid with --format json or lcov (got --format {})",
             args.format
         )));
     }
@@ -859,6 +882,10 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
         cmd.arg("--fail-under-lines").arg(pct.to_string());
     }
 
+    if args.branch {
+        cmd.arg("--branch");
+    }
+
     Ok(cmd)
 }
 
@@ -878,6 +905,7 @@ mod tests {
             exclude_generated: false,
             ignore_filename_regex: Vec::new(),
             no_clean: false,
+            branch: false,
         }
     }
 
@@ -890,7 +918,10 @@ mod tests {
     #[test]
     fn new_collection_flags_are_not_forwarded_by_default() {
         let rendered = rendered_args(&build_command(&args(&[], &[])).unwrap());
-        assert!(!rendered.contains(&"--no-clean".to_string()), "{rendered:?}");
+        assert!(
+            !rendered.contains(&"--no-clean".to_string()),
+            "{rendered:?}"
+        );
         assert!(
             !rendered.contains(&"--ignore-filename-regex".to_string()),
             "{rendered:?}"
@@ -903,6 +934,14 @@ mod tests {
         a.no_clean = true;
         let rendered = rendered_args(&build_command(&a).unwrap());
         assert!(rendered.contains(&"--no-clean".to_string()), "{rendered:?}");
+    }
+
+    #[test]
+    fn branch_is_forwarded_to_cargo_llvm_cov() {
+        let mut a = args(&[], &[]);
+        a.branch = true;
+        let rendered = rendered_args(&build_command(&a).unwrap());
+        assert!(rendered.contains(&"--branch".to_string()), "{rendered:?}");
     }
 
     #[test]
@@ -972,7 +1011,10 @@ mod tests {
             note.contains("were left on disk and were not validated"),
             "{note}"
         );
-        assert!(note.contains(&format!("'{}'", json_path.display())), "{note}");
+        assert!(
+            note.contains(&format!("'{}'", json_path.display())),
+            "{note}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1842,10 +1884,8 @@ mod tests {
 
     #[test]
     fn validate_coverage_outputs_fails_for_malformed_json_content() {
-        let dir = std::env::temp_dir().join(format!(
-            "stk-cov-val-malformed-json-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("stk-cov-val-malformed-json-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let json_path = dir.join("coverage.json");
 
@@ -1901,7 +1941,10 @@ mod tests {
                 || msg_fail_under.contains("terminated by signal"),
             "{msg_fail_under}"
         );
-        assert!(!msg_fail_under.to_lowercase().contains("success"), "{msg_fail_under}");
+        assert!(
+            !msg_fail_under.to_lowercase().contains("success"),
+            "{msg_fail_under}"
+        );
 
         let msg_open = coverage_failure_message(status, true, None);
         assert!(
