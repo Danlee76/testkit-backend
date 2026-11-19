@@ -332,6 +332,20 @@ fn map_is_empty<K, V>(map: &BTreeMap<K, V>) -> bool {
     map.is_empty()
 }
 
+/// `serde(skip_serializing_if)` helper: omitted for an empty vec.
+fn vec_is_empty<T>(v: &[T]) -> bool {
+    v.is_empty()
+}
+
+/// One recorded probe sample, included in the `--export-samples` output.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProbeSample {
+    pub value: u32,
+    pub succeeded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<ProbeFailureCategory>,
+}
+
 /// The single source of truth for one `limits` run.
 ///
 /// The terminal summary ([`LimitsSummary::render_text`]) and the JSON export
@@ -342,8 +356,8 @@ fn map_is_empty<K, V>(map: &BTreeMap<K, V>) -> bool {
 pub struct LimitsSummary {
     /// Sanitized contract path (see [`sanitize_report_path`]).
     pub contract: String,
-    pub function: String,
-    pub ramp: String,
+    pub function: Option<String>,
+    pub ramp: Option<String>,
     /// The highest ramp value that succeeded.
     pub best: u32,
     /// CPU instructions consumed at `best`.
@@ -379,6 +393,13 @@ pub struct LimitsSummary {
     /// Computed from the fraction of Soroban mainnet limits consumed at `best`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped_by: Option<ResourceBoundary>,
+    /// All individual probe samples recorded during the run, in call order.
+    /// Populated only when `--export-samples` is requested.
+    #[serde(skip_serializing_if = "vec_is_empty")]
+    pub probe_samples: Vec<ProbeSample>,
+    /// Additional parameters ramped in lockstep with the primary ramp.
+    #[serde(skip_serializing_if = "vec_is_empty")]
+    pub co_ramp: Vec<String>,
 }
 
 impl LimitsSummary {
@@ -386,14 +407,21 @@ impl LimitsSummary {
     /// output is produced, keeping it in lockstep with the JSON export.
     pub fn render_text(&self) -> String {
         let mut out = String::new();
+        let ramp_str = self.ramp.as_deref().unwrap_or("");
+        let function_str = self.function.as_deref().unwrap_or("");
+        let ramp_display = if self.co_ramp.is_empty() {
+            ramp_str.to_string()
+        } else {
+            format!("{} (+ {})", ramp_str, self.co_ramp.join(", "))
+        };
         out.push_str(&format!(
             "last successful {} for {:?}: {}\n",
-            self.ramp, self.function, self.best
+            ramp_display, function_str, self.best
         ));
         out.push_str(&format!("  instructions: {}\n", self.instructions));
         out.push_str(&format!("  memory bytes: {}\n", self.memory_bytes));
         if let Some(failed) = self.first_failed {
-            out.push_str(&format!("  first failed {} value: {failed}", self.ramp));
+            out.push_str(&format!("  first failed {} value: {failed}", ramp_str));
             if let Some(category) = self.first_failure_category {
                 out.push_str(&format!(" [{category}]"));
             }
@@ -505,6 +533,11 @@ pub struct LimitsArgs {
     /// Required unless --preset is given.
     #[arg(long, value_name = "PARAM", required_unless_present = "preset")]
     ramp: Option<String>,
+    /// Additional parameters to ramp in lockstep with --ramp. Each listed
+    /// parameter is set to the same value as the primary ramp parameter on
+    /// every probe. Repeatable. Must each match an input name in the ABI.
+    #[arg(long = "co-ramp", value_name = "PARAM")]
+    co_ramp: Vec<String>,
     /// Explicit value for a non-ramped parameter, as NAME=VALUE. Repeatable.
     /// Scalars use their Soroban type; Bytes uses 0x-prefixed hexadecimal.
     #[arg(long = "arg", value_name = "NAME=VALUE")]
@@ -556,6 +589,21 @@ pub struct LimitsArgs {
     /// if any limit is exceeded.
     #[arg(long, value_name = "PATH")]
     budget: Option<std::path::PathBuf>,
+    /// Export every individual probe sample to PATH as a JSON array. Each
+    /// entry records the ramp value, whether it succeeded, and the failure
+    /// category when it failed. Useful for plotting the full resource curve.
+    #[arg(long, value_name = "PATH")]
+    export_samples: Option<std::path::PathBuf>,
+    /// Print the planned probe sequence without executing any probes and
+    /// exit. Shows the ramp values that would be attempted in the doubling
+    /// phase, up to the first theoretical failure bracket.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+    /// Abort with an error if the total number of probe invocations exceeds
+    /// this limit. Protects against unexpectedly large search spaces in CI.
+    /// Set to 0 to disable the limit (the default).
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    max_probes: usize,
 }
 
 /// Hidden: runs exactly one probe (a single ramp value) and reports its
@@ -573,6 +621,8 @@ pub struct ProbeArgs {
     value: u32,
     #[arg(long = "arg", value_name = "NAME=VALUE")]
     arg_values: Vec<String>,
+    #[arg(long = "co-ramp")]
+    co_ramp: Vec<String>,
 }
 
 /// Empirically discovers a resource ceiling by invoking `--fn` with an
@@ -656,9 +706,41 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     // abort risk documented above, and it means a typo'd --fn or --ramp
     // reports its actual cause instead of the generic "failed at value 1"
     // a swallowed child-process error would otherwise produce.
-    let (_, env, function, ramp_index) = load(&args.contract, &args.function, &args.ramp)?;
-    build_args(&env, &function, ramp_index, 1, &args.arg_values)?;
+    let (function, ramp, effective_arg_values) = resolve_preset_defaults(&args)?;
+    let (_, env, function_spec, ramp_index) = load(&args.contract, &function, &ramp)?;
+    let co_ramp_indices: Vec<usize> = args
+        .co_ramp
+        .iter()
+        .map(|name| {
+            function_spec
+                .inputs
+                .iter()
+                .position(|input| input.name.to_utf8_string_lossy() == name.as_str())
+                .ok_or_else(|| {
+                    CliError(format!(
+                        "--co-ramp parameter {:?} not found in function {:?}",
+                        name, function
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    build_args(&env, &function_spec, ramp_index, &co_ramp_indices, 1, &effective_arg_values)?;
     drop(env);
+
+    if args.dry_run {
+        println!("dry-run: would probe {:?} ramping {:?}", function, ramp);
+        println!(
+            "  phase 1: doubling ladder 1, 2, 4, 8, \u{2026} up to {SEARCH_UPPER_BOUND}"
+        );
+        println!("  phase 2: binary search to refine bounds");
+        if !args.co_ramp.is_empty() {
+            println!("  co-ramp parameters: {}", args.co_ramp.join(", "));
+        }
+        if args.max_probes > 0 {
+            println!("  max probes: {}", args.max_probes);
+        }
+        return Ok(());
+    }
 
     let self_exe = std::env::current_exe()
         .map_err(|err| CliError(format!("failed to locate this binary: {err}")))?;
@@ -669,10 +751,17 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     let mut last_failure_category: Option<ProbeFailureCategory> = None;
     let mut first_failed_probe_stderr: Option<String> = None;
     let mut hit_upper_bound = false;
+    let mut probe_count: usize = 0;
+    let mut all_samples: Vec<ProbeSample> = Vec::new();
 
     // Folds one probe result into the run's statistics. Only called in ramp
     // order, so the counts and the first failure's stderr match a sequential run.
     let mut record = |value: u32, outcome: ProbeOutcome, stderr: String| {
+        let (succeeded, failure_category) = match &outcome {
+            ProbeOutcome::Succeeded => (true, None),
+            ProbeOutcome::Failed(cat) => (false, Some(*cat)),
+        };
+        all_samples.push(ProbeSample { value, succeeded, failure_category });
         if let ProbeOutcome::Failed(category) = outcome {
             // A contract failure cannot establish a budget ceiling, even if
             // earlier, lower ramp values succeeded.
@@ -680,8 +769,8 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
                 return Err(CliError(format!(
                     "contract function {:?} failed at {}={} before a resource limit was verified; \
                      check the contract's validation and trap logic; probe stderr: {}",
-                    args.function,
-                    args.ramp,
+                    function,
+                    ramp,
                     value,
                     stderr.trim()
                 )));
@@ -702,9 +791,16 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     let mut high = None;
     let mut next = Some(1u32);
     while let Some(start) = next {
+        if args.max_probes > 0 && probe_count >= args.max_probes {
+            break;
+        }
         let batch = ladder_batch(start, SEARCH_UPPER_BOUND, args.jobs);
         let results = probe_batch(&self_exe, &args, &batch, probe_timeout);
         for (value, result) in batch.into_iter().zip(results) {
+            probe_count += 1;
+            if args.max_probes > 0 && probe_count > args.max_probes {
+                break;
+            }
             let (outcome, stderr) = result?;
             match record(value, outcome, stderr)? {
                 ProbeOutcome::Succeeded => {
@@ -758,6 +854,10 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     if let Some(hi_start) = high {
         // Refinement is sequential: each midpoint depends on the previous result.
         let mut probe = |value: u32| -> Result<ProbeOutcome, CliError> {
+            if args.max_probes > 0 && probe_count >= args.max_probes {
+                return Ok(ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure));
+            }
+            probe_count += 1;
             let (outcome, stderr) = spawn_probe(&self_exe, &args, value, probe_timeout)?;
             record(value, outcome, stderr)
         };
@@ -801,8 +901,8 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
 
     let summary = LimitsSummary {
         contract: sanitize_report_path(&args.contract),
-        function: function.clone(),
-        ramp: ramp.clone(),
+        function: Some(function.clone()),
+        ramp: Some(ramp.clone()),
         best,
         instructions,
         memory_bytes,
@@ -816,6 +916,8 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
         reproduction,
         stopped_by,
+        probe_samples: all_samples,
+        co_ramp: args.co_ramp.clone(),
     };
     print!("{}", summary.render_text());
 
@@ -849,6 +951,10 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     if let Some(budget_path) = &args.budget {
         compare_to_budget(budget_path, &ramp, best, instructions, memory_bytes)?;
     }
+    if let Some(samples_path) = &args.export_samples {
+        export_probe_samples(samples_path, &summary.probe_samples)?;
+        println!("exported probe samples to {}", samples_path.display());
+    }
 
     Ok(())
 }
@@ -875,6 +981,11 @@ fn spawn_probe(
             args.arg_values
                 .iter()
                 .flat_map(|value| ["--arg", value.as_str()]),
+        )
+        .args(
+            args.co_ramp
+                .iter()
+                .flat_map(|name| ["--co-ramp", name.as_str()]),
         )
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -1121,7 +1232,17 @@ pub fn run_probe(args: ProbeArgs) -> Result<(), CliError> {
     let _quiet = QuietPanics::install();
     let (contract_id, env, function, ramp_index) =
         load(&args.contract, &args.function, &args.ramp)?;
-    let args_vec = build_args(&env, &function, ramp_index, args.value, &args.arg_values)?;
+    let co_ramp_indices: Vec<usize> = args
+        .co_ramp
+        .iter()
+        .filter_map(|name| {
+            function
+                .inputs
+                .iter()
+                .position(|input| input.name.to_utf8_string_lossy() == name.as_str())
+        })
+        .collect();
+    let args_vec = build_args(&env, &function, ramp_index, &co_ramp_indices, args.value, &args.arg_values)?;
     let func = Symbol::new(&env, &args.function);
     match env.try_invoke_contract::<Val, soroban_sdk::Error>(&contract_id, &func, args_vec) {
         Ok(Ok(_)) => Ok(()),
@@ -1478,8 +1599,8 @@ pub fn export_results(path: &Path, summary: &LimitsSummary) -> Result<(), CliErr
     } else {
         let baseline = Baseline {
             contract: Some(summary.contract.clone()),
-            function: summary.function.clone(),
-            ramp: summary.ramp.clone(),
+            function: summary.function.clone().unwrap_or_default(),
+            ramp: summary.ramp.clone().unwrap_or_default(),
             best: summary.best,
             instructions: summary.instructions,
             memory_bytes: summary.memory_bytes,
@@ -1494,6 +1615,18 @@ pub fn export_results(path: &Path, summary: &LimitsSummary) -> Result<(), CliErr
     }
 }
 
+/// Writes all probe samples collected during the run to `path` as a JSON array.
+pub fn export_probe_samples(path: &Path, samples: &[ProbeSample]) -> Result<(), CliError> {
+    let json_str = serde_json::to_string_pretty(samples)
+        .map_err(|err| CliError(format!("failed to format probe samples JSON: {err}")))?;
+    std::fs::write(path, json_str).map_err(|err| {
+        CliError(format!(
+            "failed to write probe samples to {}: {err}",
+            path.display()
+        ))
+    })
+}
+
 fn measure_at(
     contract: &std::path::Path,
     function: &str,
@@ -1505,7 +1638,7 @@ fn measure_at(
     let func = Symbol::new(&env, function);
     let mut budget = env.cost_estimate().budget();
     budget.reset_default();
-    let args_vec = build_args(&env, &fn_spec, ramp_index, value, arg_values)?;
+    let args_vec = build_args(&env, &fn_spec, ramp_index, &[], value, arg_values)?;
     if !invoke_succeeds(&env, &contract_id, &func, args_vec) {
         return Err(CliError(format!(
             "internal error: {:?} reported ramp value {value} as successful during probing              but failed on in-process re-measurement for parameter {:?}; re-run to confirm the              boundary is stable, or lower --probe-timeout if the run is racing a hang",
@@ -1759,6 +1892,7 @@ fn build_args(
     env: &Env,
     function: &ScSpecFunctionV0,
     ramp_index: usize,
+    co_ramp_indices: &[usize],
     ramp_value: u32,
     explicit: &[String],
 ) -> Result<SVec<Val>, CliError> {
@@ -1796,7 +1930,7 @@ fn build_args(
     }
     for (i, input) in function.inputs.iter().enumerate() {
         let input_name = input.name.to_utf8_string_lossy();
-        let val = if i == ramp_index {
+        let val = if i == ramp_index || co_ramp_indices.contains(&i) {
             ramp_val(env, &input.type_, ramp_value)?
         } else if let Some(value) = overrides.get(input_name.as_str()) {
             explicit_val(env, &input.type_, value)?
@@ -2213,6 +2347,8 @@ mod tests {
                 "invoke `batch_payout` with `recipients` = 100 in a test environment; to re-verify the boundary via CLI run: `soroban-testkit limits --contract vault.wasm --fn batch_payout --ramp recipients`".to_string(),
             ),
             stopped_by: None,
+            probe_samples: Vec::new(),
+            co_ramp: Vec::new(),
         }
     }
 
@@ -3608,6 +3744,131 @@ min_best=200
         assert!(err.0.contains("instructions"), "{}", err.0);
         assert!(err.0.contains("memory"), "{}", err.0);
         assert!(err.0.contains("ceiling"), "{}", err.0);
+    }
+
+    // ── #372: dry-run mode ────────────────────────────────────────────────────
+
+    #[test]
+    fn dry_run_flag_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+            "--dry-run",
+        ]).expect("--dry-run should be accepted");
+        assert!(args.dry_run);
+    }
+
+    #[test]
+    fn dry_run_defaults_to_false() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+        ]).expect("parse should succeed");
+        assert!(!args.dry_run);
+    }
+
+    // ── #373: export-samples ─────────────────────────────────────────────────
+
+    #[test]
+    fn export_samples_flag_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+            "--export-samples", "/tmp/samples.json",
+        ]).expect("--export-samples should be accepted");
+        assert!(args.export_samples.is_some());
+    }
+
+    #[test]
+    fn export_probe_samples_writes_json_array() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_probe_samples.json");
+        let samples = vec![
+            ProbeSample { value: 1, succeeded: true, failure_category: None },
+            ProbeSample { value: 2, succeeded: false, failure_category: Some(ProbeFailureCategory::ExitFailure) },
+        ];
+        export_probe_samples(&path, &samples).expect("export should succeed");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"value\": 1"), "missing value 1: {content}");
+        assert!(content.contains("\"succeeded\": true"), "missing succeeded true: {content}");
+        assert!(content.contains("\"failure_category\": \"exit-failure\""), "missing category: {content}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── #368: co-ramp ────────────────────────────────────────────────────────
+
+    #[test]
+    fn co_ramp_flag_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+            "--co-ramp", "m",
+            "--co-ramp", "k",
+        ]).expect("--co-ramp should be accepted");
+        assert_eq!(args.co_ramp, vec!["m", "k"]);
+    }
+
+    #[test]
+    fn build_args_with_co_ramp_index_applies_ramp_value() {
+        let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
+        env.mock_all_auths_allowing_non_root_auth();
+        let inputs = soroban_sdk::xdr::VecM::try_from(vec![
+            soroban_sdk::xdr::ScSpecFunctionInputV0 {
+                doc: soroban_sdk::xdr::StringM::default(),
+                name: soroban_sdk::xdr::StringM::try_from(b"a".to_vec()).unwrap(),
+                type_: soroban_sdk::xdr::ScSpecTypeDef::U32,
+            },
+            soroban_sdk::xdr::ScSpecFunctionInputV0 {
+                doc: soroban_sdk::xdr::StringM::default(),
+                name: soroban_sdk::xdr::StringM::try_from(b"b".to_vec()).unwrap(),
+                type_: soroban_sdk::xdr::ScSpecTypeDef::U32,
+            },
+        ]).unwrap();
+        let function_spec = soroban_sdk::xdr::ScSpecFunctionV0 {
+            doc: soroban_sdk::xdr::StringM::default(),
+            name: soroban_sdk::xdr::StringM::try_from(b"f".to_vec()).unwrap(),
+            inputs,
+            outputs: soroban_sdk::xdr::VecM::default(),
+        };
+        // ramp index 0, co-ramp index 1, value 42
+        let result = build_args(&env, &function_spec, 0, &[1], 42, &[]).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    // ── #369: max-probes ─────────────────────────────────────────────────────
+
+    #[test]
+    fn max_probes_flag_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+            "--max-probes", "10",
+        ]).expect("--max-probes should be accepted");
+        assert_eq!(args.max_probes, 10);
+    }
+
+    #[test]
+    fn max_probes_defaults_to_zero() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+        ]).expect("parse should succeed");
+        assert_eq!(args.max_probes, 0);
     }
 
 }

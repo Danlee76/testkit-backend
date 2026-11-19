@@ -86,6 +86,10 @@ fn limits_help_documents_options_and_limitations() {
     assert!(stdout.contains("--baseline-tolerance-pct"), "{stdout}");
     assert!(stdout.contains("--save-baseline"), "{stdout}");
     assert!(stdout.contains("--export"), "{stdout}");
+    assert!(stdout.contains("--dry-run"), "{stdout}");
+    assert!(stdout.contains("--export-samples"), "{stdout}");
+    assert!(stdout.contains("--co-ramp"), "{stdout}");
+    assert!(stdout.contains("--max-probes"), "{stdout}");
 }
 
 #[test]
@@ -826,4 +830,235 @@ fn limits_stops_when_contract_rejects_after_successful_probes() {
         "{stderr}"
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("last successful"));
+}
+
+// ---- Issue #372: dry-run mode ----
+
+#[test]
+fn limits_dry_run_prints_planned_probes_and_exits_zero() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--dry-run",
+    ]);
+    assert!(output.status.success(), "{:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("dry-run"), "{stdout}");
+    assert!(stdout.contains("batch_payout"), "{stdout}");
+    assert!(stdout.contains("recipients"), "{stdout}");
+    assert!(stdout.contains("probe ramp=1"), "{stdout}");
+    assert!(stdout.contains("doubling phase"), "{stdout}");
+}
+
+#[test]
+fn limits_dry_run_does_not_execute_probes() {
+    // dry-run must not write any output files even when --export is given.
+    let wasm = ensure_vault_wasm();
+    let dir =
+        std::env::temp_dir().join(format!("stk-dryrun-no-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let export_path = dir.join("dry.json");
+
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--dry-run",
+        "--export",
+        export_path.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{:?}", output);
+    assert!(
+        !export_path.exists(),
+        "dry-run must not write the export file"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn limits_dry_run_shows_max_probes_limit_when_set() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--dry-run",
+        "--max-probes",
+        "10",
+    ]);
+    assert!(output.status.success(), "{:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("max-probes limit: 10"), "{stdout}");
+}
+
+// ---- Issue #373: export all probe samples as JSON ----
+
+#[test]
+fn limits_export_samples_writes_json_array_of_probes() {
+    let wasm = ensure_vault_wasm();
+    let dir =
+        std::env::temp_dir().join(format!("stk-samples-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let samples_path = dir.join("samples.json");
+
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--export-samples",
+        samples_path.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout: {stdout}");
+    assert!(samples_path.exists(), "samples file should be created");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&samples_path).unwrap()).unwrap();
+    assert!(json.is_array(), "samples should be a JSON array: {json}");
+    let arr = json.as_array().unwrap();
+    assert!(!arr.is_empty(), "samples array must not be empty");
+    for entry in arr {
+        assert!(entry["value"].as_u64().is_some(), "missing value: {entry}");
+        assert!(entry["succeeded"].as_bool().is_some(), "missing succeeded: {entry}");
+    }
+    assert_eq!(arr[0]["value"], 1, "first sample must be value=1");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn limits_export_samples_stdout_reports_path() {
+    let wasm = ensure_vault_wasm();
+    let dir =
+        std::env::temp_dir().join(format!("stk-samples-stdout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let samples_path = dir.join("samples.json");
+
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--export-samples",
+        samples_path.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout: {stdout}");
+    assert!(
+        stdout.contains("exported probe samples to"),
+        "stdout missing samples path: {stdout}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- Issue #368: correlated parameter ramping ----
+
+#[test]
+fn limits_co_ramp_rejects_unknown_parameter() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--co-ramp",
+        "nonexistent_param",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--co-ramp"), "{stderr}");
+    assert!(stderr.contains("nonexistent_param"), "{stderr}");
+}
+
+#[test]
+fn limits_co_ramp_shown_in_stdout_summary() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--co-ramp",
+        "amount",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout: {stdout}");
+    assert!(
+        stdout.contains("recipients (+ amount)"),
+        "co_ramp not shown in summary: {stdout}"
+    );
+}
+
+// ---- Issue #369: maximum probe count protection ----
+
+#[test]
+fn limits_max_probes_zero_does_not_restrict() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--max-probes",
+        "0",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout: {stdout}");
+}
+
+#[test]
+fn limits_max_probes_one_aborts_after_first_probe() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--max-probes",
+        "1",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--max-probes"),
+        "error should mention --max-probes: {stderr}"
+    );
+    assert!(
+        stderr.contains("raise --max-probes"),
+        "error should suggest raising the limit: {stderr}"
+    );
 }
