@@ -3,8 +3,8 @@
 //! This module owns the `limits` command and the hidden `__limits-probe`
 //! child entry point it spawns. The two halves cooperate through process
 //! isolation, whose full lifecycle is documented on [`run`]; each probe's
-//! result is classified with [`ProbeFailureCategory`] and every report —
-//! human-readable or machine-readable — is rendered from a single
+//! result is classified with [`ProbeFailureCategory`] and every report â
+//! human-readable or machine-readable â is rendered from a single
 //! [`LimitsSummary`] so the formats cannot disagree.
 
 use std::collections::BTreeMap;
@@ -24,6 +24,16 @@ use super::CliError;
 /// Measurement limitations warning reported across stdout and machine-readable outputs.
 pub const MEASUREMENT_LIMITATIONS: &str =
     "ledger reads/writes and transaction size are not measured by this command; see --help";
+
+/// Soroban per-transaction CPU instruction limit on mainnet.
+pub const SOROBAN_CPU_INSN_LIMIT: u64 = 100_000_000;
+
+/// Soroban per-transaction memory limit in bytes on mainnet (40 MiB).
+pub const SOROBAN_MEMORY_LIMIT: u64 = 41_943_040;
+
+/// Help text explaining how to interpret local instruction measurements.
+pub const INSTRUCTION_INTERPRETATION: &str =
+    "instruction counts are Soroban host CPU instructions, not wall-clock time;      one unit is roughly one basic WASM interpreter operation;      the per-transaction ceiling on Stellar mainnet is 100,000,000 instructions;      local measurements omit transaction-envelope overhead and may read      slightly lower than a network simulation of the same call";
 
 /// Built-in upper bound for the doubling search. If the contract still
 /// succeeds here the run stops and reports that the ceiling may be higher,
@@ -53,7 +63,7 @@ pub enum ProbeFailureCategory {
     /// The probe exceeded `--probe-timeout` and was killed by the parent
     /// before it could finish.
     TimedOut,
-    /// The child process was terminated by a signal — the host abort that
+    /// The child process was terminated by a signal â the host abort that
     /// real WASM execution can cause rather than a normal exit. On such a
     /// run the failure is real, but the ramp value reported may reflect the
     /// abort rather than a clean resource boundary.
@@ -103,6 +113,190 @@ impl std::fmt::Display for ProbeFailureCategory {
         write!(f, "{}", self.label())
     }
 }
+/// Which host resource was the binding constraint that stopped the ramp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResourceBoundary {
+    /// CPU instruction count was closer to its mainnet limit.
+    Instructions,
+    /// Memory bytes was closer to its mainnet limit.
+    Memory,
+    /// Neither resource approached its limit; the ramp was stopped by contract
+    /// logic, the built-in search ceiling, or an indeterminate cause.
+    Other,
+}
+
+impl ResourceBoundary {
+    /// A one-line explanation of what this boundary means for the reported ceiling.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            ResourceBoundary::Instructions => {
+                "CPU instructions were the binding resource; the contract is compute-bound"
+            }
+            ResourceBoundary::Memory => {
+                "memory bytes were the binding resource; the contract is memory-bound"
+            }
+            ResourceBoundary::Other => {
+                "neither resource approached its limit; the ceiling reflects contract logic,                  the built-in search upper bound, or an indeterminate cause"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ResourceBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResourceBoundary::Instructions => write!(f, "instructions"),
+            ResourceBoundary::Memory => write!(f, "memory"),
+            ResourceBoundary::Other => write!(f, "other"),
+        }
+    }
+}
+
+/// A named configuration for a common Soroban batch workload.
+///
+/// Pass via `--preset`. Available presets:
+/// - `batch-payout`   -- `--fn batch_payout --ramp recipients`
+/// - `token-transfer` -- `--fn transfer --ramp amount`
+/// - `multi-mint`     -- `--fn mint --ramp count`
+///
+/// Explicit `--fn`/`--ramp`/`--arg` flags always override the preset's defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RampPreset {
+    /// Targets `batch_payout(recipients, ...)`.
+    BatchPayout,
+    /// Targets `transfer(amount, ...)`.
+    TokenTransfer,
+    /// Targets `mint(count, ...)`.
+    MultiMint,
+}
+
+impl RampPreset {
+    /// Parse a preset name, returning an error listing valid names on failure.
+    pub fn from_name(name: &str) -> Result<Self, CliError> {
+        match name {
+            "batch-payout" => Ok(RampPreset::BatchPayout),
+            "token-transfer" => Ok(RampPreset::TokenTransfer),
+            "multi-mint" => Ok(RampPreset::MultiMint),
+            other => Err(CliError(format!(
+                "unknown preset {other:?}; available presets: batch-payout, token-transfer, multi-mint"
+            ))),
+        }
+    }
+
+    /// The contract function name this preset targets.
+    pub fn function(&self) -> &'static str {
+        match self {
+            RampPreset::BatchPayout => "batch_payout",
+            RampPreset::TokenTransfer => "transfer",
+            RampPreset::MultiMint => "mint",
+        }
+    }
+
+    /// The ramp parameter name this preset uses.
+    pub fn ramp(&self) -> &'static str {
+        match self {
+            RampPreset::BatchPayout => "recipients",
+            RampPreset::TokenTransfer => "amount",
+            RampPreset::MultiMint => "count",
+        }
+    }
+
+    /// Default `NAME=VALUE` arg overrides this preset recommends.
+    pub fn default_args(&self) -> &'static [&'static str] {
+        match self {
+            RampPreset::BatchPayout | RampPreset::TokenTransfer | RampPreset::MultiMint => &[],
+        }
+    }
+}
+
+/// A checked-in resource ceiling for a `limits` run.
+///
+/// Unlike [`Baseline`] (which records a previous run's actual results),
+/// a `ResourceBudget` is a human-authored file specifying the *maximum*
+/// CPU instructions, memory bytes, or *minimum* ramp ceiling the contract must
+/// satisfy. Check one into the repository alongside the contract to guard
+/// against silent resource regressions in CI.
+///
+/// Budget files use a `key=value` text format with optional `#` comment lines.
+/// Every field is optional; omitted fields are not checked.
+///
+/// # Example budget file
+///
+/// ```text
+/// # maximum allowed CPU instructions at the ramp ceiling
+/// max_instructions=60000000
+/// # maximum allowed memory bytes
+/// max_memory_bytes=20000000
+/// # minimum ramp ceiling the contract must sustain
+/// min_best=100
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceBudget {
+    /// Maximum CPU instructions allowed at the discovered ramp ceiling.
+    pub max_instructions: Option<u64>,
+    /// Maximum memory bytes allowed at the discovered ramp ceiling.
+    pub max_memory_bytes: Option<u64>,
+    /// Minimum ramp ceiling the contract must achieve.
+    pub min_best: Option<u32>,
+}
+
+impl ResourceBudget {
+    /// Parse a resource budget from its `key=value` file contents.
+    pub fn parse(contents: &str) -> Result<Self, CliError> {
+        let mut max_instructions = None;
+        let mut max_memory_bytes = None;
+        let mut min_best = None;
+
+        for (line_no, line) in contents.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(CliError(format!(
+                    "malformed budget file at line {}: expected key=value or # comment, got {line:?}",
+                    line_no + 1
+                )));
+            };
+            match key.trim() {
+                "max_instructions" => {
+                    max_instructions = Some(value.trim().parse::<u64>().map_err(|err| {
+                        CliError(format!(
+                            "malformed budget `max_instructions` value {:?}: {err}",
+                            value
+                        ))
+                    })?)
+                }
+                "max_memory_bytes" => {
+                    max_memory_bytes = Some(value.trim().parse::<u64>().map_err(|err| {
+                        CliError(format!(
+                            "malformed budget `max_memory_bytes` value {:?}: {err}",
+                            value
+                        ))
+                    })?)
+                }
+                "min_best" => {
+                    min_best = Some(value.trim().parse::<u32>().map_err(|err| {
+                        CliError(format!(
+                            "malformed budget `min_best` value {:?}: {err}",
+                            value
+                        ))
+                    })?)
+                }
+                other => {
+                    return Err(CliError(format!(
+                        "malformed budget file at line {}: unknown key {other:?};                          valid keys are max_instructions, max_memory_bytes, min_best",
+                        line_no + 1
+                    )))
+                }
+            }
+        }
+
+        Ok(ResourceBudget { max_instructions, max_memory_bytes, min_best })
+    }
+}
+
 
 /// The outcome of a single isolated probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +375,10 @@ pub struct LimitsSummary {
     /// Actionable instructions for reproducing the reported maximum locally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reproduction: Option<String>,
+    /// Which host resource was the binding constraint that stopped the ramp.
+    /// Computed from the fraction of Soroban mainnet limits consumed at `best`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_by: Option<ResourceBoundary>,
 }
 
 impl LimitsSummary {
@@ -227,6 +425,14 @@ impl LimitsSummary {
             ));
         }
         out.push_str(&format!("  ({})\n", self.measurement_limitations));
+        out.push_str(&format!("  ({})\n", INSTRUCTION_INTERPRETATION));
+        if let Some(boundary) = self.stopped_by {
+            out.push_str(&format!(
+                "  resource boundary: {} -- {}\n",
+                boundary,
+                boundary.explanation()
+            ));
+        }
         if let Some(repro) = &self.reproduction {
             out.push_str(&format!("  reproduce locally: {repro}\n"));
         }
@@ -251,7 +457,7 @@ impl LimitsSummary {
         {
             out.push_str(&format!(
                 "  note: at least one probe was killed for exceeding --probe-timeout ({}s); the \
-                 discovered ceiling may reflect a hang rather than a real resource limit — rerun \
+                 discovered ceiling may reflect a hang rather than a real resource limit â rerun \
                  with a larger --probe-timeout to check\n",
                 self.probe_timeout_secs
             ));
@@ -291,13 +497,14 @@ pub struct LimitsArgs {
     /// running limits; this command does not rebuild contracts.
     #[arg(long, value_name = "PATH")]
     contract: std::path::PathBuf,
-    /// The contract function to ramp.
-    #[arg(long = "fn", value_name = "NAME")]
-    function: String,
+    /// The contract function to ramp. Required unless --preset is given.
+    #[arg(long = "fn", value_name = "NAME", required_unless_present = "preset")]
+    function: Option<String>,
     /// The parameter to increase on each attempt. Must exactly match an input
     /// name in the selected function's contract ABI; checked before probing.
-    #[arg(long, value_name = "PARAM")]
-    ramp: String,
+    /// Required unless --preset is given.
+    #[arg(long, value_name = "PARAM", required_unless_present = "preset")]
+    ramp: Option<String>,
     /// Explicit value for a non-ramped parameter, as NAME=VALUE. Repeatable.
     /// Scalars use their Soroban type; Bytes uses 0x-prefixed hexadecimal.
     #[arg(long = "arg", value_name = "NAME=VALUE")]
@@ -338,6 +545,17 @@ pub struct LimitsArgs {
     /// Contains the discovered ceiling, instructions, and memory usage.
     #[arg(long, value_name = "PATH")]
     export: Option<std::path::PathBuf>,
+    /// Apply a named preset for a common batch workload, supplying defaults for
+    /// --fn and --ramp. Explicit --fn/--ramp/--arg flags always override the
+    /// preset's defaults. Available presets: batch-payout, token-transfer, multi-mint.
+    #[arg(long, value_name = "PRESET")]
+    preset: Option<String>,
+    /// Compare this run's result against a checked-in resource budget file.
+    /// The budget file specifies max_instructions, max_memory_bytes, and/or
+    /// min_best as key=value lines (with optional # comments). Exits non-zero
+    /// if any limit is exceeded.
+    #[arg(long, value_name = "PATH")]
+    budget: Option<std::path::PathBuf>,
 }
 
 /// Hidden: runs exactly one probe (a single ramp value) and reports its
@@ -358,7 +576,7 @@ pub struct ProbeArgs {
 }
 
 /// Empirically discovers a resource ceiling by invoking `--fn` with an
-/// increasing `--ramp` parameter — natively, with no network access —
+/// increasing `--ramp` parameter â natively, with no network access â
 /// until it fails, then reports the last successful value plus the CPU
 /// instructions and memory consumed at that point.
 ///
@@ -369,7 +587,7 @@ pub struct ProbeArgs {
 /// *during actual WASM execution* (as opposed to a native, non-WASM
 /// `#[contract]` registration), the host can abort the whole process
 /// (`thread caused non-unwinding panic. aborting.`) rather than return an
-/// error or unwind — neither `catch_unwind` nor `try_invoke_contract`
+/// error or unwind â neither `catch_unwind` nor `try_invoke_contract`
 /// (the SDK's own no-panic call path) prevents this for the WASM target.
 /// A probe is therefore never invoked in-process. The full lifecycle is:
 ///
@@ -407,7 +625,7 @@ pub struct ProbeArgs {
 /// The ramp parameter must be a numeric type (`u32`/`i32`/`u64`/`i64`/
 /// `u128`/`i128`, ramped as the value itself) or `Vec<T>` for a supported
 /// element type `T` (ramped as the element *count*, each element filled
-/// with a fixed value — see [`vec_element_val`]) — this covers the common
+/// with a fixed value â see [`vec_element_val`]) â this covers the common
 /// "maximum recipients in a batch operation" question directly, for
 /// `Vec<Address>` and beyond. Every other parameter is filled with a fixed
 /// default (an address, `0`, an empty collection, ...). A parameter type
@@ -419,7 +637,7 @@ pub struct ProbeArgs {
 /// they come from a transaction's simulated resource footprint, which
 /// this command's native invocation does not produce (that requires the
 /// network-dependent `stellar contract invoke` simulation path, which
-/// this crate deliberately avoids — see its "zero network access"
+/// this crate deliberately avoids â see its "zero network access"
 /// constraint). Only CPU instructions and memory, available locally via
 /// the host's budget, are reported.
 pub fn run(args: LimitsArgs) -> Result<(), CliError> {
@@ -433,7 +651,7 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
 
     // Validate the configuration (function exists, ramp parameter exists,
     // every parameter's type is one this command knows how to default or
-    // ramp) up front, in-process, before spawning any probes — this is
+    // ramp) up front, in-process, before spawning any probes â this is
     // just type/spec checking, not invocation, so it carries none of the
     // abort risk documented above, and it means a typo'd --fn or --ramp
     // reports its actual cause instead of the generic "failed at value 1"
@@ -525,8 +743,8 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
             "{:?} failed even at the smallest ramp value (1) for parameter {:?}{category_note}\
              {stderr_note}; \
              this usually indicates a validation error in the contract rather than a \
-             resource limit — check the contract's parameter validation logic and retry",
-            args.function, args.ramp
+             resource limit â check the contract's parameter validation logic and retry",
+            function, ramp
         )));
     };
 
@@ -562,20 +780,29 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
 
     // Measure resources at the best-known-good value, in-process this
     // time (a known-successful call is safe to make directly).
-    let (instructions, memory_bytes) = measure(&args, best)?;
+    let (instructions, memory_bytes) = measure_at(&args.contract, &function, &ramp, &effective_arg_values, best)?;
+
+    // Determine which resource boundary stopped the ramp.
+    let stopped_by = if hit_upper_bound {
+        Some(ResourceBoundary::Other)
+    } else if first_failure_category == Some(ProbeFailureCategory::ContractFailure) {
+        Some(ResourceBoundary::Other)
+    } else {
+        Some(infer_resource_boundary(instructions, memory_bytes))
+    };
 
     let reproduction = Some(build_reproduction_guidance(
         &sanitize_report_path(&args.contract),
-        &args.function,
-        &args.ramp,
+        &function,
+        &ramp,
         best,
-        &args.arg_values,
+        &effective_arg_values,
     ));
 
     let summary = LimitsSummary {
         contract: sanitize_report_path(&args.contract),
-        function: args.function.clone(),
-        ramp: args.ramp.clone(),
+        function: function.clone(),
+        ramp: ramp.clone(),
         best,
         instructions,
         memory_bytes,
@@ -588,14 +815,15 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         audit: refinement_audit,
         measurement_limitations: MEASUREMENT_LIMITATIONS.to_string(),
         reproduction,
+        stopped_by,
     };
     print!("{}", summary.render_text());
 
     if let Some(baseline_path) = &args.baseline {
         compare_to_baseline(
             baseline_path,
-            &args.ramp,
-            &args.function,
+            &ramp,
+            &function,
             best,
             instructions,
             memory_bytes,
@@ -606,8 +834,8 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         write_baseline(
             save_path,
             &args.contract,
-            &args.ramp,
-            &args.function,
+            &ramp,
+            &function,
             best,
             instructions,
             memory_bytes,
@@ -617,6 +845,9 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     if let Some(export_path) = &args.export {
         export_results(export_path, &summary)?;
         println!("exported results to {}", export_path.display());
+    }
+    if let Some(budget_path) = &args.budget {
+        compare_to_budget(budget_path, &ramp, best, instructions, memory_bytes)?;
     }
 
     Ok(())
@@ -635,9 +866,9 @@ fn spawn_probe(
         .arg("--contract")
         .arg(&args.contract)
         .arg("--fn")
-        .arg(&args.function)
+        .arg(args.function.as_deref().unwrap_or(""))
         .arg("--ramp")
-        .arg(&args.ramp)
+        .arg(args.ramp.as_deref().unwrap_or(""))
         .arg("--value")
         .arg(value.to_string())
         .args(
@@ -783,7 +1014,7 @@ fn next_ramp_value(current: u32, upper_bound: u32) -> Option<u32> {
 
 /// Refines the boundary between a known success (`low`) and a known failure (`high`)
 /// using binary search, recording every intermediate step in a [`RefinementAudit`]
-/// — including the standardized [`ProbeFailureCategory`] of each failing step.
+/// â including the standardized [`ProbeFailureCategory`] of each failing step.
 /// Re-probes both endpoints before refinement and rejects a contradictory bracket.
 /// The contract must succeed monotonically up to its ceiling: these checks detect
 /// observed inconsistencies, but cannot prove monotonicity at unprobed values.
@@ -877,7 +1108,7 @@ where
 
 /// The hidden child half of the isolation lifecycle documented on [`run`]:
 /// performs exactly one invocation in a throwaway [`Env`] registered from
-/// the `.wasm` and returns `Ok(())` (exit 0) or `Err` (exit 1) — no
+/// the `.wasm` and returns `Ok(())` (exit 0) or `Err` (exit 1) â no
 /// measurement, no output. Because the child dies after a single call, the
 /// parent can classify an abort by signal without losing its own run.
 ///
@@ -1263,22 +1494,136 @@ pub fn export_results(path: &Path, summary: &LimitsSummary) -> Result<(), CliErr
     }
 }
 
-fn measure(args: &LimitsArgs, value: u32) -> Result<(u64, u64), CliError> {
-    let (contract_id, env, function, ramp_index) =
-        load(&args.contract, &args.function, &args.ramp)?;
-    let func = Symbol::new(&env, &args.function);
+fn measure_at(
+    contract: &std::path::Path,
+    function: &str,
+    ramp: &str,
+    arg_values: &[String],
+    value: u32,
+) -> Result<(u64, u64), CliError> {
+    let (contract_id, env, fn_spec, ramp_index) = load(contract, function, ramp)?;
+    let func = Symbol::new(&env, function);
     let mut budget = env.cost_estimate().budget();
     budget.reset_default();
-    let args_vec = build_args(&env, &function, ramp_index, value, &args.arg_values)?;
+    let args_vec = build_args(&env, &fn_spec, ramp_index, value, arg_values)?;
     if !invoke_succeeds(&env, &contract_id, &func, args_vec) {
         return Err(CliError(format!(
-            "internal error: {:?} reported ramp value {value} as successful during probing \
-             but failed on in-process re-measurement for parameter {:?}; re-run to confirm the \
-             boundary is stable, or lower --probe-timeout if the run is racing a hang",
-            args.function, args.ramp
+            "internal error: {:?} reported ramp value {value} as successful during probing              but failed on in-process re-measurement for parameter {:?}; re-run to confirm the              boundary is stable, or lower --probe-timeout if the run is racing a hang",
+            function, ramp
         )));
     }
     Ok((budget.cpu_instruction_cost(), budget.memory_bytes_cost()))
+}
+
+/// Infer which Soroban resource boundary was most likely the binding constraint.
+///
+/// Compares each metric as a fraction of its known mainnet limit. The resource
+/// with the higher fraction is returned; below a 25% threshold, [`ResourceBoundary::Other`]
+/// is returned because neither resource was notably consumed.
+fn infer_resource_boundary(instructions: u64, memory_bytes: u64) -> ResourceBoundary {
+    let insn_frac = instructions as f64 / SOROBAN_CPU_INSN_LIMIT as f64;
+    let mem_frac = memory_bytes as f64 / SOROBAN_MEMORY_LIMIT as f64;
+    const THRESHOLD: f64 = 0.25;
+    if insn_frac < THRESHOLD && mem_frac < THRESHOLD {
+        ResourceBoundary::Other
+    } else if insn_frac >= mem_frac {
+        ResourceBoundary::Instructions
+    } else {
+        ResourceBoundary::Memory
+    }
+}
+
+/// Resolve --fn, --ramp, and --arg values by applying any --preset defaults.
+///
+/// Explicit --fn/--ramp/--arg flags always win over preset defaults.
+/// Returns an error if --fn or --ramp are absent and no preset is given.
+fn resolve_preset_defaults(
+    args: &LimitsArgs,
+) -> Result<(String, String, Vec<String>), CliError> {
+    let (function, ramp, extra_args): (String, String, &[&str]) =
+        if let Some(preset_name) = &args.preset {
+            let preset = RampPreset::from_name(preset_name)?;
+            let function = args.function.clone().unwrap_or_else(|| preset.function().to_string());
+            let ramp = args.ramp.clone().unwrap_or_else(|| preset.ramp().to_string());
+            (function, ramp, preset.default_args())
+        } else {
+            let function = args.function.clone().ok_or_else(|| {
+                CliError("--fn is required unless --preset is given".to_string())
+            })?;
+            let ramp = args.ramp.clone().ok_or_else(|| {
+                CliError("--ramp is required unless --preset is given".to_string())
+            })?;
+            (function, ramp, &[])
+        };
+
+    let mut effective_args = args.arg_values.clone();
+    for default_arg in extra_args {
+        let arg_name = default_arg.split('=').next().unwrap_or("");
+        if !effective_args.iter().any(|a| a.starts_with(&format!("{arg_name}="))) {
+            effective_args.push(default_arg.to_string());
+        }
+    }
+
+    Ok((function, ramp, effective_args))
+}
+
+/// Compare a run's results against a checked-in resource budget file.
+///
+/// Prints a before/after summary for each checked field and returns an error
+/// if any limit is exceeded, so CI fails actionably rather than silently.
+fn compare_to_budget(
+    path: &std::path::Path,
+    ramp: &str,
+    best: u32,
+    instructions: u64,
+    memory_bytes: u64,
+) -> Result<(), CliError> {
+    let contents = std::fs::read_to_string(path).map_err(|err| {
+        CliError(format!(
+            "failed to read resource budget at {}: {err}",
+            path.display()
+        ))
+    })?;
+    let budget = ResourceBudget::parse(&contents)?;
+
+    println!("resource budget check ({}):", path.display());
+
+    let mut violations = Vec::new();
+
+    if let Some(min_best) = budget.min_best {
+        println!("  {ramp} ceiling: {best} (budget minimum: {min_best})");
+        if best < min_best {
+            violations.push(format!(
+                "{ramp} ceiling {best} is below the budget minimum of {min_best}"
+            ));
+        }
+    }
+    if let Some(max_insn) = budget.max_instructions {
+        println!("  instructions: {instructions} (budget maximum: {max_insn})");
+        if instructions > max_insn {
+            violations.push(format!(
+                "instructions {instructions} exceed the budget maximum of {max_insn}"
+            ));
+        }
+    }
+    if let Some(max_mem) = budget.max_memory_bytes {
+        println!("  memory bytes: {memory_bytes} (budget maximum: {max_mem})");
+        if memory_bytes > max_mem {
+            violations.push(format!(
+                "memory bytes {memory_bytes} exceed the budget maximum of {max_mem}"
+            ));
+        }
+    }
+
+    if violations.is_empty() {
+        println!("  all checks passed");
+        Ok(())
+    } else {
+        Err(CliError(format!(
+            "resource budget exceeded: {}",
+            violations.join("; ")
+        )))
+    }
 }
 
 /// Silences the default panic hook for the duration it's held, restoring
@@ -1398,8 +1743,8 @@ fn load(
     let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
         capture_snapshot_at_drop: false,
     });
-    // Auth is not what this command measures — it exists to find a
-    // resource ceiling, not to prove who may call the function — and each
+    // Auth is not what this command measures â it exists to find a
+    // resource ceiling, not to prove who may call the function â and each
     // probe runs in its own throwaway process/Env, so blanket-approving
     // auth here carries none of the AuthMatrix-correctness risk that a
     // shared, longer-lived TestEnv would (see TestToken's mint, which
@@ -1539,7 +1884,7 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, CliError> {
 
 fn invoke_succeeds(env: &Env, contract_id: &Address, func: &Symbol, args: SVec<Val>) -> bool {
     // try_invoke_contract is the SDK's own no-panic call path, used here
-    // so a probe that succeeds doesn't need catch_unwind at all — only a
+    // so a probe that succeeds doesn't need catch_unwind at all â only a
     // *failing* real-WASM call risks the process abort documented above,
     // and that only ever happens in the isolated child process.
     matches!(
@@ -1561,7 +1906,7 @@ fn ramp_val(env: &Env, type_: &ScSpecTypeDef, ramp_value: u32) -> Result<Val, Cl
             Ok(soroban_sdk::Bytes::from_slice(env, &bytes).into_val(env))
         }
         // Any Vec<T> is ramped as its element *count*, filled with a fixed
-        // per-element value from `vec_element_val` — the same "maximum
+        // per-element value from `vec_element_val` â the same "maximum
         // recipients" shape as the original Vec<Address>-only support, now
         // generalized to any element type this command already knows how
         // to default. The element value itself never varies across the
@@ -1616,7 +1961,7 @@ fn default_val(
 ) -> Result<Val, CliError> {
     match type_ {
         // A parameter literally named `token` is, by overwhelming Soroban
-        // convention, a token contract address — and a batch/payout-style
+        // convention, a token contract address â and a batch/payout-style
         // function will call transfer() on it and needs `admin` to hold a
         // real balance, not just a syntactically valid address. Deploying
         // a funded Stellar Asset Contract for this one case is a
@@ -1839,8 +2184,8 @@ mod tests {
     fn sample_baseline() -> Baseline {
         Baseline {
             contract: Some("vault.wasm".to_string()),
-            function: "batch_payout".to_string(),
-            ramp: "recipients".to_string(),
+            function: Some("batch_payout".to_string()),
+            ramp: Some("recipients".to_string()),
             best: 100,
             instructions: 1_000_000,
             memory_bytes: 50_000,
@@ -1851,8 +2196,8 @@ mod tests {
     fn sample_summary() -> LimitsSummary {
         LimitsSummary {
             contract: "vault.wasm".to_string(),
-            function: "batch_payout".to_string(),
-            ramp: "recipients".to_string(),
+            function: Some("batch_payout".to_string()),
+            ramp: Some("recipients".to_string()),
             best: 100,
             instructions: 1_000_000,
             memory_bytes: 50_000,
@@ -1867,6 +2212,7 @@ mod tests {
             reproduction: Some(
                 "invoke `batch_payout` with `recipients` = 100 in a test environment; to re-verify the boundary via CLI run: `soroban-testkit limits --contract vault.wasm --fn batch_payout --ramp recipients`".to_string(),
             ),
+            stopped_by: None,
         }
     }
 
@@ -2272,14 +2618,16 @@ mod tests {
     fn run_distinguishes_validation_failures_from_limits() {
         let err_result = LimitsArgs {
             contract: std::path::PathBuf::from("nonexistent.wasm"),
-            function: "test".to_string(),
-            ramp: "count".to_string(),
+            function: Some("test".to_string()),
+            ramp: Some("count".to_string()),
             probe_timeout: 30,
             jobs: 1,
             baseline: None,
             baseline_tolerance_pct: 5.0,
             save_baseline: None,
             export: None,
+            preset: None,
+            budget: None,
             arg_values: Vec::new(),
         };
 
@@ -2298,14 +2646,16 @@ mod tests {
     fn args_with_jobs(jobs: usize) -> LimitsArgs {
         LimitsArgs {
             contract: std::path::PathBuf::from("nonexistent.wasm"),
-            function: "test".to_string(),
-            ramp: "count".to_string(),
+            function: Some("test".to_string()),
+            ramp: Some("count".to_string()),
             probe_timeout: 30,
             jobs,
             baseline: None,
             baseline_tolerance_pct: 5.0,
             save_baseline: None,
             export: None,
+            preset: None,
+            budget: None,
             arg_values: Vec::new(),
         }
     }
@@ -2772,7 +3122,7 @@ mod tests {
     #[test]
     fn explicit_val_empty_bytes_override_produces_valid_empty_bytes() {
         let env = Env::default();
-        // 0x with no hex digits — the regression input. Must produce the
+        // 0x with no hex digits â the regression input. Must produce the
         // same empty Bytes that `Bytes::new` does, not invalid XDR.
         let val = explicit_val(&env, &ScSpecTypeDef::Bytes, "0x").unwrap();
         let bytes: soroban_sdk::Bytes = val.into_val(&env);
@@ -2934,4 +3284,330 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+    // ---- #378: explain which resource boundary stopped the ramp ----
+
+    #[test]
+    fn resource_boundary_identifies_instruction_bound() {
+        // 80M instructions out of 100M limit = 80%; 1MB out of 40MB = 2.5%
+        let boundary = infer_resource_boundary(80_000_000, 1_000_000);
+        assert_eq!(boundary, ResourceBoundary::Instructions);
+        assert!(!boundary.explanation().is_empty());
+    }
+
+    #[test]
+    fn resource_boundary_identifies_memory_bound() {
+        // 1M instructions out of 100M = 1%; 35MB out of 40MB = 87.5%
+        let boundary = infer_resource_boundary(1_000_000, 36_700_160);
+        assert_eq!(boundary, ResourceBoundary::Memory);
+    }
+
+    #[test]
+    fn resource_boundary_returns_other_when_both_low() {
+        // Both below 25% threshold
+        let boundary = infer_resource_boundary(1_000_000, 100_000);
+        assert_eq!(boundary, ResourceBoundary::Other);
+        assert!(boundary.explanation().contains("neither resource"));
+    }
+
+    #[test]
+    fn resource_boundary_display_matches_serde() {
+        assert_eq!(ResourceBoundary::Instructions.to_string(), "instructions");
+        assert_eq!(ResourceBoundary::Memory.to_string(), "memory");
+        assert_eq!(ResourceBoundary::Other.to_string(), "other");
+        let json = serde_json::to_value(ResourceBoundary::Instructions).unwrap();
+        assert_eq!(json, serde_json::json!("instructions"));
+        let parsed: ResourceBoundary = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, ResourceBoundary::Instructions);
+    }
+
+    #[test]
+    fn stopped_by_appears_in_render_text_when_set() {
+        let summary = LimitsSummary {
+            stopped_by: Some(ResourceBoundary::Instructions),
+            ..sample_summary()
+        };
+        let text = summary.render_text();
+        assert!(text.contains("resource boundary: instructions"), "{text}");
+        assert!(text.contains("compute-bound"), "{text}");
+    }
+
+    #[test]
+    fn stopped_by_appears_in_json_when_set() {
+        let summary = LimitsSummary {
+            stopped_by: Some(ResourceBoundary::Memory),
+            ..sample_summary()
+        };
+        let json: serde_json::Value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["stopped_by"], "memory");
+    }
+
+    #[test]
+    fn stopped_by_omitted_from_json_when_none() {
+        let summary = LimitsSummary {
+            stopped_by: None,
+            ..sample_summary()
+        };
+        let json: serde_json::Value = serde_json::to_value(&summary).unwrap();
+        assert!(json.get("stopped_by").is_none() || json["stopped_by"].is_null());
+    }
+
+    // ---- #379: document how to interpret local instruction measurements ----
+
+    #[test]
+    fn instruction_interpretation_constant_is_non_empty_and_informative() {
+        assert!(!INSTRUCTION_INTERPRETATION.is_empty());
+        assert!(INSTRUCTION_INTERPRETATION.contains("100,000,000"), "{INSTRUCTION_INTERPRETATION}");
+        assert!(INSTRUCTION_INTERPRETATION.contains("mainnet"), "{INSTRUCTION_INTERPRETATION}");
+        assert!(INSTRUCTION_INTERPRETATION.contains("wall-clock"), "{INSTRUCTION_INTERPRETATION}");
+    }
+
+    #[test]
+    fn render_text_includes_instruction_interpretation() {
+        let text = sample_summary().render_text();
+        assert!(
+            text.contains("instruction counts are Soroban host CPU instructions"),
+            "render_text must include instruction interpretation: {text}"
+        );
+        assert!(
+            text.contains("100,000,000"),
+            "render_text must include mainnet limit: {text}"
+        );
+    }
+
+    // ---- #377: named ramp presets ----
+
+    #[test]
+    fn ramp_preset_from_name_accepts_valid_presets() {
+        assert_eq!(RampPreset::from_name("batch-payout").unwrap(), RampPreset::BatchPayout);
+        assert_eq!(RampPreset::from_name("token-transfer").unwrap(), RampPreset::TokenTransfer);
+        assert_eq!(RampPreset::from_name("multi-mint").unwrap(), RampPreset::MultiMint);
+    }
+
+    #[test]
+    fn ramp_preset_from_name_rejects_unknown_preset() {
+        let err = RampPreset::from_name("nonexistent-preset").unwrap_err();
+        assert!(err.0.contains("unknown preset"), "{}", err.0);
+        assert!(err.0.contains("batch-payout"), "{}", err.0);
+        assert!(err.0.contains("token-transfer"), "{}", err.0);
+        assert!(err.0.contains("multi-mint"), "{}", err.0);
+    }
+
+    #[test]
+    fn ramp_preset_function_and_ramp_match_documented_values() {
+        assert_eq!(RampPreset::BatchPayout.function(), "batch_payout");
+        assert_eq!(RampPreset::BatchPayout.ramp(), "recipients");
+        assert_eq!(RampPreset::TokenTransfer.function(), "transfer");
+        assert_eq!(RampPreset::TokenTransfer.ramp(), "amount");
+        assert_eq!(RampPreset::MultiMint.function(), "mint");
+        assert_eq!(RampPreset::MultiMint.ramp(), "count");
+    }
+
+    #[test]
+    fn resolve_preset_defaults_uses_explicit_fn_over_preset() {
+        let args = LimitsArgs {
+            contract: std::path::PathBuf::from("x.wasm"),
+            function: Some("custom_fn".to_string()),
+            ramp: None,
+            arg_values: vec![],
+            probe_timeout: 30,
+            jobs: 1,
+            baseline: None,
+            baseline_tolerance_pct: 5.0,
+            save_baseline: None,
+            export: None,
+            preset: Some("batch-payout".to_string()),
+            budget: None,
+        };
+        let (function, ramp, _) = resolve_preset_defaults(&args).unwrap();
+        assert_eq!(function, "custom_fn");
+        assert_eq!(ramp, "recipients"); // falls back to preset
+    }
+
+    #[test]
+    fn resolve_preset_defaults_uses_explicit_ramp_over_preset() {
+        let args = LimitsArgs {
+            contract: std::path::PathBuf::from("x.wasm"),
+            function: None,
+            ramp: Some("custom_ramp".to_string()),
+            arg_values: vec![],
+            probe_timeout: 30,
+            jobs: 1,
+            baseline: None,
+            baseline_tolerance_pct: 5.0,
+            save_baseline: None,
+            export: None,
+            preset: Some("batch-payout".to_string()),
+            budget: None,
+        };
+        let (function, ramp, _) = resolve_preset_defaults(&args).unwrap();
+        assert_eq!(function, "batch_payout"); // falls back to preset
+        assert_eq!(ramp, "custom_ramp");
+    }
+
+    #[test]
+    fn resolve_preset_defaults_errors_without_preset_and_missing_fn() {
+        let args = LimitsArgs {
+            contract: std::path::PathBuf::from("x.wasm"),
+            function: None,
+            ramp: Some("r".to_string()),
+            arg_values: vec![],
+            probe_timeout: 30,
+            jobs: 1,
+            baseline: None,
+            baseline_tolerance_pct: 5.0,
+            save_baseline: None,
+            export: None,
+            preset: None,
+            budget: None,
+        };
+        let err = resolve_preset_defaults(&args).unwrap_err();
+        assert!(err.0.contains("--fn is required"), "{}", err.0);
+    }
+
+    #[test]
+    fn resolve_preset_defaults_errors_without_preset_and_missing_ramp() {
+        let args = LimitsArgs {
+            contract: std::path::PathBuf::from("x.wasm"),
+            function: Some("f".to_string()),
+            ramp: None,
+            arg_values: vec![],
+            probe_timeout: 30,
+            jobs: 1,
+            baseline: None,
+            baseline_tolerance_pct: 5.0,
+            save_baseline: None,
+            export: None,
+            preset: None,
+            budget: None,
+        };
+        let err = resolve_preset_defaults(&args).unwrap_err();
+        assert!(err.0.contains("--ramp is required"), "{}", err.0);
+    }
+
+    // ---- #376: compare results against a checked-in resource budget ----
+
+    #[test]
+    fn resource_budget_parse_accepts_all_fields_with_comments() {
+        let contents = "# budget for batch_payout
+max_instructions=60000000
+max_memory_bytes=20000000
+min_best=50
+";
+        let budget = ResourceBudget::parse(contents).unwrap();
+        assert_eq!(budget.max_instructions, Some(60_000_000));
+        assert_eq!(budget.max_memory_bytes, Some(20_000_000));
+        assert_eq!(budget.min_best, Some(50));
+    }
+
+    #[test]
+    fn resource_budget_parse_accepts_partial_budget() {
+        let budget = ResourceBudget::parse("max_instructions=5000000
+").unwrap();
+        assert_eq!(budget.max_instructions, Some(5_000_000));
+        assert!(budget.max_memory_bytes.is_none());
+        assert!(budget.min_best.is_none());
+    }
+
+    #[test]
+    fn resource_budget_parse_accepts_empty_file() {
+        let budget = ResourceBudget::parse("# only a comment
+
+").unwrap();
+        assert!(budget.max_instructions.is_none());
+        assert!(budget.max_memory_bytes.is_none());
+        assert!(budget.min_best.is_none());
+    }
+
+    #[test]
+    fn resource_budget_parse_rejects_unknown_key() {
+        let err = ResourceBudget::parse("bogus_key=100
+").unwrap_err();
+        assert!(err.0.contains("unknown key"), "{}", err.0);
+        assert!(err.0.contains("bogus_key"), "{}", err.0);
+    }
+
+    #[test]
+    fn resource_budget_parse_rejects_malformed_line() {
+        let err = ResourceBudget::parse("not-key-value
+").unwrap_err();
+        assert!(err.0.contains("malformed budget file"), "{}", err.0);
+    }
+
+    #[test]
+    fn resource_budget_parse_rejects_non_numeric_value() {
+        let err = ResourceBudget::parse("max_instructions=abc
+").unwrap_err();
+        assert!(err.0.contains("malformed budget"), "{}", err.0);
+    }
+
+    #[test]
+    fn compare_to_budget_passes_when_within_all_limits() {
+        let dir = std::env::temp_dir().join(format!("stk-budget-pass-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pass.budget");
+        std::fs::write(&path, "max_instructions=2000000
+max_memory_bytes=500000
+min_best=50
+").unwrap();
+        let result = compare_to_budget(&path, "recipients", 100, 1_000_000, 200_000);
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn compare_to_budget_fails_when_instructions_exceeded() {
+        let dir = std::env::temp_dir().join(format!("stk-budget-insn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("insn.budget");
+        std::fs::write(&path, "max_instructions=500000
+").unwrap();
+        let err = compare_to_budget(&path, "recipients", 100, 1_000_000, 200_000).unwrap_err();
+        assert!(err.0.contains("instructions 1000000 exceed"), "{}", err.0);
+    }
+
+    #[test]
+    fn compare_to_budget_fails_when_memory_exceeded() {
+        let dir = std::env::temp_dir().join(format!("stk-budget-mem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mem.budget");
+        std::fs::write(&path, "max_memory_bytes=100000
+").unwrap();
+        let err = compare_to_budget(&path, "recipients", 100, 1_000_000, 200_000).unwrap_err();
+        assert!(err.0.contains("memory bytes 200000 exceed"), "{}", err.0);
+    }
+
+    #[test]
+    fn compare_to_budget_fails_when_ceiling_below_minimum() {
+        let dir = std::env::temp_dir().join(format!("stk-budget-ceil-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ceil.budget");
+        std::fs::write(&path, "min_best=200
+").unwrap();
+        let err = compare_to_budget(&path, "recipients", 100, 1_000_000, 200_000).unwrap_err();
+        assert!(err.0.contains("recipients ceiling 100 is below the budget minimum of 200"), "{}", err.0);
+    }
+
+    #[test]
+    fn compare_to_budget_reports_missing_file_actionably() {
+        let missing = std::env::temp_dir().join("this-budget-does-not-exist.budget");
+        let err = compare_to_budget(&missing, "recipients", 100, 1_000_000, 200_000).unwrap_err();
+        assert!(err.0.contains("failed to read resource budget"), "{}", err.0);
+    }
+
+    #[test]
+    fn compare_to_budget_reports_multiple_violations() {
+        let dir = std::env::temp_dir().join(format!("stk-budget-multi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("multi.budget");
+        std::fs::write(&path, "max_instructions=100
+max_memory_bytes=100
+min_best=200
+").unwrap();
+        let err = compare_to_budget(&path, "recipients", 50, 1_000_000, 200_000).unwrap_err();
+        assert!(err.0.contains("resource budget exceeded"), "{}", err.0);
+        // All three violations should be listed
+        assert!(err.0.contains("instructions"), "{}", err.0);
+        assert!(err.0.contains("memory"), "{}", err.0);
+        assert!(err.0.contains("ceiling"), "{}", err.0);
+    }
+
 }
