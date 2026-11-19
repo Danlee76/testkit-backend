@@ -344,6 +344,11 @@ pub struct ProbeSample {
     pub succeeded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_category: Option<ProbeFailureCategory>,
+    /// Wall-clock duration of this probe in milliseconds, measured from spawn
+    /// to result classification. Present for every probe when `--record-probe-duration`
+    /// is set; `None` when the flag is omitted (the default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// The single source of truth for one `limits` run.
@@ -669,6 +674,35 @@ impl BaselineComparison {
     }
 }
 
+/// Which strategy to use during the initial scan phase of a `limits` run.
+///
+/// Pass via `--search-strategy`. The binary-refinement phase that narrows the
+/// bracket found by the scan always runs regardless of strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchStrategy {
+    /// Double the ramp value on each step: 1, 2, 4, 8, … (default). Finds a
+    /// failing bracket in O(log N) probes; best when the ceiling is unknown.
+    #[default]
+    Doubling,
+    /// Advance by a fixed step on each probe. The step size is set by
+    /// `--step` (default 1). Use when you need a fully predictable probe
+    /// sequence or want to explore a narrow range exhaustively.
+    FixedStep,
+}
+
+impl std::str::FromStr for SearchStrategy {
+    type Err = CliError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "doubling" => Ok(SearchStrategy::Doubling),
+            "fixed-step" => Ok(SearchStrategy::FixedStep),
+            other => Err(CliError(format!(
+                "unknown search strategy {other:?}; available strategies: doubling, fixed-step"
+            ))),
+        }
+    }
+}
+
 /// Arguments for `soroban-testkit limits`.
 #[derive(Args)]
 pub struct LimitsArgs {
@@ -766,6 +800,21 @@ pub struct LimitsArgs {
     /// is used as-is.
     #[arg(long, value_name = "PROFILE")]
     profile: Option<String>,
+    /// Strategy used during the initial scan phase that brackets the first
+    /// failing ramp value. `doubling` (the default) doubles on each probe:
+    /// 1, 2, 4, 8, … `fixed-step` advances by a fixed amount set with `--step`.
+    #[arg(long, value_name = "STRATEGY", default_value = "doubling")]
+    search_strategy: SearchStrategy,
+    /// Step size for `--search-strategy fixed-step`. The probe sequence will be
+    /// `--step`, `2 × --step`, `3 × --step`, … up to the search upper bound.
+    /// Ignored unless `--search-strategy fixed-step` is also set.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    step: u32,
+    /// Record the wall-clock duration of every probe in the samples output.
+    /// When set, each `ProbeSample` in `--export-samples` gains a `duration_ms`
+    /// field with the elapsed milliseconds from spawn to result classification.
+    #[arg(long, default_value_t = false)]
+    record_probe_duration: bool,
 }
 
 /// Hidden: runs exactly one probe (a single ramp value) and reports its
@@ -895,9 +944,17 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
 
     if args.dry_run {
         println!("dry-run: would probe {:?} ramping {:?}", function, ramp);
-        println!(
-            "  phase 1: doubling ladder 1, 2, 4, 8, \u{2026} up to {SEARCH_UPPER_BOUND}"
-        );
+        match args.search_strategy {
+            SearchStrategy::Doubling => println!(
+                "  phase 1: doubling ladder 1, 2, 4, 8, \u{2026} up to {SEARCH_UPPER_BOUND}"
+            ),
+            SearchStrategy::FixedStep => println!(
+                "  phase 1: fixed-step ladder {step}, {two_step}, {three_step}, \u{2026} up to {SEARCH_UPPER_BOUND}",
+                step = args.step,
+                two_step = args.step.saturating_mul(2),
+                three_step = args.step.saturating_mul(3),
+            ),
+        }
         println!("  phase 2: binary search to refine bounds");
         if !args.co_ramp.is_empty() {
             println!("  co-ramp parameters: {}", args.co_ramp.join(", "));
@@ -922,12 +979,12 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
 
     // Folds one probe result into the run's statistics. Only called in ramp
     // order, so the counts and the first failure's stderr match a sequential run.
-    let mut record = |value: u32, outcome: ProbeOutcome, stderr: String| {
+    let mut record = |value: u32, outcome: ProbeOutcome, stderr: String, duration_ms: Option<u64>| {
         let (succeeded, failure_category) = match &outcome {
             ProbeOutcome::Succeeded => (true, None),
             ProbeOutcome::Failed(cat) => (false, Some(*cat)),
         };
-        all_samples.push(ProbeSample { value, succeeded, failure_category });
+        all_samples.push(ProbeSample { value, succeeded, failure_category, duration_ms });
         if let ProbeOutcome::Failed(category) = outcome {
             // A contract failure cannot establish a budget ceiling, even if
             // earlier, lower ramp values succeeded.
@@ -949,29 +1006,48 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         Ok(outcome)
     };
 
-    // Find a failing upper bound by doubling. Each batch holds up to `jobs`
-    // consecutive ladder values probed concurrently; results are read back in
-    // ladder order and reading stops at the first failure, so the outcome is
-    // the same as a sequential run.
+    // Validate fixed-step configuration before entering the scan loop.
+    if args.search_strategy == SearchStrategy::FixedStep && args.step == 0 {
+        return Err(CliError("--step must be at least 1 when using --search-strategy fixed-step".to_string()));
+    }
+
+    // Find a failing upper bound. The strategy controls how the scan advances:
+    // - Doubling: 1, 2, 4, 8, … (O(log N) probes; best for unknown ceilings)
+    // - FixedStep: step, 2*step, 3*step, … (predictable sequence; uses --step)
+    // Each batch holds up to `jobs` consecutive values probed concurrently;
+    // results are read back in order and stop at the first failure.
     let mut last_ok: Option<u32> = None;
     let mut high = None;
-    let mut next = Some(1u32);
+    let mut next = Some(match args.search_strategy {
+        SearchStrategy::Doubling => 1u32,
+        SearchStrategy::FixedStep => args.step,
+    });
     while let Some(start) = next {
         if args.max_probes > 0 && probe_count >= args.max_probes {
             break;
         }
-        let batch = ladder_batch(start, SEARCH_UPPER_BOUND, args.jobs);
+        let batch = match args.search_strategy {
+            SearchStrategy::Doubling => ladder_batch(start, SEARCH_UPPER_BOUND, args.jobs),
+            SearchStrategy::FixedStep => {
+                fixed_step_batch(start, SEARCH_UPPER_BOUND, args.step, args.jobs)
+            }
+        };
         let results = probe_batch(&self_exe, &args, &batch, probe_timeout);
         for (value, result) in batch.into_iter().zip(results) {
             probe_count += 1;
             if args.max_probes > 0 && probe_count > args.max_probes {
                 break;
             }
-            let (outcome, stderr) = result?;
-            match record(value, outcome, stderr)? {
+            let (outcome, stderr, duration_ms) = result?;
+            match record(value, outcome, stderr, duration_ms)? {
                 ProbeOutcome::Succeeded => {
                     last_ok = Some(value);
-                    next = next_ramp_value(value, SEARCH_UPPER_BOUND);
+                    next = match args.search_strategy {
+                        SearchStrategy::Doubling => next_ramp_value(value, SEARCH_UPPER_BOUND),
+                        SearchStrategy::FixedStep => {
+                            next_fixed_step_value(value, SEARCH_UPPER_BOUND, args.step)
+                        }
+                    };
                     if next.is_none() {
                         hit_upper_bound = true;
                     }
@@ -1024,8 +1100,8 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
                 return Ok(ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure));
             }
             probe_count += 1;
-            let (outcome, stderr) = spawn_probe(&self_exe, &args, value, probe_timeout)?;
-            record(value, outcome, stderr)
+            let (outcome, stderr, duration_ms) = spawn_probe(&self_exe, &args, value, probe_timeout)?;
+            record(value, outcome, stderr, duration_ms)
         };
         let (last_success, first_failure, audit) =
             refine_upper_bound_audited(last_ok, hi_start, &mut probe)?;
@@ -1129,13 +1205,15 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
 }
 
 /// Runs one probe in its own process and returns its classified outcome with
-/// the captured stderr. It touches no shared state, so calls may run concurrently.
+/// the captured stderr and optional wall-clock duration. It touches no shared
+/// state, so calls may run concurrently.
 fn spawn_probe(
     self_exe: &Path,
     args: &LimitsArgs,
     value: u32,
     probe_timeout: Duration,
-) -> Result<(ProbeOutcome, String), CliError> {
+) -> Result<(ProbeOutcome, String, Option<u64>), CliError> {
+    let probe_start = args.record_probe_duration.then(Instant::now);
     let child = Command::new(self_exe)
         .arg("__limits-probe")
         .arg("--contract")
@@ -1200,7 +1278,8 @@ fn spawn_probe(
         Some(_) => ProbeOutcome::Failed(classify_probe_exit_stderr(&stderr)),
         None => ProbeOutcome::Failed(ProbeFailureCategory::TimedOut),
     };
-    Ok((outcome, stderr))
+    let duration_ms = probe_start.map(|t| t.elapsed().as_millis() as u64);
+    Ok((outcome, stderr, duration_ms))
 }
 
 /// Runs `values` as concurrent probes, one thread each, and returns the results
@@ -1210,7 +1289,7 @@ fn probe_batch(
     args: &LimitsArgs,
     values: &[u32],
     probe_timeout: Duration,
-) -> Vec<Result<(ProbeOutcome, String), CliError>> {
+) -> Vec<Result<(ProbeOutcome, String, Option<u64>), CliError>> {
     std::thread::scope(|scope| {
         let workers: Vec<_> = values
             .iter()
@@ -1300,6 +1379,33 @@ fn next_ramp_value(current: u32, upper_bound: u32) -> Option<u32> {
     } else {
         Some(current.saturating_mul(2).min(upper_bound))
     }
+}
+
+/// Next value in a fixed-step sequence: `current + step`, clamped to `upper_bound`.
+/// Returns `None` when `current` has already reached the bound.
+fn next_fixed_step_value(current: u32, upper_bound: u32, step: u32) -> Option<u32> {
+    if current >= upper_bound {
+        None
+    } else {
+        Some(current.saturating_add(step).min(upper_bound))
+    }
+}
+
+/// A batch of up to `jobs` fixed-step values starting at `start`, each `step`
+/// apart, stopping at `upper_bound`.
+fn fixed_step_batch(start: u32, upper_bound: u32, step: u32, jobs: usize) -> Vec<u32> {
+    let jobs = jobs.max(1);
+    let step = step.max(1);
+    let mut batch = Vec::with_capacity(jobs);
+    let mut current = Some(start.min(upper_bound));
+    while let Some(value) = current {
+        if batch.len() == jobs {
+            break;
+        }
+        batch.push(value);
+        current = next_fixed_step_value(value, upper_bound, step);
+    }
+    batch
 }
 
 /// Refines the boundary between a known success (`low`) and a known failure (`high`)
@@ -2209,6 +2315,12 @@ fn invoke_succeeds(env: &Env, contract_id: &Address, func: &Symbol, args: SVec<V
 fn ramp_val(env: &Env, type_: &ScSpecTypeDef, ramp_value: u32) -> Result<Val, CliError> {
     match type_ {
         ScSpecTypeDef::U32 => Ok(ramp_value.into_val(env)),
+        // Signed integer types are supported: the internal ramp counter is a
+        // u32 (0..=SEARCH_UPPER_BOUND), cast to the target signed type. For
+        // values ≤ i32::MAX / i64::MAX / i128::MAX this is a lossless widening
+        // cast that produces the expected positive ramp sequence. Values above
+        // i32::MAX would wrap negative on cast to i32; in practice the ramp
+        // ceiling for a signed-integer parameter is found well below that bound.
         ScSpecTypeDef::I32 => Ok((ramp_value as i32).into_val(env)),
         ScSpecTypeDef::U64 => Ok((ramp_value as u64).into_val(env)),
         ScSpecTypeDef::I64 => Ok((ramp_value as i64).into_val(env)),
@@ -2950,6 +3062,9 @@ mod tests {
             max_probes: 0,
             wasm_target_dir: None,
             profile: None,
+            search_strategy: SearchStrategy::Doubling,
+            step: 1,
+            record_probe_duration: false,
         };
 
         let result = run(err_result);
@@ -2984,6 +3099,9 @@ mod tests {
             max_probes: 0,
             wasm_target_dir: None,
             profile: None,
+            search_strategy: SearchStrategy::Doubling,
+            step: 1,
+            record_probe_duration: false,
         }
     }
 
@@ -3753,6 +3871,9 @@ mod tests {
             max_probes: 0,
             wasm_target_dir: None,
             profile: None,
+            search_strategy: SearchStrategy::Doubling,
+            step: 1,
+            record_probe_duration: false,
         }
     }
 
@@ -4336,6 +4457,187 @@ min_best=200
         assert_eq!(cmp.current_instructions, 55_000);
         assert_eq!(cmp.baseline_memory_bytes, 10_000);
         assert_eq!(cmp.current_memory_bytes, 11_000);
+    }
+
+    // ---- #364: probe duration recording ----
+
+    #[test]
+    fn probe_sample_duration_ms_is_absent_by_default() {
+        let sample = ProbeSample {
+            value: 10,
+            succeeded: true,
+            failure_category: None,
+            duration_ms: None,
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert!(!json.contains("duration_ms"), "duration_ms should be absent when None: {json}");
+    }
+
+    #[test]
+    fn probe_sample_duration_ms_is_present_when_set() {
+        let sample = ProbeSample {
+            value: 10,
+            succeeded: true,
+            failure_category: None,
+            duration_ms: Some(42),
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert!(json.contains("\"duration_ms\":42"), "duration_ms missing: {json}");
+    }
+
+    #[test]
+    fn probe_sample_duration_ms_round_trips_through_json() {
+        let sample = ProbeSample {
+            value: 7,
+            succeeded: false,
+            failure_category: Some(ProbeFailureCategory::TimedOut),
+            duration_ms: Some(1234),
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        let back: ProbeSample = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.duration_ms, Some(1234));
+        assert_eq!(back.failure_category, Some(ProbeFailureCategory::TimedOut));
+    }
+
+    // ---- #365: search strategy selection ----
+
+    #[test]
+    fn search_strategy_flag_accepts_doubling() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+            "--search-strategy", "doubling",
+        ]).expect("--search-strategy doubling should be accepted");
+        assert_eq!(args.search_strategy, SearchStrategy::Doubling);
+    }
+
+    #[test]
+    fn search_strategy_flag_accepts_fixed_step() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+            "--search-strategy", "fixed-step",
+        ]).expect("--search-strategy fixed-step should be accepted");
+        assert_eq!(args.search_strategy, SearchStrategy::FixedStep);
+    }
+
+    #[test]
+    fn search_strategy_defaults_to_doubling() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+        ]).expect("parse should succeed");
+        assert_eq!(args.search_strategy, SearchStrategy::Doubling);
+    }
+
+    #[test]
+    fn search_strategy_rejects_unknown_value() {
+        let err = SearchStrategy::from_str("exponential").unwrap_err();
+        assert!(err.0.contains("unknown search strategy"), "{}", err.0);
+        assert!(err.0.contains("doubling"), "{}", err.0);
+        assert!(err.0.contains("fixed-step"), "{}", err.0);
+    }
+
+    // ---- #366: fixed-step ramp mode ----
+
+    #[test]
+    fn fixed_step_batch_produces_multiples_of_step() {
+        let batch = fixed_step_batch(10, 100, 10, 5);
+        assert_eq!(batch, vec![10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn fixed_step_batch_clamps_at_upper_bound() {
+        let batch = fixed_step_batch(90, 100, 10, 5);
+        assert_eq!(batch, vec![90, 100]);
+    }
+
+    #[test]
+    fn fixed_step_batch_stops_when_at_upper_bound() {
+        let batch = fixed_step_batch(100, 100, 10, 5);
+        assert_eq!(batch, vec![100]);
+    }
+
+    #[test]
+    fn next_fixed_step_value_advances_by_step() {
+        assert_eq!(next_fixed_step_value(10, 100, 10), Some(20));
+        assert_eq!(next_fixed_step_value(90, 100, 10), Some(100));
+        assert_eq!(next_fixed_step_value(100, 100, 10), None);
+    }
+
+    #[test]
+    fn step_flag_is_accepted_by_limits_args() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+            "--search-strategy", "fixed-step",
+            "--step", "50",
+        ]).expect("--step should be accepted");
+        assert_eq!(args.step, 50);
+        assert_eq!(args.search_strategy, SearchStrategy::FixedStep);
+    }
+
+    // ---- #367: signed integer ramp parameter support ----
+
+    #[test]
+    fn ramp_val_i32_produces_expected_positive_sequence() {
+        let env = Env::default();
+        for v in [0u32, 1, 100, 1000, i32::MAX as u32] {
+            let val = ramp_val(&env, &ScSpecTypeDef::I32, v).unwrap();
+            let got: i32 = val.into_val(&env);
+            assert_eq!(got, v as i32, "i32 cast failed for {v}");
+        }
+    }
+
+    #[test]
+    fn ramp_val_i64_produces_expected_positive_sequence() {
+        let env = Env::default();
+        for v in [0u32, 1, 1_000_000, u32::MAX] {
+            let val = ramp_val(&env, &ScSpecTypeDef::I64, v).unwrap();
+            let got: i64 = val.into_val(&env);
+            assert_eq!(got, v as i64, "i64 cast failed for {v}");
+        }
+    }
+
+    #[test]
+    fn ramp_val_i128_produces_expected_positive_sequence() {
+        let env = Env::default();
+        for v in [0u32, 1, 1_000_000, u32::MAX] {
+            let val = ramp_val(&env, &ScSpecTypeDef::I128, v).unwrap();
+            let got: i128 = val.into_val(&env);
+            assert_eq!(got, v as i128, "i128 cast failed for {v}");
+        }
+    }
+
+    #[test]
+    fn record_probe_duration_flag_defaults_to_false() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+        ]).expect("parse should succeed");
+        assert!(!args.record_probe_duration);
+    }
+
+    #[test]
+    fn record_probe_duration_flag_is_accepted() {
+        let args = LimitsArgs::try_parse_from([
+            "limits",
+            "--contract", "contract.wasm",
+            "--fn", "test",
+            "--ramp", "n",
+            "--record-probe-duration",
+        ]).expect("--record-probe-duration should be accepted");
+        assert!(args.record_probe_duration);
     }
 
 }
