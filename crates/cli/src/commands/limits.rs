@@ -293,10 +293,13 @@ impl ResourceBudget {
             }
         }
 
-        Ok(ResourceBudget { max_instructions, max_memory_bytes, min_best })
+        Ok(ResourceBudget {
+            max_instructions,
+            max_memory_bytes,
+            min_best,
+        })
     }
 }
-
 
 /// The outcome of a single isolated probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,7 +482,12 @@ impl LimitsSummary {
                 "  last failing probe: {}={} [{}]",
                 ramp_str, last.value, last.category
             ));
-            if let Some(stderr) = last.stderr.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(stderr) = last
+                .stderr
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 out.push_str(&format!(": {}", first_line(stderr)));
             }
             out.push('\n');
@@ -1002,7 +1010,14 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    build_args(&env, &function_spec, ramp_index, &co_ramp_indices, 1, &effective_arg_values)?;
+    build_args(
+        &env,
+        &function_spec,
+        ramp_index,
+        &co_ramp_indices,
+        1,
+        &effective_arg_values,
+    )?;
     drop(env);
 
     if args.dry_run {
@@ -1056,9 +1071,16 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
             ProbeOutcome::Succeeded => (true, None),
             ProbeOutcome::Failed(cat) => (false, Some(*cat)),
         };
-        all_samples.push(ProbeSample { value, succeeded, failure_category, duration_ms });
+        all_samples.push(ProbeSample {
+            value,
+            succeeded,
+            failure_category,
+            duration_ms,
+        });
         if succeeded {
-            best_so_far.set(Some(best_so_far.get().map_or(value, |best| best.max(value))));
+            best_so_far.set(Some(
+                best_so_far.get().map_or(value, |best| best.max(value)),
+            ));
         }
         progress.report(all_samples.len(), phase, value, outcome, best_so_far.get());
         if let ProbeOutcome::Failed(category) = outcome {
@@ -1089,7 +1111,9 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
 
     // Validate fixed-step configuration before entering the scan loop.
     if args.search_strategy == SearchStrategy::FixedStep && args.step == 0 {
-        return Err(CliError("--step must be at least 1 when using --search-strategy fixed-step".to_string()));
+        return Err(CliError(
+            "--step must be at least 1 when using --search-strategy fixed-step".to_string(),
+        ));
     }
 
     // Find a failing upper bound. The strategy controls how the scan advances:
@@ -1227,7 +1251,13 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
 
     // Measure resources at the best-known-good value, in-process this
     // time (a known-successful call is safe to make directly).
-    let (instructions, memory_bytes) = measure_at(&args.contract, &function, &ramp, &effective_arg_values, best)?;
+    let (instructions, memory_bytes) = measure_at(
+        &args.contract,
+        &function,
+        &ramp,
+        &effective_arg_values,
+        best,
+    )?;
 
     // Determine which resource boundary stopped the ramp.
     let stopped_by = if hit_upper_bound {
@@ -1267,7 +1297,10 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         probe_samples: all_samples,
         co_ramp: args.co_ramp.clone(),
         compiler_meta: Some(collect_compiler_meta()),
-        wasm_target_dir: args.wasm_target_dir.as_ref().map(|p| p.display().to_string()),
+        wasm_target_dir: args
+            .wasm_target_dir
+            .as_ref()
+            .map(|p| p.display().to_string()),
         profile: args.profile.clone(),
     };
     print!("{}", summary.render_text());
@@ -1345,11 +1378,7 @@ fn spawn_probe(
                 .iter()
                 .flat_map(|dir| ["--wasm-target-dir", dir.to_str().unwrap_or("")]),
         )
-        .args(
-            args.profile
-                .iter()
-                .flat_map(|p| ["--profile", p.as_str()]),
-        )
+        .args(args.profile.iter().flat_map(|p| ["--profile", p.as_str()]))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1505,7 +1534,11 @@ fn format_duration(duration: Duration) -> String {
 /// Rejects timeout settings the run could never honour, before any probe is
 /// spawned, so a bad flag is reported as such rather than as a probe failure.
 fn validate_timeouts(probe_timeout_secs: u64, timeout_secs: Option<u64>) -> Result<(), CliError> {
-    let fits_clock = |secs: u64| Instant::now().checked_add(Duration::from_secs(secs)).is_some();
+    let fits_clock = |secs: u64| {
+        Instant::now()
+            .checked_add(Duration::from_secs(secs))
+            .is_some()
+    };
     if !fits_clock(probe_timeout_secs) {
         return Err(CliError(format!(
             "--probe-timeout {probe_timeout_secs} is too large for the host clock; \
@@ -1580,7 +1613,11 @@ struct ProgressReporter<'a> {
 
 impl<'a> ProgressReporter<'a> {
     fn new(enabled: bool, ramp: &'a str, started: Instant) -> Self {
-        ProgressReporter { enabled, ramp, started }
+        ProgressReporter {
+            enabled,
+            ramp,
+            started,
+        }
     }
 
     fn report(
@@ -1620,7 +1657,11 @@ impl RunClock {
         let started = Instant::now();
         // validate_timeouts already rejected limits that overflow the clock.
         let deadline = limit.and_then(|limit| started.checked_add(limit));
-        RunClock { started, limit, deadline }
+        RunClock {
+            started,
+            limit,
+            deadline,
+        }
     }
 
     /// Time left before the overall deadline; `None` when there is none.
@@ -1669,8 +1710,8 @@ impl RunClock {
         function: &str,
         ramp: &str,
     ) -> Result<(), CliError> {
-        let cut_short = outcome == ProbeOutcome::Failed(ProbeFailureCategory::TimedOut)
-            && wait < probe_timeout;
+        let cut_short =
+            outcome == ProbeOutcome::Failed(ProbeFailureCategory::TimedOut) && wait < probe_timeout;
         if cut_short {
             Err(self.exceeded(probes_run, best, Some(value), function, ramp))
         } else {
@@ -1866,7 +1907,14 @@ pub fn run_probe(args: ProbeArgs) -> Result<(), CliError> {
                 .position(|input| input.name.to_utf8_string_lossy() == name.as_str())
         })
         .collect();
-    let args_vec = build_args(&env, &function, ramp_index, &co_ramp_indices, args.value, &args.arg_values)?;
+    let args_vec = build_args(
+        &env,
+        &function,
+        ramp_index,
+        &co_ramp_indices,
+        args.value,
+        &args.arg_values,
+    )?;
     let func = Symbol::new(&env, &args.function);
     match env.try_invoke_contract::<Val, soroban_sdk::Error>(&contract_id, &func, args_vec) {
         Ok(Ok(_)) => Ok(()),
@@ -2294,19 +2342,24 @@ fn infer_resource_boundary(instructions: u64, memory_bytes: u64) -> ResourceBoun
 ///
 /// Explicit --fn/--ramp/--arg flags always win over preset defaults.
 /// Returns an error if --fn or --ramp are absent and no preset is given.
-fn resolve_preset_defaults(
-    args: &LimitsArgs,
-) -> Result<(String, String, Vec<String>), CliError> {
+fn resolve_preset_defaults(args: &LimitsArgs) -> Result<(String, String, Vec<String>), CliError> {
     let (function, ramp, extra_args): (String, String, &[&str]) =
         if let Some(preset_name) = &args.preset {
             let preset = RampPreset::from_name(preset_name)?;
-            let function = args.function.clone().unwrap_or_else(|| preset.function().to_string());
-            let ramp = args.ramp.clone().unwrap_or_else(|| preset.ramp().to_string());
+            let function = args
+                .function
+                .clone()
+                .unwrap_or_else(|| preset.function().to_string());
+            let ramp = args
+                .ramp
+                .clone()
+                .unwrap_or_else(|| preset.ramp().to_string());
             (function, ramp, preset.default_args())
         } else {
-            let function = args.function.clone().ok_or_else(|| {
-                CliError("--fn is required unless --preset is given".to_string())
-            })?;
+            let function = args
+                .function
+                .clone()
+                .ok_or_else(|| CliError("--fn is required unless --preset is given".to_string()))?;
             let ramp = args.ramp.clone().ok_or_else(|| {
                 CliError("--ramp is required unless --preset is given".to_string())
             })?;
@@ -2316,7 +2369,10 @@ fn resolve_preset_defaults(
     let mut effective_args = args.arg_values.clone();
     for default_arg in extra_args {
         let arg_name = default_arg.split('=').next().unwrap_or("");
-        if !effective_args.iter().any(|a| a.starts_with(&format!("{arg_name}="))) {
+        if !effective_args
+            .iter()
+            .any(|a| a.starts_with(&format!("{arg_name}=")))
+        {
             effective_args.push(default_arg.to_string());
         }
     }
@@ -4168,9 +4224,18 @@ mod tests {
     #[test]
     fn instruction_interpretation_constant_is_non_empty_and_informative() {
         assert!(!INSTRUCTION_INTERPRETATION.is_empty());
-        assert!(INSTRUCTION_INTERPRETATION.contains("100,000,000"), "{INSTRUCTION_INTERPRETATION}");
-        assert!(INSTRUCTION_INTERPRETATION.contains("mainnet"), "{INSTRUCTION_INTERPRETATION}");
-        assert!(INSTRUCTION_INTERPRETATION.contains("wall-clock"), "{INSTRUCTION_INTERPRETATION}");
+        assert!(
+            INSTRUCTION_INTERPRETATION.contains("100,000,000"),
+            "{INSTRUCTION_INTERPRETATION}"
+        );
+        assert!(
+            INSTRUCTION_INTERPRETATION.contains("mainnet"),
+            "{INSTRUCTION_INTERPRETATION}"
+        );
+        assert!(
+            INSTRUCTION_INTERPRETATION.contains("wall-clock"),
+            "{INSTRUCTION_INTERPRETATION}"
+        );
     }
 
     #[test]
@@ -4190,9 +4255,18 @@ mod tests {
 
     #[test]
     fn ramp_preset_from_name_accepts_valid_presets() {
-        assert_eq!(RampPreset::from_name("batch-payout").unwrap(), RampPreset::BatchPayout);
-        assert_eq!(RampPreset::from_name("token-transfer").unwrap(), RampPreset::TokenTransfer);
-        assert_eq!(RampPreset::from_name("multi-mint").unwrap(), RampPreset::MultiMint);
+        assert_eq!(
+            RampPreset::from_name("batch-payout").unwrap(),
+            RampPreset::BatchPayout
+        );
+        assert_eq!(
+            RampPreset::from_name("token-transfer").unwrap(),
+            RampPreset::TokenTransfer
+        );
+        assert_eq!(
+            RampPreset::from_name("multi-mint").unwrap(),
+            RampPreset::MultiMint
+        );
     }
 
     #[test]
@@ -4293,8 +4367,11 @@ min_best=50
 
     #[test]
     fn resource_budget_parse_accepts_partial_budget() {
-        let budget = ResourceBudget::parse("max_instructions=5000000
-").unwrap();
+        let budget = ResourceBudget::parse(
+            "max_instructions=5000000
+",
+        )
+        .unwrap();
         assert_eq!(budget.max_instructions, Some(5_000_000));
         assert!(budget.max_memory_bytes.is_none());
         assert!(budget.min_best.is_none());
@@ -4302,9 +4379,12 @@ min_best=50
 
     #[test]
     fn resource_budget_parse_accepts_empty_file() {
-        let budget = ResourceBudget::parse("# only a comment
+        let budget = ResourceBudget::parse(
+            "# only a comment
 
-").unwrap();
+",
+        )
+        .unwrap();
         assert!(budget.max_instructions.is_none());
         assert!(budget.max_memory_bytes.is_none());
         assert!(budget.min_best.is_none());
@@ -4312,23 +4392,32 @@ min_best=50
 
     #[test]
     fn resource_budget_parse_rejects_unknown_key() {
-        let err = ResourceBudget::parse("bogus_key=100
-").unwrap_err();
+        let err = ResourceBudget::parse(
+            "bogus_key=100
+",
+        )
+        .unwrap_err();
         assert!(err.0.contains("unknown key"), "{}", err.0);
         assert!(err.0.contains("bogus_key"), "{}", err.0);
     }
 
     #[test]
     fn resource_budget_parse_rejects_malformed_line() {
-        let err = ResourceBudget::parse("not-key-value
-").unwrap_err();
+        let err = ResourceBudget::parse(
+            "not-key-value
+",
+        )
+        .unwrap_err();
         assert!(err.0.contains("malformed budget file"), "{}", err.0);
     }
 
     #[test]
     fn resource_budget_parse_rejects_non_numeric_value() {
-        let err = ResourceBudget::parse("max_instructions=abc
-").unwrap_err();
+        let err = ResourceBudget::parse(
+            "max_instructions=abc
+",
+        )
+        .unwrap_err();
         assert!(err.0.contains("malformed budget"), "{}", err.0);
     }
 
@@ -4337,10 +4426,14 @@ min_best=50
         let dir = std::env::temp_dir().join(format!("stk-budget-pass-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pass.budget");
-        std::fs::write(&path, "max_instructions=2000000
+        std::fs::write(
+            &path,
+            "max_instructions=2000000
 max_memory_bytes=500000
 min_best=50
-").unwrap();
+",
+        )
+        .unwrap();
         let result = compare_to_budget(&path, "recipients", 100, 1_000_000, 200_000);
         assert!(result.is_ok(), "{:?}", result.err());
     }
@@ -4350,8 +4443,12 @@ min_best=50
         let dir = std::env::temp_dir().join(format!("stk-budget-insn-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("insn.budget");
-        std::fs::write(&path, "max_instructions=500000
-").unwrap();
+        std::fs::write(
+            &path,
+            "max_instructions=500000
+",
+        )
+        .unwrap();
         let err = compare_to_budget(&path, "recipients", 100, 1_000_000, 200_000).unwrap_err();
         assert!(err.0.contains("instructions 1000000 exceed"), "{}", err.0);
     }
@@ -4361,8 +4458,12 @@ min_best=50
         let dir = std::env::temp_dir().join(format!("stk-budget-mem-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mem.budget");
-        std::fs::write(&path, "max_memory_bytes=100000
-").unwrap();
+        std::fs::write(
+            &path,
+            "max_memory_bytes=100000
+",
+        )
+        .unwrap();
         let err = compare_to_budget(&path, "recipients", 100, 1_000_000, 200_000).unwrap_err();
         assert!(err.0.contains("memory bytes 200000 exceed"), "{}", err.0);
     }
@@ -4372,17 +4473,30 @@ min_best=50
         let dir = std::env::temp_dir().join(format!("stk-budget-ceil-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ceil.budget");
-        std::fs::write(&path, "min_best=200
-").unwrap();
+        std::fs::write(
+            &path,
+            "min_best=200
+",
+        )
+        .unwrap();
         let err = compare_to_budget(&path, "recipients", 100, 1_000_000, 200_000).unwrap_err();
-        assert!(err.0.contains("recipients ceiling 100 is below the budget minimum of 200"), "{}", err.0);
+        assert!(
+            err.0
+                .contains("recipients ceiling 100 is below the budget minimum of 200"),
+            "{}",
+            err.0
+        );
     }
 
     #[test]
     fn compare_to_budget_reports_missing_file_actionably() {
         let missing = std::env::temp_dir().join("this-budget-does-not-exist.budget");
         let err = compare_to_budget(&missing, "recipients", 100, 1_000_000, 200_000).unwrap_err();
-        assert!(err.0.contains("failed to read resource budget"), "{}", err.0);
+        assert!(
+            err.0.contains("failed to read resource budget"),
+            "{}",
+            err.0
+        );
     }
 
     #[test]
@@ -4390,10 +4504,14 @@ min_best=50
         let dir = std::env::temp_dir().join(format!("stk-budget-multi-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("multi.budget");
-        std::fs::write(&path, "max_instructions=100
+        std::fs::write(
+            &path,
+            "max_instructions=100
 max_memory_bytes=100
 min_best=200
-").unwrap();
+",
+        )
+        .unwrap();
         let err = compare_to_budget(&path, "recipients", 50, 1_000_000, 200_000).unwrap_err();
         assert!(err.0.contains("resource budget exceeded"), "{}", err.0);
         // All three violations should be listed
@@ -4408,11 +4526,15 @@ min_best=200
     fn dry_run_flag_accepted_by_limits_args() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
             "--dry-run",
-        ]).expect("--dry-run should be accepted");
+        ])
+        .expect("--dry-run should be accepted");
         assert!(args.dry_run);
     }
 
@@ -4420,10 +4542,14 @@ min_best=200
     fn dry_run_defaults_to_false() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-        ]).expect("parse should succeed");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+        ])
+        .expect("parse should succeed");
         assert!(!args.dry_run);
     }
 
@@ -4433,11 +4559,16 @@ min_best=200
     fn export_samples_flag_accepted_by_limits_args() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-            "--export-samples", "/tmp/samples.json",
-        ]).expect("--export-samples should be accepted");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--export-samples",
+            "/tmp/samples.json",
+        ])
+        .expect("--export-samples should be accepted");
         assert!(args.export_samples.is_some());
     }
 
@@ -4446,14 +4577,33 @@ min_best=200
         let dir = std::env::temp_dir();
         let path = dir.join("test_probe_samples.json");
         let samples = vec![
-            ProbeSample { value: 1, succeeded: true, failure_category: None, duration_ms: None },
-            ProbeSample { value: 2, succeeded: false, failure_category: Some(ProbeFailureCategory::ExitFailure), duration_ms: None },
+            ProbeSample {
+                value: 1,
+                succeeded: true,
+                failure_category: None,
+                duration_ms: None,
+            },
+            ProbeSample {
+                value: 2,
+                succeeded: false,
+                failure_category: Some(ProbeFailureCategory::ExitFailure),
+                duration_ms: None,
+            },
         ];
         export_probe_samples(&path, &samples).expect("export should succeed");
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("\"value\": 1"), "missing value 1: {content}");
-        assert!(content.contains("\"succeeded\": true"), "missing succeeded true: {content}");
-        assert!(content.contains("\"failure_category\": \"exit-failure\""), "missing category: {content}");
+        assert!(
+            content.contains("\"value\": 1"),
+            "missing value 1: {content}"
+        );
+        assert!(
+            content.contains("\"succeeded\": true"),
+            "missing succeeded true: {content}"
+        );
+        assert!(
+            content.contains("\"failure_category\": \"exit-failure\""),
+            "missing category: {content}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -4463,12 +4613,18 @@ min_best=200
     fn co_ramp_flag_accepted_by_limits_args() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-            "--co-ramp", "m",
-            "--co-ramp", "k",
-        ]).expect("--co-ramp should be accepted");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--co-ramp",
+            "m",
+            "--co-ramp",
+            "k",
+        ])
+        .expect("--co-ramp should be accepted");
         assert_eq!(args.co_ramp, vec!["m", "k"]);
     }
 
@@ -4489,10 +4645,13 @@ min_best=200
                 name: soroban_sdk::xdr::StringM::try_from(b"b".to_vec()).unwrap(),
                 type_: soroban_sdk::xdr::ScSpecTypeDef::U32,
             },
-        ]).unwrap();
+        ])
+        .unwrap();
         let function_spec = soroban_sdk::xdr::ScSpecFunctionV0 {
             doc: soroban_sdk::xdr::StringM::default(),
-            name: soroban_sdk::xdr::ScSymbol(soroban_sdk::xdr::StringM::try_from(b"f".to_vec()).unwrap()),
+            name: soroban_sdk::xdr::ScSymbol(
+                soroban_sdk::xdr::StringM::try_from(b"f".to_vec()).unwrap(),
+            ),
             inputs,
             outputs: soroban_sdk::xdr::VecM::default(),
         };
@@ -4507,11 +4666,16 @@ min_best=200
     fn max_probes_flag_accepted_by_limits_args() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-            "--max-probes", "10",
-        ]).expect("--max-probes should be accepted");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--max-probes",
+            "10",
+        ])
+        .expect("--max-probes should be accepted");
         assert_eq!(args.max_probes, 10);
     }
 
@@ -4519,10 +4683,14 @@ min_best=200
     fn max_probes_defaults_to_zero() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-        ]).expect("parse should succeed");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+        ])
+        .expect("parse should succeed");
         assert_eq!(args.max_probes, 0);
     }
 
@@ -4531,7 +4699,10 @@ min_best=200
     #[test]
     fn collect_compiler_meta_returns_non_empty_rustc_version() {
         let meta = collect_compiler_meta();
-        assert!(!meta.rustc_version.is_empty(), "rustc_version should not be empty");
+        assert!(
+            !meta.rustc_version.is_empty(),
+            "rustc_version should not be empty"
+        );
         assert_eq!(meta.wasm_target, "wasm32v1-none");
     }
 
@@ -4542,8 +4713,14 @@ min_best=200
             wasm_target: "wasm32v1-none".to_string(),
         };
         let json = serde_json::to_string(&meta).unwrap();
-        assert!(json.contains("\"rustc-version\""), "expected kebab-case key: {json}");
-        assert!(json.contains("\"wasm-target\""), "expected kebab-case key: {json}");
+        assert!(
+            json.contains("\"rustc-version\""),
+            "expected kebab-case key: {json}"
+        );
+        assert!(
+            json.contains("\"wasm-target\""),
+            "expected kebab-case key: {json}"
+        );
     }
 
     #[test]
@@ -4577,7 +4754,10 @@ min_best=200
             profile: None,
         };
         let json = serde_json::to_string_pretty(&summary).unwrap();
-        assert!(json.contains("rustc-version"), "compiler-meta missing from JSON: {json}");
+        assert!(
+            json.contains("rustc-version"),
+            "compiler-meta missing from JSON: {json}"
+        );
         let decoded: LimitsSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.compiler_meta, Some(meta));
     }
@@ -4612,8 +4792,14 @@ min_best=200
             profile: None,
         };
         let text = summary.render_text();
-        assert!(text.contains("rustc 1.80.0"), "compiler version missing from text: {text}");
-        assert!(text.contains("wasm32v1-none"), "wasm target missing from text: {text}");
+        assert!(
+            text.contains("rustc 1.80.0"),
+            "compiler version missing from text: {text}"
+        );
+        assert!(
+            text.contains("wasm32v1-none"),
+            "wasm target missing from text: {text}"
+        );
     }
 
     // ── #370: custom wasm target directory ───────────────────────────────────
@@ -4622,11 +4808,16 @@ min_best=200
     fn wasm_target_dir_flag_accepted_by_limits_args() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-            "--wasm-target-dir", "/custom/target",
-        ]).expect("--wasm-target-dir should be accepted");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--wasm-target-dir",
+            "/custom/target",
+        ])
+        .expect("--wasm-target-dir should be accepted");
         assert!(args.wasm_target_dir.is_some());
         assert_eq!(
             args.wasm_target_dir.unwrap().to_str().unwrap(),
@@ -4638,10 +4829,14 @@ min_best=200
     fn wasm_target_dir_defaults_to_none() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-        ]).expect("parse should succeed");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+        ])
+        .expect("parse should succeed");
         assert!(args.wasm_target_dir.is_none());
     }
 
@@ -4672,7 +4867,10 @@ min_best=200
             profile: None,
         };
         let text = summary.render_text();
-        assert!(text.contains("/custom/target"), "wasm_target_dir missing from text: {text}");
+        assert!(
+            text.contains("/custom/target"),
+            "wasm_target_dir missing from text: {text}"
+        );
     }
 
     // ── #371: cargo profile selection ────────────────────────────────────────
@@ -4681,11 +4879,16 @@ min_best=200
     fn profile_flag_accepted_by_limits_args() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-            "--profile", "dev",
-        ]).expect("--profile should be accepted");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--profile",
+            "dev",
+        ])
+        .expect("--profile should be accepted");
         assert_eq!(args.profile.as_deref(), Some("dev"));
     }
 
@@ -4693,10 +4896,14 @@ min_best=200
     fn profile_defaults_to_none() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-        ]).expect("parse should succeed");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+        ])
+        .expect("parse should succeed");
         assert!(args.profile.is_none());
     }
 
@@ -4762,7 +4969,11 @@ min_best=200
         let cmp = BaselineComparison::new(&baseline, "n", "f", 90, 50_000, 10_000, 5.0).unwrap();
         assert!(cmp.has_regression());
         assert_eq!(cmp.regressions().len(), 1);
-        assert!(cmp.regressions()[0].contains("ceiling dropped"), "{}", cmp.regressions()[0]);
+        assert!(
+            cmp.regressions()[0].contains("ceiling dropped"),
+            "{}",
+            cmp.regressions()[0]
+        );
     }
 
     #[test]
@@ -4778,7 +4989,11 @@ min_best=200
         };
         let cmp = BaselineComparison::new(&baseline, "n", "f", 100, 60_000, 10_000, 5.0).unwrap();
         assert!(cmp.has_regression());
-        assert!(cmp.regressions()[0].contains("instructions"), "{}", cmp.regressions()[0]);
+        assert!(
+            cmp.regressions()[0].contains("instructions"),
+            "{}",
+            cmp.regressions()[0]
+        );
     }
 
     #[test]
@@ -4807,7 +5022,8 @@ min_best=200
             memory_bytes: 10_000,
             measurement_limitations: None,
         };
-        let err = BaselineComparison::new(&baseline, "n", "f", 100, 50_000, 10_000, 5.0).unwrap_err();
+        let err =
+            BaselineComparison::new(&baseline, "n", "f", 100, 50_000, 10_000, 5.0).unwrap_err();
         assert!(err.0.contains("other_fn"), "{}", err.0);
     }
 
@@ -4842,7 +5058,10 @@ min_best=200
             duration_ms: None,
         };
         let json = serde_json::to_string(&sample).unwrap();
-        assert!(!json.contains("duration_ms"), "duration_ms should be absent when None: {json}");
+        assert!(
+            !json.contains("duration_ms"),
+            "duration_ms should be absent when None: {json}"
+        );
     }
 
     #[test]
@@ -4854,7 +5073,10 @@ min_best=200
             duration_ms: Some(42),
         };
         let json = serde_json::to_string(&sample).unwrap();
-        assert!(json.contains("\"duration_ms\":42"), "duration_ms missing: {json}");
+        assert!(
+            json.contains("\"duration_ms\":42"),
+            "duration_ms missing: {json}"
+        );
     }
 
     #[test]
@@ -4877,11 +5099,16 @@ min_best=200
     fn search_strategy_flag_accepts_doubling() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-            "--search-strategy", "doubling",
-        ]).expect("--search-strategy doubling should be accepted");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--search-strategy",
+            "doubling",
+        ])
+        .expect("--search-strategy doubling should be accepted");
         assert_eq!(args.search_strategy, SearchStrategy::Doubling);
     }
 
@@ -4889,11 +5116,16 @@ min_best=200
     fn search_strategy_flag_accepts_fixed_step() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-            "--search-strategy", "fixed-step",
-        ]).expect("--search-strategy fixed-step should be accepted");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--search-strategy",
+            "fixed-step",
+        ])
+        .expect("--search-strategy fixed-step should be accepted");
         assert_eq!(args.search_strategy, SearchStrategy::FixedStep);
     }
 
@@ -4901,10 +5133,14 @@ min_best=200
     fn search_strategy_defaults_to_doubling() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-        ]).expect("parse should succeed");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+        ])
+        .expect("parse should succeed");
         assert_eq!(args.search_strategy, SearchStrategy::Doubling);
     }
 
@@ -4947,12 +5183,18 @@ min_best=200
     fn step_flag_is_accepted_by_limits_args() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-            "--search-strategy", "fixed-step",
-            "--step", "50",
-        ]).expect("--step should be accepted");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+            "--search-strategy",
+            "fixed-step",
+            "--step",
+            "50",
+        ])
+        .expect("--step should be accepted");
         assert_eq!(args.step, 50);
         assert_eq!(args.search_strategy, SearchStrategy::FixedStep);
     }
@@ -4993,10 +5235,14 @@ min_best=200
     fn record_probe_duration_flag_defaults_to_false() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
-        ]).expect("parse should succeed");
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
+        ])
+        .expect("parse should succeed");
         assert!(!args.record_probe_duration);
     }
 
@@ -5004,14 +5250,17 @@ min_best=200
     fn record_probe_duration_flag_is_accepted() {
         let args = LimitsArgs::try_parse_from([
             "limits",
-            "--contract", "contract.wasm",
-            "--fn", "test",
-            "--ramp", "n",
+            "--contract",
+            "contract.wasm",
+            "--fn",
+            "test",
+            "--ramp",
+            "n",
             "--record-probe-duration",
-        ]).expect("--record-probe-duration should be accepted");
+        ])
+        .expect("--record-probe-duration should be accepted");
         assert!(args.record_probe_duration);
     }
-
 
     // ---- #360: per-probe timeout ----
 
@@ -5053,7 +5302,10 @@ min_best=200
         let args = LimitsArgs::try_parse_from(base.iter().copied().chain(["--probe-timeout", "5"]))
             .unwrap();
         assert_eq!(args.probe_timeout, 5);
-        assert!(LimitsArgs::try_parse_from(base.iter().copied().chain(["--probe-timeout", "-1"])).is_err());
+        assert!(
+            LimitsArgs::try_parse_from(base.iter().copied().chain(["--probe-timeout", "-1"]))
+                .is_err()
+        );
     }
 
     // ---- #361: overall command timeout ----
@@ -5061,10 +5313,18 @@ min_best=200
     #[test]
     fn overall_timeout_must_be_positive_and_fit_the_clock() {
         let zero = validate_timeouts(30, Some(0)).unwrap_err();
-        assert!(zero.0.contains("--timeout must be at least 1 second"), "{}", zero.0);
+        assert!(
+            zero.0.contains("--timeout must be at least 1 second"),
+            "{}",
+            zero.0
+        );
         let huge = validate_timeouts(30, Some(u64::MAX)).unwrap_err();
         assert!(huge.0.contains("--timeout"), "{}", huge.0);
-        assert!(huge.0.contains("too large for the host clock"), "{}", huge.0);
+        assert!(
+            huge.0.contains("too large for the host clock"),
+            "{}",
+            huge.0
+        );
         validate_timeouts(30, Some(1)).unwrap();
         validate_timeouts(30, Some(600)).unwrap();
     }
@@ -5073,14 +5333,18 @@ min_best=200
     fn timeout_flag_is_optional() {
         let base = ["limits", "--contract", "c.wasm", "--fn", "f", "--ramp", "n"];
         assert_eq!(LimitsArgs::try_parse_from(base).unwrap().timeout, None);
-        let args = LimitsArgs::try_parse_from(base.iter().copied().chain(["--timeout", "120"])).unwrap();
+        let args =
+            LimitsArgs::try_parse_from(base.iter().copied().chain(["--timeout", "120"])).unwrap();
         assert_eq!(args.timeout, Some(120));
     }
 
     #[test]
     fn without_an_overall_timeout_probes_get_the_full_per_probe_timeout() {
         let clock = RunClock::start(None);
-        assert_eq!(clock.probe_wait(Duration::from_secs(30)), Duration::from_secs(30));
+        assert_eq!(
+            clock.probe_wait(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
         clock.check(5, Some(3), "f", "n").unwrap();
     }
 
@@ -5090,21 +5354,38 @@ min_best=200
         let wait = clock.probe_wait(Duration::from_secs(30));
         assert!(wait <= Duration::from_secs(2), "{wait:?}");
         // A per-probe timeout shorter than the time left is used as-is.
-        assert_eq!(clock.probe_wait(Duration::from_millis(10)), Duration::from_millis(10));
+        assert_eq!(
+            clock.probe_wait(Duration::from_millis(10)),
+            Duration::from_millis(10)
+        );
     }
 
     #[test]
     fn an_expired_deadline_reports_progress_and_how_to_recover() {
         let clock = RunClock::start(Some(Duration::ZERO));
-        let err = clock.check(7, Some(16), "batch_payout", "recipients").unwrap_err();
-        assert!(err.0.contains("\"batch_payout\" exceeded --timeout (0ms)"), "{}", err.0);
+        let err = clock
+            .check(7, Some(16), "batch_payout", "recipients")
+            .unwrap_err();
+        assert!(
+            err.0.contains("\"batch_payout\" exceeded --timeout (0ms)"),
+            "{}",
+            err.0
+        );
         assert!(err.0.contains("after 7 probe(s)"), "{}", err.0);
-        assert!(err.0.contains("highest recipients verified so far is 16"), "{}", err.0);
+        assert!(
+            err.0.contains("highest recipients verified so far is 16"),
+            "{}",
+            err.0
+        );
         assert!(err.0.contains("boundary was not confirmed"), "{}", err.0);
         assert!(err.0.contains("Raise --timeout"), "{}", err.0);
 
         let none = clock.check(1, None, "f", "n").unwrap_err();
-        assert!(none.0.contains("no n value had succeeded yet"), "{}", none.0);
+        assert!(
+            none.0.contains("no n value had succeeded yet"),
+            "{}",
+            none.0
+        );
     }
 
     #[test]
@@ -5112,10 +5393,23 @@ min_best=200
         let clock = RunClock::start(None);
         let timed_out = ProbeOutcome::Failed(ProbeFailureCategory::TimedOut);
         let err = clock
-            .check_cut_short(timed_out, Duration::from_secs(1), Duration::from_secs(30), 9, 4, Some(8), "f", "n")
+            .check_cut_short(
+                timed_out,
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+                9,
+                4,
+                Some(8),
+                "f",
+                "n",
+            )
             .unwrap_err();
         assert!(err.0.contains("while probing n=9"), "{}", err.0);
-        assert!(err.0.contains("highest n verified so far is 8"), "{}", err.0);
+        assert!(
+            err.0.contains("highest n verified so far is 8"),
+            "{}",
+            err.0
+        );
     }
 
     #[test]
@@ -5123,11 +5417,25 @@ min_best=200
         let clock = RunClock::start(None);
         let full = Duration::from_secs(30);
         let timed_out = ProbeOutcome::Failed(ProbeFailureCategory::TimedOut);
-        clock.check_cut_short(timed_out, full, full, 9, 4, Some(8), "f", "n").unwrap();
+        clock
+            .check_cut_short(timed_out, full, full, 9, 4, Some(8), "f", "n")
+            .unwrap();
         // Other outcomes are never treated as the deadline, even when clamped.
-        for outcome in [ProbeOutcome::Succeeded, ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure)] {
+        for outcome in [
+            ProbeOutcome::Succeeded,
+            ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure),
+        ] {
             clock
-                .check_cut_short(outcome, Duration::from_secs(1), full, 9, 4, Some(8), "f", "n")
+                .check_cut_short(
+                    outcome,
+                    Duration::from_secs(1),
+                    full,
+                    9,
+                    4,
+                    Some(8),
+                    "f",
+                    "n",
+                )
                 .unwrap();
         }
     }
@@ -5187,7 +5495,11 @@ min_best=200
     fn progress_flag_defaults_to_off() {
         let base = ["limits", "--contract", "c.wasm", "--fn", "f", "--ramp", "n"];
         assert!(!LimitsArgs::try_parse_from(base).unwrap().progress);
-        assert!(LimitsArgs::try_parse_from(base.iter().copied().chain(["--progress"])).unwrap().progress);
+        assert!(
+            LimitsArgs::try_parse_from(base.iter().copied().chain(["--progress"]))
+                .unwrap()
+                .progress
+        );
     }
 
     // ---- #363: last failing probe ----
@@ -5207,7 +5519,10 @@ min_best=200
     fn text_summary_reports_the_last_failing_probe_next_to_the_maximum_success() {
         let text = summary_with_last_failure(Some("HostError: budget exceeded")).render_text();
         let lines: Vec<&str> = text.lines().collect();
-        let best = lines.iter().position(|l| l.starts_with("last successful")).unwrap();
+        let best = lines
+            .iter()
+            .position(|l| l.starts_with("last successful"))
+            .unwrap();
         let last = lines
             .iter()
             .position(|l| l.contains("last failing probe:"))
@@ -5221,8 +5536,13 @@ min_best=200
 
     #[test]
     fn last_failing_probe_line_keeps_only_the_first_stderr_line() {
-        let text = summary_with_last_failure(Some("\n  panicked at host.rs\nstack backtrace:\n  0: ...")).render_text();
-        assert!(text.contains("recipients=101 [exit-failure]: panicked at host.rs\n"), "{text}");
+        let text =
+            summary_with_last_failure(Some("\n  panicked at host.rs\nstack backtrace:\n  0: ..."))
+                .render_text();
+        assert!(
+            text.contains("recipients=101 [exit-failure]: panicked at host.rs\n"),
+            "{text}"
+        );
         assert!(!text.contains("stack backtrace"), "{text}");
     }
 
@@ -5230,7 +5550,10 @@ min_best=200
     fn last_failing_probe_without_stderr_still_reports_value_and_category() {
         for stderr in [None, Some("   ")] {
             let text = summary_with_last_failure(stderr).render_text();
-            assert!(text.contains("  last failing probe: recipients=101 [exit-failure]\n"), "{text}");
+            assert!(
+                text.contains("  last failing probe: recipients=101 [exit-failure]\n"),
+                "{text}"
+            );
         }
     }
 

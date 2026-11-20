@@ -864,8 +864,7 @@ fn limits_dry_run_prints_planned_probes_and_exits_zero() {
 fn limits_dry_run_does_not_execute_probes() {
     // dry-run must not write any output files even when --export is given.
     let wasm = ensure_vault_wasm();
-    let dir =
-        std::env::temp_dir().join(format!("stk-dryrun-no-export-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("stk-dryrun-no-export-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let export_path = dir.join("dry.json");
 
@@ -914,8 +913,7 @@ fn limits_dry_run_shows_max_probes_limit_when_set() {
 #[test]
 fn limits_export_samples_writes_json_array_of_probes() {
     let wasm = ensure_vault_wasm();
-    let dir =
-        std::env::temp_dir().join(format!("stk-samples-export-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("stk-samples-export-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let samples_path = dir.join("samples.json");
 
@@ -941,7 +939,10 @@ fn limits_export_samples_writes_json_array_of_probes() {
     assert!(!arr.is_empty(), "samples array must not be empty");
     for entry in arr {
         assert!(entry["value"].as_u64().is_some(), "missing value: {entry}");
-        assert!(entry["succeeded"].as_bool().is_some(), "missing succeeded: {entry}");
+        assert!(
+            entry["succeeded"].as_bool().is_some(),
+            "missing succeeded: {entry}"
+        );
     }
     assert_eq!(arr[0]["value"], 1, "first sample must be value=1");
 
@@ -951,8 +952,7 @@ fn limits_export_samples_writes_json_array_of_probes() {
 #[test]
 fn limits_export_samples_stdout_reports_path() {
     let wasm = ensure_vault_wasm();
-    let dir =
-        std::env::temp_dir().join(format!("stk-samples-stdout-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("stk-samples-stdout-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let samples_path = dir.join("samples.json");
 
@@ -1190,7 +1190,10 @@ fn limits_rejects_a_probe_timeout_the_clock_cannot_represent_before_probing() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--probe-timeout"), "{stderr}");
     assert!(stderr.contains("too large for the host clock"), "{stderr}");
-    assert!(!export.exists(), "no report may be written for a rejected flag");
+    assert!(
+        !export.exists(),
+        "no report may be written for a rejected flag"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -1222,10 +1225,8 @@ fn limits_rejects_a_zero_overall_timeout() {
 #[test]
 fn limits_overall_timeout_stops_a_long_ramp_with_partial_results() {
     let wasm = ensure_vault_wasm();
-    let root = std::env::temp_dir().join(format!(
-        "stk-limits-overall-timeout-{}",
-        std::process::id()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("stk-limits-overall-timeout-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let export = root.join("report.json");
     let start = std::time::Instant::now();
@@ -1389,10 +1390,7 @@ fn limits_progress_reports_the_failing_probe_before_a_contract_error() {
 #[test]
 fn limits_reports_the_last_failing_probe_alongside_the_maximum_success() {
     let wasm = ensure_vault_wasm();
-    let root = std::env::temp_dir().join(format!(
-        "stk-limits-last-failure-{}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("stk-limits-last-failure-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let export = root.join("report.json");
     let output = run(&[

@@ -227,12 +227,8 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     }
 
     if !output.status.success() {
-        let mut message = coverage_failure_message(
-            output.status,
-            args.open,
-            args.fail_under,
-            &captured_stderr,
-        );
+        let mut message =
+            coverage_failure_message(output.status, args.open, args.fail_under, &captured_stderr);
         // Nothing is deleted on failure. Name any output files still on disk so
         // the user can inspect them, and say they were not validated.
         let kept = existing_artifacts(&args);
@@ -253,9 +249,10 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
 
 /// `lcov.info` path, inside `--output-dir` when given.
 fn lcov_output_path(args: &CoverageArgs) -> std::path::PathBuf {
-    args.output_dir
-        .as_ref()
-        .map_or_else(|| std::path::PathBuf::from("lcov.info"), |dir| dir.join("lcov.info"))
+    args.output_dir.as_ref().map_or_else(
+        || std::path::PathBuf::from("lcov.info"),
+        |dir| dir.join("lcov.info"),
+    )
 }
 
 /// JSON report path: `--output`, else `coverage.json` inside `--output-dir`.
@@ -892,7 +889,10 @@ mod tests {
     #[test]
     fn new_collection_flags_are_not_forwarded_by_default() {
         let rendered = rendered_args(&build_command(&args(&[], &[])).unwrap());
-        assert!(!rendered.contains(&"--no-clean".to_string()), "{rendered:?}");
+        assert!(
+            !rendered.contains(&"--no-clean".to_string()),
+            "{rendered:?}"
+        );
         assert!(
             !rendered.contains(&"--ignore-filename-regex".to_string()),
             "{rendered:?}"
@@ -974,7 +974,10 @@ mod tests {
             note.contains("were left on disk and were not validated"),
             "{note}"
         );
-        assert!(note.contains(&format!("'{}'", json_path.display())), "{note}");
+        assert!(
+            note.contains(&format!("'{}'", json_path.display())),
+            "{note}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1844,10 +1847,8 @@ mod tests {
 
     #[test]
     fn validate_coverage_outputs_fails_for_malformed_json_content() {
-        let dir = std::env::temp_dir().join(format!(
-            "stk-cov-val-malformed-json-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("stk-cov-val-malformed-json-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let json_path = dir.join("coverage.json");
 
@@ -1903,7 +1904,10 @@ mod tests {
                 || msg_fail_under.contains("terminated by signal"),
             "{msg_fail_under}"
         );
-        assert!(!msg_fail_under.to_lowercase().contains("success"), "{msg_fail_under}");
+        assert!(
+            !msg_fail_under.to_lowercase().contains("success"),
+            "{msg_fail_under}"
+        );
 
         let msg_open = coverage_failure_message(status, true, None, "");
         assert!(
