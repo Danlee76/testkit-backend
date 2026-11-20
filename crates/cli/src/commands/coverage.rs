@@ -227,12 +227,8 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     }
 
     if !output.status.success() {
-        let mut message = coverage_failure_message(
-            output.status,
-            args.open,
-            args.fail_under,
-            &captured_stderr,
-        );
+        let mut message =
+            coverage_failure_message(output.status, args.open, args.fail_under, &captured_stderr);
         // Nothing is deleted on failure. Name any output files still on disk so
         // the user can inspect them, and say they were not validated.
         let kept = existing_artifacts(&args);
@@ -253,9 +249,10 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
 
 /// `lcov.info` path, inside `--output-dir` when given.
 fn lcov_output_path(args: &CoverageArgs) -> std::path::PathBuf {
-    args.output_dir
-        .as_ref()
-        .map_or_else(|| std::path::PathBuf::from("lcov.info"), |dir| dir.join("lcov.info"))
+    args.output_dir.as_ref().map_or_else(
+        || std::path::PathBuf::from("lcov.info"),
+        |dir| dir.join("lcov.info"),
+    )
 }
 
 /// JSON report path: `--output`, else `coverage.json` inside `--output-dir`.
@@ -612,19 +609,21 @@ pub fn augment_coverage_json(
         line_percent,
     };
 
+    // Describe the root before borrowing it mutably; the error closure below
+    // cannot borrow `root` again while `as_object_mut` holds it.
+    let root_kind = match &root {
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Object(_) => "an object", // unreachable
+    };
     let obj = root.as_object_mut().ok_or_else(|| {
         CliError(format!(
             "coverage JSON output has unexpected structure: expected a JSON object at the root, \
-             got {}; this usually means the coverage tool produced malformed or unexpected output — \
-             check the coverage run output above for errors",
-            match &root {
-                serde_json::Value::Array(_) => "an array",
-                serde_json::Value::Null => "null",
-                serde_json::Value::Bool(_) => "a boolean",
-                serde_json::Value::Number(_) => "a number",
-                serde_json::Value::String(_) => "a string",
-                serde_json::Value::Object(_) => "an object", // unreachable
-            }
+             got {root_kind}; this usually means the coverage tool produced malformed or unexpected output — \
+             check the coverage run output above for errors"
         ))
     })?;
 
@@ -890,7 +889,10 @@ mod tests {
     #[test]
     fn new_collection_flags_are_not_forwarded_by_default() {
         let rendered = rendered_args(&build_command(&args(&[], &[])).unwrap());
-        assert!(!rendered.contains(&"--no-clean".to_string()), "{rendered:?}");
+        assert!(
+            !rendered.contains(&"--no-clean".to_string()),
+            "{rendered:?}"
+        );
         assert!(
             !rendered.contains(&"--ignore-filename-regex".to_string()),
             "{rendered:?}"
@@ -972,7 +974,10 @@ mod tests {
             note.contains("were left on disk and were not validated"),
             "{note}"
         );
-        assert!(note.contains(&format!("'{}'", json_path.display())), "{note}");
+        assert!(
+            note.contains(&format!("'{}'", json_path.display())),
+            "{note}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1797,7 +1802,7 @@ mod tests {
     #[test]
     fn augment_coverage_json_rejects_non_object_root() {
         // JSON array root — valid JSON but wrong schema
-        let err = augment_coverage_json(r#"[]"#).unwrap_err();
+        let err = augment_coverage_json(r#"[]"#, &[]).unwrap_err();
         assert!(
             err.0.contains("unexpected structure"),
             "expected 'unexpected structure' in: {}",
@@ -1806,17 +1811,17 @@ mod tests {
         assert!(err.0.contains("an array"), "{}", err.0);
 
         // JSON null root
-        let err = augment_coverage_json("null").unwrap_err();
+        let err = augment_coverage_json("null", &[]).unwrap_err();
         assert!(err.0.contains("unexpected structure"), "{}", err.0);
         assert!(err.0.contains("null"), "{}", err.0);
 
         // JSON string root
-        let err = augment_coverage_json(r#""hello""#).unwrap_err();
+        let err = augment_coverage_json(r#""hello""#, &[]).unwrap_err();
         assert!(err.0.contains("unexpected structure"), "{}", err.0);
         assert!(err.0.contains("a string"), "{}", err.0);
 
         // JSON number root
-        let err = augment_coverage_json("42").unwrap_err();
+        let err = augment_coverage_json("42", &[]).unwrap_err();
         assert!(err.0.contains("unexpected structure"), "{}", err.0);
         assert!(err.0.contains("a number"), "{}", err.0);
     }
@@ -1824,7 +1829,7 @@ mod tests {
     #[test]
     fn augment_coverage_json_rejects_malformed_json() {
         // Syntactically invalid JSON
-        let err = augment_coverage_json("{not valid json}").unwrap_err();
+        let err = augment_coverage_json("{not valid json}", &[]).unwrap_err();
         assert!(
             err.0.contains("failed to parse coverage JSON output"),
             "{}",
@@ -1832,7 +1837,7 @@ mod tests {
         );
 
         // Truncated JSON
-        let err = augment_coverage_json(r#"{"data": ["#).unwrap_err();
+        let err = augment_coverage_json(r#"{"data": ["#, &[]).unwrap_err();
         assert!(
             err.0.contains("failed to parse coverage JSON output"),
             "{}",
@@ -1842,10 +1847,8 @@ mod tests {
 
     #[test]
     fn validate_coverage_outputs_fails_for_malformed_json_content() {
-        let dir = std::env::temp_dir().join(format!(
-            "stk-cov-val-malformed-json-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("stk-cov-val-malformed-json-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let json_path = dir.join("coverage.json");
 
@@ -1888,22 +1891,25 @@ mod tests {
 
         let status = std::process::ExitStatus::from_raw(256); // exit code 1
 
-        let msg = coverage_failure_message(status, false, None);
+        let msg = coverage_failure_message(status, false, None, "");
         assert!(
             msg.contains("coverage run failed") || msg.contains("terminated by signal"),
             "expected failure indication, got: {msg}"
         );
         assert!(!msg.to_lowercase().contains("success"), "{msg}");
 
-        let msg_fail_under = coverage_failure_message(status, false, Some(80.0));
+        let msg_fail_under = coverage_failure_message(status, false, Some(80.0), "");
         assert!(
             msg_fail_under.contains("coverage run failed")
                 || msg_fail_under.contains("terminated by signal"),
             "{msg_fail_under}"
         );
-        assert!(!msg_fail_under.to_lowercase().contains("success"), "{msg_fail_under}");
+        assert!(
+            !msg_fail_under.to_lowercase().contains("success"),
+            "{msg_fail_under}"
+        );
 
-        let msg_open = coverage_failure_message(status, true, None);
+        let msg_open = coverage_failure_message(status, true, None, "");
         assert!(
             msg_open.contains("coverage run failed") || msg_open.contains("terminated by signal"),
             "{msg_open}"
