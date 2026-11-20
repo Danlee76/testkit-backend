@@ -724,19 +724,21 @@ pub fn augment_coverage_json(
         line_percent,
     };
 
+    // Describe the root before borrowing it mutably; the error closure below
+    // cannot borrow `root` again while `as_object_mut` holds it.
+    let root_kind = match &root {
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Object(_) => "an object", // unreachable
+    };
     let obj = root.as_object_mut().ok_or_else(|| {
         CliError(format!(
             "coverage JSON output has unexpected structure: expected a JSON object at the root, \
-             got {}; this usually means the coverage tool produced malformed or unexpected output — \
-             check the coverage run output above for errors",
-            match &root {
-                serde_json::Value::Array(_) => "an array",
-                serde_json::Value::Null => "null",
-                serde_json::Value::Bool(_) => "a boolean",
-                serde_json::Value::Number(_) => "a number",
-                serde_json::Value::String(_) => "a string",
-                serde_json::Value::Object(_) => "an object", // unreachable
-            }
+             got {root_kind}; this usually means the coverage tool produced malformed or unexpected output — \
+             check the coverage run output above for errors"
         ))
     })?;
 
@@ -1966,7 +1968,7 @@ mod tests {
     #[test]
     fn augment_coverage_json_rejects_non_object_root() {
         // JSON array root — valid JSON but wrong schema
-        let err = augment_coverage_json(r#"[]"#).unwrap_err();
+        let err = augment_coverage_json(r#"[]"#, &[]).unwrap_err();
         assert!(
             err.0.contains("unexpected structure"),
             "expected 'unexpected structure' in: {}",
@@ -1975,17 +1977,17 @@ mod tests {
         assert!(err.0.contains("an array"), "{}", err.0);
 
         // JSON null root
-        let err = augment_coverage_json("null").unwrap_err();
+        let err = augment_coverage_json("null", &[]).unwrap_err();
         assert!(err.0.contains("unexpected structure"), "{}", err.0);
         assert!(err.0.contains("null"), "{}", err.0);
 
         // JSON string root
-        let err = augment_coverage_json(r#""hello""#).unwrap_err();
+        let err = augment_coverage_json(r#""hello""#, &[]).unwrap_err();
         assert!(err.0.contains("unexpected structure"), "{}", err.0);
         assert!(err.0.contains("a string"), "{}", err.0);
 
         // JSON number root
-        let err = augment_coverage_json("42").unwrap_err();
+        let err = augment_coverage_json("42", &[]).unwrap_err();
         assert!(err.0.contains("unexpected structure"), "{}", err.0);
         assert!(err.0.contains("a number"), "{}", err.0);
     }
@@ -1993,7 +1995,7 @@ mod tests {
     #[test]
     fn augment_coverage_json_rejects_malformed_json() {
         // Syntactically invalid JSON
-        let err = augment_coverage_json("{not valid json}").unwrap_err();
+        let err = augment_coverage_json("{not valid json}", &[]).unwrap_err();
         assert!(
             err.0.contains("failed to parse coverage JSON output"),
             "{}",
@@ -2001,7 +2003,7 @@ mod tests {
         );
 
         // Truncated JSON
-        let err = augment_coverage_json(r#"{"data": ["#).unwrap_err();
+        let err = augment_coverage_json(r#"{"data": ["#, &[]).unwrap_err();
         assert!(
             err.0.contains("failed to parse coverage JSON output"),
             "{}",
@@ -2055,14 +2057,14 @@ mod tests {
 
         let status = std::process::ExitStatus::from_raw(256); // exit code 1
 
-        let msg = coverage_failure_message(status, false, None);
+        let msg = coverage_failure_message(status, false, None, "");
         assert!(
             msg.contains("coverage run failed") || msg.contains("terminated by signal"),
             "expected failure indication, got: {msg}"
         );
         assert!(!msg.to_lowercase().contains("success"), "{msg}");
 
-        let msg_fail_under = coverage_failure_message(status, false, Some(80.0));
+        let msg_fail_under = coverage_failure_message(status, false, Some(80.0), "");
         assert!(
             msg_fail_under.contains("coverage run failed")
                 || msg_fail_under.contains("terminated by signal"),
@@ -2073,7 +2075,7 @@ mod tests {
             "{msg_fail_under}"
         );
 
-        let msg_open = coverage_failure_message(status, true, None);
+        let msg_open = coverage_failure_message(status, true, None, "");
         assert!(
             msg_open.contains("coverage run failed") || msg_open.contains("terminated by signal"),
             "{msg_open}"
