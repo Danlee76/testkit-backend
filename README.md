@@ -152,8 +152,11 @@ reproduction instructions shell-quote paths containing spaces or quotes.
 `audit` accepts three scan roots: a crate directory (walked recursively for
 `.rs` files), a single `.rs` file, or `-` to read Rust source from stdin.
 While walking a directory it skips `target/`, `vendor/`, `node_modules/`,
-and hidden directories such as `.git/` and `.github/`, keeping build output
-and dependency trees out of recursive scans. A missing path is an actionable
+and hidden directories such as `.git/` and `.github/`, along with any
+directories passed via repeatable `--exclude <DIR>` flags or the `exclude = [...]`
+configuration key (exact relative directory paths; glob matching is not
+supported), keeping build output, generated source, and dependency trees out
+of recursive scans. A missing path is an actionable
 error rather than an empty "no findings" run. An explicitly selected excluded
 directory or single file is still scanned. Empty, whitespace-only, and
 comment-only Rust files are valid inputs with no findings. Raw identifiers

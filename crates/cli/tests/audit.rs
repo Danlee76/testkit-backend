@@ -1939,4 +1939,138 @@ fn audit_no_severity_overrides_leaves_default_severities() {
     assert_eq!(report["findings"][0]["severity"], "warning");
 }
 
+// ---- #321: support excluding generated source directories ----
+
+#[test]
+fn audit_excludes_directory_via_cli_flag() {
+    let fixture = AuditFixture::new("exclude-cli");
+    std::fs::create_dir_all(fixture.0.join("src/gen")).unwrap();
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("src/gen/generated.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--exclude", "src/gen"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["file"], "src/lib.rs");
+}
+
+#[test]
+fn audit_excludes_directory_via_config() {
+    let fixture = AuditFixture::new("exclude-config");
+    std::fs::create_dir_all(fixture.0.join("generated")).unwrap();
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("generated/code.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(".soroban-testkit.toml", "exclude = [\"generated\"]\n");
+
+    let output = fixture.scan(&[]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["file"], "src/lib.rs");
+}
+
+#[test]
+fn audit_excludes_directory_matches_whole_path_components() {
+    let fixture = AuditFixture::new("exclude-whole-component");
+    std::fs::create_dir_all(fixture.0.join("gen")).unwrap();
+    std::fs::create_dir_all(fixture.0.join("generated_utils")).unwrap();
+    std::fs::create_dir_all(fixture.0.join("src/regen")).unwrap();
+    fixture.write("gen/a.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("generated_utils/b.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("src/regen/c.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--exclude", "gen"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    let files: Vec<&str> = findings.iter().map(|f| f["file"].as_str().unwrap()).collect();
+    assert!(!files.contains(&"gen/a.rs"), "{files:?}");
+    assert!(files.contains(&"generated_utils/b.rs"), "{files:?}");
+    assert!(files.contains(&"src/regen/c.rs"), "{files:?}");
+}
+
+#[test]
+fn audit_excludes_normalizes_trailing_slashes_and_leading_dotslash() {
+    let fixture = AuditFixture::new("exclude-normalize");
+    std::fs::create_dir_all(fixture.0.join("gen/nested")).unwrap();
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("gen/nested/gen.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--exclude", "./gen/nested/"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["file"], "src/lib.rs");
+}
+
+#[test]
+fn audit_excludes_nonexistent_directory_is_safe_and_does_not_fail() {
+    let fixture = AuditFixture::new("exclude-nonexistent");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--exclude", "does_not_exist"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+}
+
+#[test]
+fn audit_excludes_rejects_paths_that_escape_project_root() {
+    let fixture = AuditFixture::new("exclude-escape");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--exclude", "../escaped"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("escapes the project root"), "{stderr}");
+}
+
+#[test]
+fn audit_scans_explicit_file_inside_excluded_directory() {
+    let fixture = AuditFixture::new("exclude-explicit-file");
+    std::fs::create_dir_all(fixture.0.join("gen")).unwrap();
+    let file = fixture.write("gen/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = run_from(
+        &fixture.0,
+        &["audit", file.to_str().unwrap(), "--exclude", "gen", "--format", "json"],
+    );
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+}
+
+#[test]
+fn audit_combines_config_and_cli_exclusions() {
+    let fixture = AuditFixture::new("exclude-combined");
+    std::fs::create_dir_all(fixture.0.join("gen1")).unwrap();
+    std::fs::create_dir_all(fixture.0.join("gen2")).unwrap();
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("gen1/a.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("gen2/b.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(".soroban-testkit.toml", "exclude = [\"gen1\"]\n");
+
+    let output = fixture.scan(&["--exclude", "gen2"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["file"], "src/lib.rs");
+}
+
+#[test]
+fn audit_no_exclusions_regression() {
+    let fixture = AuditFixture::new("exclude-none");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let output = fixture.scan(&[]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+}
+
+
 

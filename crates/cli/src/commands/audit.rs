@@ -95,7 +95,10 @@ pub struct AuditArgs {
     ///
     /// While scanning a directory these are excluded (skipped, never
     /// descended into): `target/`, `vendor/`, `node_modules/`, and any hidden
-    /// directory (its name begins with `.`, e.g. `.git/`, `.github/`, `.cargo/`). A
+    /// directory (its name begins with `.`, e.g. `.git/`, `.github/`, `.cargo/`),
+    /// along with any directories specified via `--exclude <DIR>` or `exclude` in
+    /// configuration (supporting exact directory paths relative to the project root;
+    /// glob matching is not supported). A
     /// missing path is reported as an actionable error rather than an empty
     /// "no findings" result. Explicitly selecting an excluded directory or
     /// one of its files still scans that input. Empty Rust files are valid
@@ -132,6 +135,10 @@ pub struct AuditArgs {
     /// the current directory. Paths inside it are relative to the workspace.
     #[arg(long, global = true)]
     baseline: Option<PathBuf>,
+    /// Exclude directory path(s) relative to the workspace root from recursive scans.
+    /// Repeatable. Exact relative directory paths only (glob patterns are not supported).
+    #[arg(long = "exclude", value_name = "DIR", action = clap::ArgAction::Append, global = true)]
+    pub exclude: Vec<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -163,6 +170,26 @@ pub enum AuditOutputFormat {
 pub struct AuditConfig {
     #[serde(default)]
     pub rules: HashMap<String, RuleConfig>,
+    #[serde(default, deserialize_with = "deserialize_exclude")]
+    pub exclude: Vec<PathBuf>,
+}
+
+fn deserialize_exclude<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ExcludeVal {
+        Single(String),
+        List(Vec<String>),
+    }
+
+    match Option::<ExcludeVal>::deserialize(deserializer)? {
+        Some(ExcludeVal::Single(s)) => Ok(vec![PathBuf::from(s)]),
+        Some(ExcludeVal::List(l)) => Ok(l.into_iter().map(PathBuf::from).collect()),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Per-rule configuration.
@@ -254,14 +281,23 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     let mut parse_warnings = Vec::new();
     let mut scanned_files = 0usize;
     let mut skipped_files = 0usize;
-    let sources = if stdin {
-        Vec::new()
-    } else {
-        collect_rust_sources(&args.path, &mut parse_warnings)?
-    };
     let source_dir = if stdin {
         canonical_path(&std::env::current_dir()?)?
     } else {
+        fs::metadata(&args.path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                CliError(format!(
+                    "path {} does not exist; pass a contract crate directory, a single .rs file, \
+                     or `-` to read Rust source from stdin",
+                    args.path.display()
+                ))
+            } else {
+                CliError(format!(
+                    "failed to access scan path {}: {err}; check path permissions and re-run",
+                    args.path.display()
+                ))
+            }
+        })?;
         let root = canonical_path(&args.path)?;
         if root.is_dir() {
             root
@@ -271,6 +307,21 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     };
     let workspace = find_workspace_root(&source_dir);
     let config = load_config(&source_dir, &workspace)?;
+
+    let mut raw_exclusions = config.exclude.clone();
+    raw_exclusions.extend(args.exclude.clone());
+    let exclusions = normalize_and_validate_exclusions(&raw_exclusions, &workspace)?;
+
+    let sources = if stdin {
+        Vec::new()
+    } else {
+        collect_rust_sources_with_exclusions(
+            &args.path,
+            &workspace,
+            &exclusions,
+            &mut parse_warnings,
+        )?
+    };
     let mut baseline = load_baseline(&args.baseline)?;
     for entry in &mut baseline {
         entry.file = workspace_relative_path(&workspace.join(&entry.file), &workspace)
@@ -383,14 +434,82 @@ fn is_scannable_entry(entry: &walkdir::DirEntry) -> bool {
     !(name.starts_with('.') || AUDIT_EXCLUDED_DIRS.contains(&name))
 }
 
+fn normalize_and_validate_exclusions(
+    raw_exclusions: &[PathBuf],
+    workspace: &Path,
+) -> Result<Vec<PathBuf>, CliError> {
+    let mut normalized = Vec::new();
+    for raw in raw_exclusions {
+        let mut clean = Vec::new();
+        let mut is_relative = true;
+
+        if raw.is_absolute() {
+            if let Ok(rel) = raw.strip_prefix(workspace) {
+                for comp in rel.components() {
+                    match comp {
+                        std::path::Component::CurDir => {}
+                        std::path::Component::ParentDir => {
+                            if clean.pop().is_none() {
+                                return Err(CliError(format!(
+                                    "excluded directory `{}` escapes the project root",
+                                    raw.display()
+                                )));
+                            }
+                        }
+                        std::path::Component::Normal(c) => clean.push(c),
+                        _ => {}
+                    }
+                }
+                is_relative = false;
+            } else {
+                return Err(CliError(format!(
+                    "excluded directory `{}` escapes the project root",
+                    raw.display()
+                )));
+            }
+        }
+
+        if is_relative {
+            for comp in raw.components() {
+                match comp {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        if clean.pop().is_none() {
+                            return Err(CliError(format!(
+                                "excluded directory `{}` escapes the project root",
+                                raw.display()
+                            )));
+                        }
+                    }
+                    std::path::Component::Normal(c) => clean.push(c),
+                    _ => {}
+                }
+            }
+        }
+
+        if !clean.is_empty() {
+            let p: PathBuf = clean.into_iter().collect();
+            normalized.push(p);
+        }
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
 /// Walks `root` and returns the `.rs` files that should be audited, applying
 /// the exclusions documented on `AuditArgs::path`.
-///
-/// A root that does not exist is an error, not an empty scan: silently
-/// reporting "no findings" for a typo'd path would be worse than useless in
-/// CI, so the message names every supported input form.
 fn collect_rust_sources(
     root: &Path,
+    warnings: &mut Vec<CliError>,
+) -> Result<Vec<PathBuf>, CliError> {
+    collect_rust_sources_with_exclusions(root, root, &[], warnings)
+}
+
+fn collect_rust_sources_with_exclusions(
+    root: &Path,
+    workspace: &Path,
+    exclusions: &[PathBuf],
     warnings: &mut Vec<CliError>,
 ) -> Result<Vec<PathBuf>, CliError> {
     fs::metadata(root).map_err(|err| {
@@ -408,11 +527,26 @@ fn collect_rust_sources(
         }
     })?;
 
+    let is_root_file = root.is_file();
     let mut sources = Vec::new();
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(is_scannable_entry)
+        .filter_entry(|entry| {
+            if !entry.file_type().is_dir() {
+                return true;
+            }
+            if entry.depth() == 0 {
+                return true;
+            }
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if name.starts_with('.') || AUDIT_EXCLUDED_DIRS.contains(&name.as_ref()) {
+                return false;
+            }
+            let rel = workspace_relative_path(entry.path(), workspace);
+            !exclusions.iter().any(|excl| rel == *excl || rel.starts_with(excl))
+        })
     {
         let entry = match entry {
             Ok(entry) => entry,
@@ -426,7 +560,15 @@ fn collect_rust_sources(
         };
         let is_rust = entry.path().extension().is_some_and(|ext| ext == "rs");
         if entry.file_type().is_file() && is_rust {
-            sources.push(entry.path().to_path_buf());
+            if entry.depth() == 0 && is_root_file {
+                sources.push(entry.path().to_path_buf());
+            } else {
+                let rel = workspace_relative_path(entry.path(), workspace);
+                let is_excluded = exclusions.iter().any(|excl| rel == *excl || rel.starts_with(excl));
+                if !is_excluded {
+                    sources.push(entry.path().to_path_buf());
+                }
+            }
         }
     }
     sources.sort();
@@ -989,6 +1131,30 @@ fn validate_audit_config_table(
             }
 
             if key == "exclude" {
+                match val {
+                    toml::Value::String(_) => {}
+                    toml::Value::Array(arr) => {
+                        for item in arr {
+                            if !item.is_str() {
+                                let line = find_line_for_key(content, &full_key);
+                                errors.push(ConfigValidationError {
+                                    line,
+                                    key_path: full_key.clone(),
+                                    message: "key `exclude` elements must be directory path strings".to_string(),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        let line = find_line_for_key(content, &full_key);
+                        errors.push(ConfigValidationError {
+                            line,
+                            key_path: full_key,
+                            message: "key `exclude` must be a string or list of directory path strings".to_string(),
+                        });
+                    }
+                }
                 continue;
             }
 
@@ -1009,6 +1175,30 @@ fn validate_audit_config_table(
                 continue;
             }
             if key == "exclude" {
+                match val {
+                    toml::Value::String(_) => {}
+                    toml::Value::Array(arr) => {
+                        for item in arr {
+                            if !item.is_str() {
+                                let line = find_line_for_key(content, &full_key);
+                                errors.push(ConfigValidationError {
+                                    line,
+                                    key_path: full_key.clone(),
+                                    message: "key `audit.exclude` elements must be directory path strings".to_string(),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        let line = find_line_for_key(content, &full_key);
+                        errors.push(ConfigValidationError {
+                            line,
+                            key_path: full_key,
+                            message: "key `audit.exclude` must be a string or list of directory path strings".to_string(),
+                        });
+                    }
+                }
                 continue;
             }
             let line = find_line_for_key(content, &full_key);
@@ -1162,7 +1352,7 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
                 }
             }
 
-            // If [audit.rules] was used, merge them into config.rules
+            // If [audit.rules] or [audit.exclude] was used, merge them into config
             if let Some(toml::Value::Table(audit_tbl)) = table.get("audit") {
                 if let Some(toml::Value::Table(rules_tbl)) = audit_tbl.get("rules") {
                     for (k, v) in rules_tbl {
@@ -1174,6 +1364,19 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
                                 config.rules.insert(k.clone(), rule_cfg);
                             }
                         }
+                    }
+                }
+                if let Some(audit_excl) = audit_tbl.get("exclude") {
+                    match audit_excl {
+                        toml::Value::String(s) => config.exclude.push(PathBuf::from(s)),
+                        toml::Value::Array(arr) => {
+                            for item in arr {
+                                if let toml::Value::String(s) = item {
+                                    config.exclude.push(PathBuf::from(s));
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -2338,7 +2541,10 @@ mod tests {
                 severity: None,
             },
         );
-        let config = AuditConfig { rules };
+        let config = AuditConfig {
+            rules,
+            ..Default::default()
+        };
         assert!(!config.rules["missing-require-auth"].enabled);
     }
 
@@ -2352,7 +2558,10 @@ mod tests {
                 severity: Some("error".to_string()),
             },
         );
-        let config = AuditConfig { rules };
+        let config = AuditConfig {
+            rules,
+            ..Default::default()
+        };
         assert_eq!(
             config.rules["missing-require-auth"].severity,
             Some("error".to_string())
