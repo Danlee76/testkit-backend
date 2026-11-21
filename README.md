@@ -159,6 +159,14 @@ directory or single file is still scanned. Empty, whitespace-only, and
 comment-only Rust files are valid inputs with no findings. Raw identifiers
 such as `r#amount` are checked the same way as their ordinary spellings.
 
+Run `audit` from a Cargo workspace root (`soroban-testkit audit .`) to scan
+every member crate in one pass. The same walk applies, so the exclusions above
+still hold. Running from a member crate resolves the same workspace root, so
+paths stay workspace-relative.
+
+`--strict` additionally exits non-zero when any finding is reported. Inputs
+that fail to read or parse always exit non-zero, with or without `--strict`.
+
 Findings use paths relative to the Cargo workspace root (or the repository
 root or crate root when there is no workspace). Every path the command
 compares or prints is normalized first — symlinks and `.`/`..` components
@@ -178,8 +186,12 @@ works from member crates too. Absolute entries are also accepted.
 Unreadable files, directory traversal failures, and Rust parse errors are
 reported separately on stderr with the affected path (and line/column for
 syntax errors). These are *parse warnings*, not findings: a warning means
-the input was skipped rather than scanned, so it never appears in the
-report, never counts toward `finding_count`, and never triggers `--strict`.
+the input was skipped rather than scanned. JSON reports list them under
+`summary.parser_limitations`, separate from `findings`, and the number of
+skipped files is in `summary.skipped_file_count`. Skipped inputs never count
+toward `finding_count` and never trigger `--strict`. When any file is
+skipped, stderr also prints a `audit: summary:` line with the scanned and
+skipped counts.
 The scan continues through other files and writes their findings in the
 requested format, then exits non-zero to signal an incomplete audit even
 without `--strict`. Fix these warnings before treating an empty report as a

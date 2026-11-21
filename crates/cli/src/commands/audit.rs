@@ -34,7 +34,7 @@ pub const FINDING_NATURE: &str =
 /// stderr only, never count as findings, and make the audit incomplete
 /// rather than a strict-mode failure.
 pub const PARSE_WARNING_NATURE: &str =
-    "parse warnings are not findings: an input that could not be read or parsed was skipped without being scanned; warnings are reported on stderr only, never counted in finding_count, and never trigger --strict; they make the audit incomplete instead";
+    "parse warnings are not findings: an input that could not be read or parsed was skipped without being scanned; warnings are reported on stderr and, in JSON, under summary.parser_limitations, never counted in finding_count, and never trigger --strict; they make the audit incomplete instead";
 
 /// Single mapping from a rule severity to a SARIF reporting level. Both the
 /// `rules` metadata and the `results` entries (and the `audit rules`
@@ -106,9 +106,10 @@ pub struct AuditArgs {
     /// up to the workspace root (or from the current directory for stdin).
     /// Files that cannot be read or parsed produce a *parse warning* on
     /// stderr — an input skipped, never scanned — not a finding: warnings
-    /// never appear in the report, never count toward `finding_count`, and
-    /// never trigger `--strict`. Other files are scanned, then the command
-    /// exits non-zero to indicate an incomplete audit.
+    /// are listed under `summary.parser_limitations` in JSON reports, apart
+    /// from `findings`, never count toward `finding_count`, and never trigger
+    /// `--strict`. Other files are scanned, then the command exits non-zero
+    /// to indicate an incomplete audit.
     ///
     /// This static scan does not expand procedural macros or macro_rules!
     /// invocations. Inspect generated code separately (e.g. cargo expand).
@@ -119,7 +120,9 @@ pub struct AuditArgs {
     /// spelling no matter how it was spelled on the command line.
     #[arg(value_name = "PATH", default_value = ".", global = true)]
     path: PathBuf,
-    /// Exit non-zero if any findings are reported.
+    /// Exit non-zero if any findings are reported. Inputs that fail to read
+    /// or parse always exit non-zero, with or without this flag, so `--strict`
+    /// never changes that rule.
     #[arg(long, global = true)]
     strict: bool,
     /// Output format. JSON and SARIF are intended for automation and code scanning.
@@ -249,6 +252,8 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
 
     let stdin = args.path == Path::new("-");
     let mut parse_warnings = Vec::new();
+    let mut scanned_files = 0usize;
+    let mut skipped_files = 0usize;
     let sources = if stdin {
         Vec::new()
     } else {
@@ -279,19 +284,27 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         std::io::stdin()
             .read_to_string(&mut source)
             .map_err(|err| CliError(format!("failed to read stdin: {err}")))?;
-        if let Err(err) = audit_source(
+        match audit_source(
             Path::new("<stdin>"),
             &source,
             &mut findings,
             &config,
             &source,
         ) {
-            parse_warnings.push(err);
+            Ok(()) => scanned_files += 1,
+            Err(err) => {
+                skipped_files += 1;
+                parse_warnings.push(err);
+            }
         }
     } else {
         for path in sources {
-            if let Err(err) = audit_file(&path, &mut findings, &config) {
-                parse_warnings.push(err);
+            match audit_file(&path, &mut findings, &config) {
+                Ok(()) => scanned_files += 1,
+                Err(err) => {
+                    skipped_files += 1;
+                    parse_warnings.push(err);
+                }
             }
         }
         for finding in &mut findings {
@@ -304,7 +317,16 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     // is guaranteed to follow.
     normalize_findings(&mut findings);
 
-    print!("{}", render_findings(&findings, args.format)?);
+    let parser_limitations: Vec<String> = parse_warnings.iter().map(ToString::to_string).collect();
+    print!(
+        "{}",
+        render_findings_with_limitations(
+            &findings,
+            args.format,
+            &parser_limitations,
+            skipped_files,
+        )?
+    );
 
     // Findings (heuristic pattern matches over parsed source) were just
     // rendered above; these are parse warnings (inputs that were never
@@ -314,6 +336,9 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         for warning in &parse_warnings {
             eprintln!("audit: warning: {warning}");
         }
+        eprintln!(
+            "audit: summary: {scanned_files} input(s) scanned, {skipped_files} skipped (see parse warnings above)"
+        );
         eprintln!("audit: note: {PARSE_WARNING_NATURE}");
         return Err(CliError(format!(
             "audit incomplete: {} parse warning(s); findings cover only successfully parsed files; \
@@ -604,6 +629,18 @@ impl<'a> DiagnosticRenderer<'a> {
     /// sanitized before serialization so no terminal control sequence
     /// survives transport.
     pub fn render_json(&self) -> Result<String, CliError> {
+        self.render_json_with_limitations(&[], 0)
+    }
+
+    /// Render the JSON report with parser limitations (inputs that were
+    /// skipped) in their own `summary.parser_limitations` list, and the count
+    /// of skipped files in `summary.skipped_file_count`. Limitations never
+    /// enter `findings` or `finding_count`.
+    pub fn render_json_with_limitations(
+        &self,
+        parser_limitations: &[String],
+        skipped_file_count: usize,
+    ) -> Result<String, CliError> {
         let findings: Vec<_> = self
             .findings
             .iter()
@@ -622,6 +659,8 @@ impl<'a> DiagnosticRenderer<'a> {
             "findings": findings,
             "summary": {
                 "finding_count": self.findings.len(),
+                "skipped_file_count": skipped_file_count,
+                "parser_limitations": parser_limitations,
                 "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE]
             }
         }))
@@ -719,6 +758,22 @@ pub fn render_findings(
     format: AuditOutputFormat,
 ) -> Result<String, CliError> {
     DiagnosticRenderer::new(findings).render(format)
+}
+
+/// Renders the report for `format`. JSON reports also carry the parser
+/// limitations (skipped inputs) and the skipped-file count in `summary`;
+/// text and SARIF output are unchanged and report those on stderr only.
+pub fn render_findings_with_limitations(
+    findings: &[Finding],
+    format: AuditOutputFormat,
+    parser_limitations: &[String],
+    skipped_file_count: usize,
+) -> Result<String, CliError> {
+    match format {
+        AuditOutputFormat::Json => DiagnosticRenderer::new(findings)
+            .render_json_with_limitations(parser_limitations, skipped_file_count),
+        _ => render_findings(findings, format),
+    }
 }
 
 pub fn render_text(findings: &[Finding]) -> String {
@@ -2233,6 +2288,24 @@ mod tests {
         assert!(output.contains("\\u0000"));
         assert!(output.contains("\\t"));
         assert!(output.contains("\\r"));
+    }
+
+    #[test]
+    fn json_report_lists_parser_limitations_apart_from_findings() {
+        let findings = audit_source_for_test("pub fn deposit(amount: i128) { save(amount); }");
+        let limitations = vec!["failed to parse Rust source broken.rs:1:8".to_string()];
+        let output = render_findings_with_limitations(
+            &findings,
+            AuditOutputFormat::Json,
+            &limitations,
+            1,
+        )
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(report["summary"]["finding_count"], findings.len());
+        assert_eq!(report["findings"].as_array().unwrap().len(), findings.len());
+        assert_eq!(report["summary"]["parser_limitations"][0], limitations[0]);
+        assert_eq!(report["summary"]["skipped_file_count"], 1);
     }
 
     #[test]
