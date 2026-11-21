@@ -178,8 +178,9 @@ works from member crates too. Absolute entries are also accepted.
 Unreadable files, directory traversal failures, and Rust parse errors are
 reported separately on stderr with the affected path (and line/column for
 syntax errors). These are *parse warnings*, not findings: a warning means
-the input was skipped rather than scanned, so it never appears in the
-report, never counts toward `finding_count`, and never triggers `--strict`.
+the input was skipped rather than scanned. JSON reports list them under
+`summary.parser_limitations`, separate from `findings`; they never count
+toward `finding_count` and never trigger `--strict`.
 The scan continues through other files and writes their findings in the
 requested format, then exits non-zero to signal an incomplete audit even
 without `--strict`. Fix these warnings before treating an empty report as a
