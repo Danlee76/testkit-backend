@@ -331,11 +331,12 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     let parser_limitations: Vec<String> = parse_warnings.iter().map(ToString::to_string).collect();
     print!(
         "{}",
-        render_findings_with_limitations(
+        render_findings_with_limitations_and_scanned(
             &findings,
             args.format,
             &parser_limitations,
             skipped_files,
+            scanned_files,
         )?
     );
 
@@ -604,9 +605,82 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     }
 }
 
+/// Counts of findings for a single rule within a severity level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleFindingCount {
+    pub rule: String,
+    pub count: usize,
+}
+
+/// Summary of findings grouped under a specific severity level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeveritySummary {
+    pub severity: String,
+    pub total: usize,
+    pub rules: Vec<RuleFindingCount>,
+}
+
+/// Aggregated summary across all findings and scanned files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditSummary {
+    pub total_findings: usize,
+    pub files_scanned: usize,
+    pub severities: Vec<SeveritySummary>,
+}
+
+/// Priority rank for rule severities: most severe first.
+pub fn severity_rank(s: &str) -> u8 {
+    match s.to_lowercase().as_str() {
+        "error" => 0,
+        "warning" => 1,
+        "note" => 2,
+        _ => 3,
+    }
+}
+
+/// Computes an aggregated audit summary from findings and scanned files.
+/// Rule counts are sorted by count descending and then rule id ascending for determinism.
+pub fn compute_summary(findings: &[Finding], files_scanned: usize) -> AuditSummary {
+    let mut map: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    for finding in findings {
+        let rule_map = map.entry(finding.severity.clone()).or_default();
+        *rule_map.entry(finding.rule.to_string()).or_default() += 1;
+    }
+
+    let mut severities: Vec<SeveritySummary> = map
+        .into_iter()
+        .map(|(severity, rules_map)| {
+            let total = rules_map.values().sum();
+            let mut rules: Vec<RuleFindingCount> = rules_map
+                .into_iter()
+                .map(|(rule, count)| RuleFindingCount { rule, count })
+                .collect();
+            rules.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.rule.cmp(&b.rule)));
+            SeveritySummary {
+                severity,
+                total,
+                rules,
+            }
+        })
+        .collect();
+
+    severities.sort_by(|a, b| {
+        severity_rank(&a.severity)
+            .cmp(&severity_rank(&b.severity))
+            .then_with(|| a.severity.cmp(&b.severity))
+    });
+
+    AuditSummary {
+        total_findings: findings.len(),
+        files_scanned,
+        severities,
+    }
+}
+
 /// Centralized diagnostic renderer across Text, JSON, and SARIF formats.
 pub struct DiagnosticRenderer<'a> {
     findings: &'a [Finding],
+    files_scanned: usize,
 }
 
 /// Present non-UTF-8 names unambiguously rather than replacing bytes with U+FFFD.
@@ -620,15 +694,42 @@ fn display_audit_path(path: &Path) -> String {
 impl<'a> DiagnosticRenderer<'a> {
     /// Create a new diagnostic renderer for the given findings.
     pub fn new(findings: &'a [Finding]) -> Self {
-        Self { findings }
+        Self {
+            findings,
+            files_scanned: 0,
+        }
+    }
+
+    /// Set the number of scanned files.
+    pub fn with_files_scanned(mut self, files_scanned: usize) -> Self {
+        self.files_scanned = files_scanned;
+        self
+    }
+
+    fn effective_files_scanned(&self) -> usize {
+        if self.files_scanned > 0 {
+            self.files_scanned
+        } else {
+            let distinct = self
+                .findings
+                .iter()
+                .map(|f| &f.file)
+                .collect::<HashSet<_>>()
+                .len();
+            if distinct > 0 {
+                distinct
+            } else {
+                1
+            }
+        }
     }
 
     /// Render diagnostics according to the specified output format.
     pub fn render(&self, format: AuditOutputFormat) -> Result<String, CliError> {
         match format {
-            AuditOutputFormat::Text => Ok(render_text(self.findings)),
-            AuditOutputFormat::Json => render_json(self.findings),
-            AuditOutputFormat::Sarif => render_sarif(self.findings),
+            AuditOutputFormat::Text => Ok(self.render_text()),
+            AuditOutputFormat::Json => self.render_json(),
+            AuditOutputFormat::Sarif => self.render_sarif(),
         }
     }
 
@@ -673,6 +774,20 @@ impl<'a> DiagnosticRenderer<'a> {
         ));
         output.push_str(&format!("note: {FINDING_NATURE}\n"));
         output.push_str(&format!("note: {MACRO_SOURCE_LIMITATION}\n"));
+
+        let summary = compute_summary(self.findings, self.effective_files_scanned());
+        output.push_str("\nSummary:\n");
+        for sev in &summary.severities {
+            output.push_str(&format!("  {}: {} finding(s)\n", sev.severity, sev.total));
+            for rule in &sev.rules {
+                output.push_str(&format!("    - {}: {}\n", rule.rule, rule.count));
+            }
+        }
+        output.push_str(&format!(
+            "  Total: {} finding(s) across {} file(s) scanned\n",
+            summary.total_findings, summary.files_scanned
+        ));
+
         output
     }
 
@@ -707,13 +822,16 @@ impl<'a> DiagnosticRenderer<'a> {
                 value
             })
             .collect();
+        let summary = compute_summary(self.findings, self.effective_files_scanned());
         serde_json::to_string_pretty(&serde_json::json!({
             "tool": "soroban-testkit",
             "version": 1,
             "findings": findings,
             "summary": {
                 "finding_count": self.findings.len(),
+                "files_scanned": summary.files_scanned,
                 "skipped_file_count": skipped_file_count,
+                "by_severity": summary.severities,
                 "parser_limitations": parser_limitations,
                 "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE]
             }
@@ -815,10 +933,29 @@ pub fn render_findings_with_limitations(
     parser_limitations: &[String],
     skipped_file_count: usize,
 ) -> Result<String, CliError> {
+    render_findings_with_limitations_and_scanned(
+        findings,
+        format,
+        parser_limitations,
+        skipped_file_count,
+        0,
+    )
+}
+
+/// Renders the report for `format` with both parser limitations and scanned file count.
+pub fn render_findings_with_limitations_and_scanned(
+    findings: &[Finding],
+    format: AuditOutputFormat,
+    parser_limitations: &[String],
+    skipped_file_count: usize,
+    files_scanned: usize,
+) -> Result<String, CliError> {
+    let renderer = DiagnosticRenderer::new(findings).with_files_scanned(files_scanned);
     match format {
-        AuditOutputFormat::Json => DiagnosticRenderer::new(findings)
-            .render_json_with_limitations(parser_limitations, skipped_file_count),
-        _ => render_findings(findings, format),
+        AuditOutputFormat::Json => {
+            renderer.render_json_with_limitations(parser_limitations, skipped_file_count)
+        }
+        _ => renderer.render(format),
     }
 }
 

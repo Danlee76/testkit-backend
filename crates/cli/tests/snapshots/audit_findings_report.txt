@@ -5,3 +5,8 @@ crates/vault/src/lib.rs:1: [warning] missing-require-auth: fn withdraw takes Add
 1 finding(s). soroban-testkit audit is a linter with seven heuristics, not a security product — a missing finding is not a security guarantee.
 note: heuristic: each finding is a pattern-match signal for manual review, possibly a false positive; it is not a definitive defect report and a clean scan is not a security guarantee
 note: source-only scan: procedural macros and macro_rules! are not expanded; generated entry points and other generated code require separate inspection
+
+Summary:
+  warning: 1 finding(s)
+    - missing-require-auth: 1
+  Total: 1 finding(s) across 1 file(s) scanned

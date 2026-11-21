@@ -1892,3 +1892,74 @@ fn audit_structured_output_includes_additive_remediation() {
         "remediation missing expected content: {remediation}"
     );
 }
+
+// ---- #325: summary grouped by severity and rule ----
+
+#[test]
+fn audit_summary_human_readable_grouped_by_severity_and_rule() {
+    let fixture = AuditFixture::new("summary-human-readable");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+        #[contractimpl]
+        impl Vault {
+            pub fn withdraw(env: Env, from: Address, amount: i128) {
+                let x = amount + 1;
+                let _ = &from;
+            }
+        }
+        "#,
+    );
+    let output = fixture.scan(&["--format", "text"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("Summary:"), "{stdout}");
+    assert!(stdout.contains("warning:"), "{stdout}");
+    assert!(stdout.contains("missing-require-auth"), "{stdout}");
+    assert!(stdout.contains("unchecked-i128-arithmetic"), "{stdout}");
+    assert!(stdout.contains("Total: 3 finding(s) across 1 file(s) scanned"), "{stdout}");
+
+    // Summary must be the last section
+    let summary_pos = stdout.find("Summary:").unwrap();
+    let note_pos = stdout.rfind("note:").unwrap();
+    assert!(summary_pos > note_pos, "Summary should appear after notes");
+}
+
+#[test]
+fn audit_summary_clean_run_has_no_findings_summary() {
+    let fixture = AuditFixture::new("summary-clean");
+    fixture.write("crates/vault/src/lib.rs", "// clean contract\n");
+    let output = fixture.scan(&["--format", "text"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("audit: no findings"), "{stdout}");
+    assert!(!stdout.contains("Summary:"), "{stdout}");
+}
+
+#[test]
+fn audit_summary_json_structured_output_is_additive() {
+    let fixture = AuditFixture::new("summary-json");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let summary = &report["summary"];
+    assert_eq!(summary["finding_count"], 1);
+    assert_eq!(summary["files_scanned"], 1);
+    let by_sev = summary["by_severity"].as_array().expect("by_severity array");
+    assert_eq!(by_sev.len(), 1);
+    assert_eq!(by_sev[0]["severity"], "warning");
+    assert_eq!(by_sev[0]["total"], 1);
+    assert_eq!(by_sev[0]["rules"][0]["rule"], "missing-require-auth");
+    assert_eq!(by_sev[0]["rules"][0]["count"], 1);
+}
+
+#[test]
+fn audit_summary_deterministic_across_runs() {
+    let fixture = AuditFixture::new("summary-determinism");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let out1 = fixture.scan(&["--format", "text"]);
+    let out2 = fixture.scan(&["--format", "text"]);
+    assert_eq!(out1.stdout, out2.stdout);
+}
