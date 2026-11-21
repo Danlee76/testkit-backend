@@ -135,6 +135,16 @@ pub struct AuditArgs {
     /// List all audit rules without running an audit.
     #[arg(long, global = true)]
     pub list_rules: bool,
+    /// Include glob patterns to filter scanned files. Can be specified multiple times.
+    /// A file is scanned if it matches at least one include pattern (or if no include
+    /// patterns are specified).
+    #[arg(long = "include", value_name = "GLOB", action = clap::ArgAction::Append, global = true)]
+    pub include: Vec<String>,
+    /// Exclude glob patterns to filter scanned files. Can be specified multiple times.
+    /// Files matching any exclude pattern are skipped. Exclude patterns take precedence
+    /// over include patterns.
+    #[arg(long = "exclude", value_name = "GLOB", action = clap::ArgAction::Append, global = true)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -261,6 +271,13 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         return explain_rule(rule);
     }
 
+    for pat in &args.include {
+        validate_glob(pat)?;
+    }
+    for pat in &args.exclude {
+        validate_glob(pat)?;
+    }
+
     let stdin = args.path == Path::new("-");
     let mut parse_warnings = Vec::new();
     let mut scanned_files = 0usize;
@@ -268,8 +285,54 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     let sources = if stdin {
         Vec::new()
     } else {
-        collect_rust_sources(&args.path, &mut parse_warnings)?
+        collect_rust_sources_filtered(
+            &args.path,
+            &mut parse_warnings,
+            &args.include,
+            &args.exclude,
+        )?
     };
+
+    if !stdin && (!args.include.is_empty() || !args.exclude.is_empty()) && sources.is_empty() {
+        match args.format {
+            AuditOutputFormat::Text => {
+                println!("audit: no files matched the configured include/exclude filters");
+            }
+            AuditOutputFormat::Json => {
+                let report = serde_json::json!({
+                    "tool": "soroban-testkit",
+                    "version": 1,
+                    "findings": [],
+                    "summary": {
+                        "finding_count": 0,
+                        "files_scanned": 0,
+                        "skipped_file_count": 0,
+                        "by_severity": [],
+                        "parser_limitations": [],
+                        "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE],
+                        "message": "no files matched the configured include/exclude filters"
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            }
+            AuditOutputFormat::Sarif => {
+                let report = serde_json::json!({
+                    "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                    "version": "2.1.0",
+                    "runs": [{
+                        "tool": { "driver": { "name": "soroban-testkit", "rules": [] } },
+                        "results": [],
+                        "properties": {
+                            "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE],
+                            "message": "no files matched the configured include/exclude filters"
+                        }
+                    }]
+                });
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            }
+        }
+        return Ok(());
+    }
     let source_dir = if stdin {
         canonical_path(&std::env::current_dir()?)?
     } else {
@@ -401,11 +464,251 @@ fn is_scannable_entry(entry: &walkdir::DirEntry) -> bool {
 /// A root that does not exist is an error, not an empty scan: silently
 /// reporting "no findings" for a typo'd path would be worse than useless in
 /// CI, so the message names every supported input form.
+/// Validates a glob pattern syntax, ensuring no unclosed classes or invalid ranges.
+pub fn validate_glob(pattern: &str) -> Result<(), CliError> {
+    if pattern.trim().is_empty() {
+        return Err(CliError(format!(
+            "invalid glob pattern '{pattern}': pattern cannot be empty; provide a pattern like '**/*.rs'"
+        )));
+    }
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            let mut j = i + 1;
+            let mut found_close = false;
+            while j < bytes.len() {
+                if bytes[j] == b']' {
+                    found_close = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !found_close {
+                return Err(CliError(format!(
+                    "invalid glob pattern '{pattern}': unclosed character class '['; provide a closing ']'"
+                )));
+            }
+            let class = &bytes[i + 1..j];
+            let class_content = if !class.is_empty() && (class[0] == b'!' || class[0] == b'^') {
+                &class[1..]
+            } else {
+                class
+            };
+            if class_content.is_empty() {
+                return Err(CliError(format!(
+                    "invalid glob pattern '{pattern}': empty character class '[]'"
+                )));
+            }
+            let mut k = 0;
+            while k < class_content.len() {
+                if k + 2 < class_content.len() && class_content[k + 1] == b'-' {
+                    if class_content[k] > class_content[k + 2] {
+                        return Err(CliError(format!(
+                            "invalid glob pattern '{pattern}': invalid range '{}-{}' in character class",
+                            class_content[k] as char, class_content[k + 2] as char
+                        )));
+                    }
+                    k += 3;
+                } else {
+                    k += 1;
+                }
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+fn match_char_class(class: &[u8], ch: u8) -> bool {
+    if class.is_empty() {
+        return false;
+    }
+    let (negated, class) = if class[0] == b'!' || class[0] == b'^' {
+        (true, &class[1..])
+    } else {
+        (false, class)
+    };
+    let mut matched = false;
+    let mut i = 0;
+    while i < class.len() {
+        if i + 2 < class.len() && class[i + 1] == b'-' {
+            let start = class[i];
+            let end = class[i + 2];
+            if ch >= start && ch <= end {
+                matched = true;
+                break;
+            }
+            i += 3;
+        } else {
+            if class[i] == ch {
+                matched = true;
+                break;
+            }
+            i += 1;
+        }
+    }
+    if negated {
+        !matched
+    } else {
+        matched
+    }
+}
+
+fn match_single_segment(pat: &[u8], text: &[u8]) -> bool {
+    let mut p = 0;
+    let mut t = 0;
+    let mut star_p = None;
+    let mut star_t = 0;
+
+    while t < text.len() {
+        if p < pat.len() && pat[p] == b'[' {
+            let close = match pat[p + 1..].iter().position(|&b| b == b']') {
+                Some(pos) => p + 1 + pos,
+                None => return false,
+            };
+            let class = &pat[p + 1..close];
+            if match_char_class(class, text[t]) {
+                p = close + 1;
+                t += 1;
+                continue;
+            } else if let Some(sp) = star_p {
+                star_t += 1;
+                t = star_t;
+                p = sp + 1;
+                continue;
+            } else {
+                return false;
+            }
+        } else if p < pat.len() && pat[p] == b'?' {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star_p = Some(p);
+            p += 1;
+            star_t = t;
+        } else if p < pat.len() && pat[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if let Some(sp) = star_p {
+            star_t += 1;
+            t = star_t;
+            p = sp + 1;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+fn match_segments(pat: &[&str], path: &[&str]) -> bool {
+    match (pat.first(), path.first()) {
+        (None, None) => true,
+        (Some(&"**"), _) => {
+            if match_segments(&pat[1..], path) {
+                return true;
+            }
+            if !path.is_empty() && match_segments(pat, &path[1..]) {
+                return true;
+            }
+            false
+        }
+        (Some(p), Some(t)) => {
+            if match_single_segment(p.as_bytes(), t.as_bytes()) {
+                match_segments(&pat[1..], &path[1..])
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Matches a glob pattern against a relative path.
+pub fn glob_matches(pattern: &str, path: &str) -> bool {
+    let mut pat_norm = pattern.replace('\\', "/");
+    let has_slash = pat_norm.contains('/');
+
+    if pat_norm.ends_with('/') {
+        pat_norm.push_str("**");
+    }
+
+    let pat_clean = pat_norm.strip_prefix("./").unwrap_or(&pat_norm);
+    let pat_clean = pat_clean.strip_prefix('/').unwrap_or(pat_clean);
+
+    let path_norm = path.replace('\\', "/");
+    let path_clean = path_norm.strip_prefix("./").unwrap_or(&path_norm);
+    let path_clean = path_clean.strip_prefix('/').unwrap_or(path_clean);
+
+    let path_segs: Vec<&str> = path_clean.split('/').filter(|s| !s.is_empty()).collect();
+
+    // If pattern had no slash and no wildcards, match against any directory component or file name
+    if !has_slash && !pattern.contains('*') && !pattern.contains('?') && !pattern.contains('[') {
+        if path_segs.contains(&pat_clean) {
+            return true;
+        }
+    }
+
+    // If pattern had no slash, it matches against the file's basename
+    if !has_slash {
+        if let Some(file_name) = path_segs.last() {
+            if match_single_segment(pat_clean.as_bytes(), file_name.as_bytes()) {
+                return true;
+            }
+        }
+    }
+
+    let pat_segs: Vec<&str> = pat_clean.split('/').filter(|s| !s.is_empty()).collect();
+    match_segments(&pat_segs, &path_segs)
+}
+
+/// Evaluates include and exclude patterns against a relative path.
+/// Exclude patterns take precedence over include patterns.
+pub fn matches_filter(
+    rel_path: &str,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> bool {
+    let rel_norm = rel_path.replace('\\', "/");
+    let rel_norm = rel_norm.strip_prefix("./").unwrap_or(&rel_norm);
+    let rel_norm = rel_norm.strip_prefix('/').unwrap_or(rel_norm);
+
+    // 1. Exclude wins: if matches any exclude pattern, skip file
+    for pat in exclude_patterns {
+        if glob_matches(pat, rel_norm) {
+            return false;
+        }
+    }
+
+    // 2. Include patterns: if specified, must match at least one
+    if !include_patterns.is_empty() {
+        return include_patterns.iter().any(|pat| glob_matches(pat, rel_norm));
+    }
+
+    // 3. Otherwise included by default
+    true
+}
+
 fn collect_rust_sources(
     root: &Path,
     warnings: &mut Vec<CliError>,
 ) -> Result<Vec<PathBuf>, CliError> {
-    fs::metadata(root).map_err(|err| {
+    collect_rust_sources_filtered(root, warnings, &[], &[])
+}
+
+fn collect_rust_sources_filtered(
+    root: &Path,
+    warnings: &mut Vec<CliError>,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> Result<Vec<PathBuf>, CliError> {
+    let metadata = fs::metadata(root).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             CliError(format!(
                 "path {} does not exist; pass a contract crate directory, a single .rs file, \
@@ -419,6 +722,15 @@ fn collect_rust_sources(
             ))
         }
     })?;
+
+    if metadata.is_file() {
+        let file_name = root.file_name().unwrap_or_default().to_string_lossy();
+        if matches_filter(&file_name, include_patterns, exclude_patterns) {
+            return Ok(vec![root.to_path_buf()]);
+        } else {
+            return Ok(Vec::new());
+        }
+    }
 
     let mut sources = Vec::new();
     for entry in WalkDir::new(root)
@@ -438,7 +750,11 @@ fn collect_rust_sources(
         };
         let is_rust = entry.path().extension().is_some_and(|ext| ext == "rs");
         if entry.file_type().is_file() && is_rust {
-            sources.push(entry.path().to_path_buf());
+            let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
+            let rel_str = rel.to_string_lossy();
+            if matches_filter(&rel_str, include_patterns, exclude_patterns) {
+                sources.push(entry.path().to_path_buf());
+            }
         }
     }
     sources.sort();

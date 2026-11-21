@@ -1963,3 +1963,207 @@ fn audit_summary_deterministic_across_runs() {
     let out2 = fixture.scan(&["--format", "text"]);
     assert_eq!(out1.stdout, out2.stdout);
 }
+
+// ---- #328: include and exclude glob patterns ----
+
+#[test]
+fn audit_filter_include_only() {
+    let fixture = AuditFixture::new("filter-include-only");
+    fixture.write("src/included.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("src/other.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--include", "src/included.rs", "--format", "json"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+    assert_eq!(report["summary"]["files_scanned"], 1);
+    assert_eq!(report["findings"][0]["file"], "src/included.rs");
+}
+
+#[test]
+fn audit_filter_exclude_only() {
+    let fixture = AuditFixture::new("filter-exclude-only");
+    fixture.write("src/a.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("src/b.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--exclude", "src/b.rs", "--format", "json"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+    assert_eq!(report["summary"]["files_scanned"], 1);
+    assert_eq!(report["findings"][0]["file"], "src/a.rs");
+}
+
+#[test]
+fn audit_filter_both_with_exclude_winning() {
+    let fixture = AuditFixture::new("filter-exclude-wins");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("src/nested/mod.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&[
+        "--include",
+        "src/**/*.rs",
+        "--exclude",
+        "src/nested/**",
+        "--format",
+        "json",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+    assert_eq!(report["summary"]["files_scanned"], 1);
+    assert_eq!(report["findings"][0]["file"], "src/lib.rs");
+}
+
+#[test]
+fn audit_filter_nested_double_star() {
+    let fixture = AuditFixture::new("filter-nested-double-star");
+    fixture.write("crates/vault/src/deep/nested/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("crates/vault/tests/ignored.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&[
+        "--include",
+        "crates/**/src/**/*.rs",
+        "--format",
+        "json",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+    assert_eq!(
+        report["findings"][0]["file"],
+        "crates/vault/src/deep/nested/lib.rs"
+    );
+}
+
+#[test]
+fn audit_filter_character_classes() {
+    let fixture = AuditFixture::new("filter-char-classes");
+    fixture.write("src/a_vault.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("src/b_vault.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("src/z_vault.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--include", "src/[a-b]_*.rs", "--format", "json"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 2);
+    assert_eq!(report["summary"]["files_scanned"], 2);
+}
+
+#[test]
+fn audit_filter_directory_patterns() {
+    let fixture = AuditFixture::new("filter-dir-pattern");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("tests/integration.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--exclude", "tests/", "--format", "json"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+    assert_eq!(report["findings"][0]["file"], "src/lib.rs");
+}
+
+#[test]
+fn audit_filter_no_pattern_unchanged_behavior() {
+    let fixture = AuditFixture::new("filter-no-pattern");
+    fixture.write("src/a.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("src/b.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 2);
+    assert_eq!(report["summary"]["files_scanned"], 2);
+}
+
+#[test]
+fn audit_filter_repeated_flags() {
+    let fixture = AuditFixture::new("filter-repeated-flags");
+    fixture.write("src/a.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("src/b.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("src/c.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&[
+        "--include",
+        "src/a.rs",
+        "--include",
+        "src/b.rs",
+        "--format",
+        "json",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 2);
+    assert_eq!(report["summary"]["files_scanned"], 2);
+}
+
+#[test]
+fn audit_filter_invalid_pattern_error_text_and_exit_code() {
+    let fixture = AuditFixture::new("filter-invalid-pat");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    // Unclosed bracket
+    let output = fixture.scan(&["--include", "[a-z"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid glob pattern"), "{stderr}");
+    assert!(stderr.contains("unclosed character class"), "{stderr}");
+
+    // Empty pattern
+    let output_empty = fixture.scan(&["--include", ""]);
+    assert!(!output_empty.status.success());
+    let stderr_empty = String::from_utf8_lossy(&output_empty.stderr);
+    assert!(stderr_empty.contains("cannot be empty"), "{stderr_empty}");
+}
+
+#[test]
+fn audit_filter_matching_nothing_reports_clearly() {
+    let fixture = AuditFixture::new("filter-match-nothing");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let text_output = fixture.scan(&["--include", "nonexistent/*.rs", "--format", "text"]);
+    assert!(text_output.status.success(), "{text_output:?}");
+    let stdout = String::from_utf8_lossy(&text_output.stdout);
+    assert!(
+        stdout.contains("audit: no files matched the configured include/exclude filters"),
+        "{stdout}"
+    );
+
+    let json_output = fixture.scan(&["--include", "nonexistent/*.rs", "--format", "json"]);
+    assert!(json_output.status.success(), "{json_output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 0);
+    assert_eq!(report["summary"]["files_scanned"], 0);
+    assert_eq!(
+        report["summary"]["message"],
+        "no files matched the configured include/exclude filters"
+    );
+}
+
+#[test]
+fn audit_filter_platform_style_separators() {
+    let fixture = AuditFixture::new("filter-platform-separators");
+    fixture.write("src/nested/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--include", "src\\nested\\*.rs", "--format", "json"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+    assert_eq!(report["findings"][0]["file"], "src/nested/lib.rs");
+}
+
+#[test]
+fn audit_filter_excluded_files_are_never_opened() {
+    let fixture = AuditFixture::new("filter-never-opened");
+    fixture.write("src/valid.rs", UNAUTHORIZED_ENTRY_POINT);
+    // Put completely invalid syntax in the excluded file
+    fixture.write("src/broken.rs", "fn broken( { let x = ;");
+
+    let output = fixture.scan(&["--exclude", "src/broken.rs", "--format", "json"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "stderr: {:?}", String::from_utf8_lossy(&output.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+    assert_eq!(report["summary"]["skipped_file_count"], 0);
+    assert!(report["summary"]["parser_limitations"].as_array().unwrap().is_empty());
+}
