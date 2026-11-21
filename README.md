@@ -176,7 +176,12 @@ compares or prints is normalized first — symlinks and `.`/`..` components
 resolved — so one file always reports under a single spelling however its
 scan root was spelled on the command line. Findings are then reported in
 one deterministic order — file, then line, then rule, then message — so a
-report diff always reflects a real change rather than scan order. The
+report diff always reflects a real change rather than scan order. For
+multi-line findings, source ranges are reported additively: text output keeps
+the `file:line:` prefix and appends `:-<end_line>:` (e.g. `src/lib.rs:3:-8:`),
+JSON reports add an `end_line` field, and SARIF output sets `endLine` on the
+location region. Single-line findings report start positions as before. Line
+numbers are 1-based and end-inclusive. The
 nearest `.soroban-testkit.toml` or `soroban-testkit.toml` between the
 scanned source directory and that root supplies rule configuration; the
 dotted name takes precedence in the same directory. Single-file scans start

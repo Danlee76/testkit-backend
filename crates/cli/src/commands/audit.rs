@@ -208,6 +208,8 @@ fn default_enabled() -> bool {
 pub struct Finding {
     pub file: PathBuf,
     pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
     pub rule: &'static str,
     pub severity: String,
     pub message: String,
@@ -745,10 +747,15 @@ impl<'a> DiagnosticRenderer<'a> {
 
         let mut output = String::new();
         for finding in self.findings {
+            let loc = match finding.end_line {
+                Some(end) if end > finding.line => {
+                    format!("{}:{}:-{}:", display_audit_path(&finding.file), finding.line, end)
+                }
+                _ => format!("{}:{}:", display_audit_path(&finding.file), finding.line),
+            };
             output.push_str(&format!(
-                "{}:{}: [{}] {}: {}\n",
-                display_audit_path(&finding.file),
-                finding.line,
+                "{} [{}] {}: {}\n",
+                loc,
                 finding.severity,
                 finding.rule,
                 finding.message
@@ -861,13 +868,18 @@ impl<'a> DiagnosticRenderer<'a> {
             .findings
             .iter()
             .map(|finding| {
-                let region = match &finding.source_snippet {
+                let mut region = match &finding.source_snippet {
                     Some(snippet) => serde_json::json!({
                         "startLine": finding.line.max(1),
                         "snippet": { "text": sanitize_snippet(snippet) }
                     }),
                     None => serde_json::json!({ "startLine": finding.line.max(1) }),
                 };
+                if let Some(end) = finding.end_line {
+                    if end > finding.line {
+                        region["endLine"] = serde_json::json!(end);
+                    }
+                }
                 serde_json::json!({
                     "ruleId": finding.rule,
                     "level": sarif_level(&finding.severity),
@@ -1415,12 +1427,14 @@ fn normalize_findings(findings: &mut Vec<Finding>) {
         left.file
             .cmp(&right.file)
             .then(left.line.cmp(&right.line))
+            .then(left.end_line.cmp(&right.end_line))
             .then(left.rule.cmp(right.rule))
             .then(left.message.cmp(&right.message))
     });
     findings.dedup_by(|left, right| {
         left.file == right.file
             && left.line == right.line
+            && left.end_line == right.end_line
             && left.rule == right.rule
             && left.message == right.message
     });
@@ -2045,9 +2059,14 @@ impl FunctionVisitor<'_> {
         // struct; sanitizing happens in the renderer.
         let source_snippet = self.source.get(line).cloned();
 
+        let end_line = fn_range
+            .map(|(_, end)| end)
+            .filter(|&end| end > line);
+
         self.findings.push(Finding {
             file: self.path.clone(),
             line,
+            end_line,
             rule,
             severity: severity.to_string(),
             message,
@@ -2237,9 +2256,12 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
                     .and_then(|rule| rule.severity.as_deref())
                     .unwrap_or("warning");
                 let method = transfer_method_name(expr).unwrap_or("transfer");
+                let (_, end) = item_line_range(expr);
+                let end_line = if end > line { Some(end) } else { None };
                 self.findings.push(Finding {
                     file: self.path.clone(),
                     line,
+                    end_line,
                     rule: "ignored-token-transfer-result",
                     severity: severity.to_string(),
                     message: format!(
@@ -2333,9 +2355,16 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
                     .and_then(|r| r.severity.as_deref())
                     .unwrap_or("warning");
 
+                let end_line = if self.fn_range.1 > self.fn_line {
+                    Some(self.fn_range.1)
+                } else {
+                    None
+                };
+
                 self.findings.push(Finding {
                     file: self.path.clone(),
                     line: self.fn_line,
+                    end_line,
                     rule: "unchecked-i128-arithmetic",
                     severity: severity.to_string(),
                     message: format!(
@@ -2767,6 +2796,7 @@ mod tests {
         let findings = [Finding {
             file: PathBuf::from(&value),
             line: 1,
+            end_line: None,
             rule: "missing-require-auth",
             severity: value.clone(),
             message: value.clone(),
@@ -3072,6 +3102,7 @@ mod tests {
         Finding {
             file: PathBuf::from(file),
             line,
+            end_line: None,
             rule,
             severity: "warning".to_string(),
             message: message.to_string(),

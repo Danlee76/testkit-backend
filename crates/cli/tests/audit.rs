@@ -2072,5 +2072,201 @@ fn audit_no_exclusions_regression() {
     assert_eq!(report["summary"]["finding_count"], 1);
 }
 
+// ---- #320: report source ranges for multi-line findings ----
+
+#[test]
+fn audit_single_line_finding_looks_exactly_as_before() {
+    let fixture = AuditFixture::new("ranges-single-line");
+    fixture.write("src/lib.rs", "fn test_broad() { mock_all_auths(); }\n");
+
+    // Text format: prefix is file:line: without range suffix
+    let text_output = fixture.scan(&["--format", "text"]);
+    assert!(text_output.status.success());
+    let text = String::from_utf8_lossy(&text_output.stdout);
+    assert!(text.contains("src/lib.rs:1: ["), "text: {text}");
+    assert!(!text.contains("src/lib.rs:1:-"), "text: {text}");
+
+    // JSON format: end_line is omitted for single-line findings
+    let json_output = fixture.scan(&["--format", "json"]);
+    assert!(json_output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let finding = &report["findings"][0];
+    assert_eq!(finding["line"], 1);
+    assert!(finding.get("end_line").is_none(), "end_line should not be serialized for single-line: {finding}");
+
+    // SARIF format: region contains startLine and no endLine
+    let sarif_output = fixture.scan(&["--format", "sarif"]);
+    assert!(sarif_output.status.success());
+    let sarif: serde_json::Value = serde_json::from_slice(&sarif_output.stdout).unwrap();
+    let region = &sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
+    assert_eq!(region["startLine"], 1);
+    assert!(region.get("endLine").is_none(), "endLine should not be present in SARIF: {region}");
+}
+
+#[test]
+fn audit_multi_line_finding_has_correct_start_and_end() {
+    // Arithmetic worked out by hand:
+    // Line 1: #[contractimpl]
+    // Line 2: impl Contract {
+    // Line 3:     pub fn withdraw(
+    // Line 4:         env: Env,
+    // Line 5:         from: Address,
+    // Line 6:     ) {
+    // Line 7:         save(&from);
+    // Line 8:     }
+    // Line 9: }
+    // The fn `withdraw` starts at line 3 (token `pub`) and ends at line 8 (token `}`).
+    // Spanned lines: [3, 8], span length = 8 - 3 + 1 = 6 lines.
+    let source = "\
+#[contractimpl]
+impl Contract {
+    pub fn withdraw(
+        env: Env,
+        from: Address,
+    ) {
+        save(&from);
+    }
+}
+";
+    let fixture = AuditFixture::new("ranges-multiline");
+    fixture.write("src/lib.rs", source);
+
+    // JSON format
+    let json_output = fixture.scan(&["--format", "json"]);
+    assert!(json_output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["rule"] == "missing-require-auth")
+        .expect("missing-require-auth finding must be present");
+    assert_eq!(finding["line"], 3, "start line: {finding}");
+    assert_eq!(finding["end_line"], 8, "end line: {finding}");
+
+    // SARIF format
+    let sarif_output = fixture.scan(&["--format", "sarif"]);
+    assert!(sarif_output.status.success());
+    let sarif: serde_json::Value = serde_json::from_slice(&sarif_output.stdout).unwrap();
+    let result = sarif["runs"][0]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["ruleId"] == "missing-require-auth")
+        .expect("missing-require-auth result must be present in SARIF");
+    let region = &result["locations"][0]["physicalLocation"]["region"];
+    assert_eq!(region["startLine"], 3);
+    assert_eq!(region["endLine"], 8);
+
+    // Text format: keeps file:line: prefix and appends range
+    let text_output = fixture.scan(&["--format", "text"]);
+    assert!(text_output.status.success());
+    let text = String::from_utf8_lossy(&text_output.stdout);
+    assert!(text.contains("src/lib.rs:3:-8:"), "text must keep prefix and append range: {text}");
+}
+
+#[test]
+fn audit_multi_line_finding_crlf_input() {
+    // Arithmetic worked out by hand:
+    // Line 1: #[contractimpl]\r\n
+    // Line 2: impl Contract {\r\n
+    // Line 3:     pub fn withdraw(\r\n
+    // Line 4:         env: Env,\r\n
+    // Line 5:         from: Address,\r\n
+    // Line 6:     ) {\r\n
+    // Line 7:         save(&from);\r\n
+    // Line 8:     }\r\n
+    // Line 9: }\r\n
+    // Line range: start = 3, end = 8.
+    let crlf_source = "#[contractimpl]\r\nimpl Contract {\r\n    pub fn withdraw(\r\n        env: Env,\r\n        from: Address,\r\n    ) {\r\n        save(&from);\r\n    }\r\n}\r\n";
+    let fixture = AuditFixture::new("ranges-crlf");
+    fixture.write("src/lib.rs", crlf_source);
+
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = &report["findings"][0];
+    assert_eq!(finding["line"], 3);
+    assert_eq!(finding["end_line"], 8);
+}
+
+#[test]
+fn audit_multi_line_finding_with_multibyte_characters_before_finding() {
+    // Arithmetic worked out by hand:
+    // Line 1: // 🦀 Stellar Smart Contracts 🚀\n
+    // Line 2: // 日本語コメント 雪\n
+    // Line 3: #[contractimpl]\n
+    // Line 4: impl Contract {\n
+    // Line 5:     pub fn withdraw(\n
+    // Line 6:         env: Env,\n
+    // Line 7:         from: Address,\n
+    // Line 8:     ) {\n
+    // Line 9:         save(&from);\n
+    // Line 10:    }\n
+    // Line 11: }\n
+    // With 2 multibyte comment lines before the impl, `withdraw` starts at line 5 and ends at line 10.
+    let source = "// 🦀 Stellar Smart Contracts 🚀\n// 日本語コメント 雪\n#[contractimpl]\nimpl Contract {\n    pub fn withdraw(\n        env: Env,\n        from: Address,\n    ) {\n        save(&from);\n    }\n}\n";
+    let fixture = AuditFixture::new("ranges-multibyte");
+    fixture.write("src/lib.rs", source);
+
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = &report["findings"][0];
+    assert_eq!(finding["line"], 5);
+    assert_eq!(finding["end_line"], 10);
+}
+
+#[test]
+fn audit_multi_line_finding_ending_at_end_of_file() {
+    // Arithmetic worked out by hand:
+    // Line 1: pub fn withdraw(
+    // Line 2:     env: Env,
+    // Line 3:     from: Address,
+    // Line 4: ) { save(&from); }
+    // No trailing newline after line 4.
+    // Start line: 1. End line: 4.
+    let source = "pub fn withdraw(\n    env: Env,\n    from: Address,\n) { save(&from); }";
+    let fixture = AuditFixture::new("ranges-eof");
+    fixture.write("src/lib.rs", source);
+
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = &report["findings"][0];
+    assert_eq!(finding["line"], 1);
+    assert_eq!(finding["end_line"], 4);
+}
+
+#[test]
+fn audit_structured_output_only_gained_fields() {
+    let fixture = AuditFixture::new("ranges-fields");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = &report["findings"][0];
+    assert!(finding.get("file").is_some());
+    assert!(finding.get("line").is_some());
+    assert!(finding.get("rule").is_some());
+    assert!(finding.get("severity").is_some());
+    assert!(finding.get("message").is_some());
+    assert!(finding.get("source_snippet").is_some());
+    assert!(finding.get("end_line").is_some());
+}
+
+#[test]
+fn audit_text_output_keeps_prefix() {
+    let fixture = AuditFixture::new("ranges-text-prefix");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "text"]);
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("src/lib.rs:3:"), "must keep src/lib.rs:3: prefix: {text}");
+}
+
+
 
 
