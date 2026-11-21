@@ -1723,3 +1723,110 @@ impl Vault {
         "missing-require-auth should fire when only an unrelated helper is called"
     );
 }
+
+// ---- #324: explicit rule listing command ----
+
+#[test]
+fn audit_list_rules_subcommand_and_flag_list_all_registered_rules() {
+    let expected_rules = [
+        "broad-mock-all-auths",
+        "ignored-token-transfer-result",
+        "missing-positive-amount-validation",
+        "missing-require-auth",
+        "missing-ttl-bump",
+        "unchecked-i128-arithmetic",
+        "unchecked-timestamp-arithmetic",
+    ];
+    // Exact count check to prevent silent rule additions/removals without test updates
+    assert_eq!(expected_rules.len(), 7);
+
+    for invocation in [&["audit", "list-rules"][..], &["audit", "--list-rules"][..]] {
+        let output = run(invocation);
+        assert!(
+            output.status.success(),
+            "invocation {:?} failed with {:?}",
+            invocation,
+            output
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        for rule in expected_rules {
+            assert!(
+                stdout.contains(rule),
+                "listing missing expected rule '{rule}' in output: {stdout}"
+            );
+        }
+
+        // Verify sorted ordering in table output
+        let mut last_index = 0;
+        for rule in expected_rules {
+            let index = stdout.find(rule).expect("rule must be in output");
+            assert!(
+                index >= last_index,
+                "rule '{rule}' out of sorted order in listing: {stdout}"
+            );
+            last_index = index;
+        }
+
+        assert!(stdout.contains("RULE"));
+        assert!(stdout.contains("SEVERITY"));
+        assert!(stdout.contains("DESCRIPTION"));
+    }
+}
+
+#[test]
+fn audit_list_rules_structured_formats() {
+    let expected_rules = [
+        "broad-mock-all-auths",
+        "ignored-token-transfer-result",
+        "missing-positive-amount-validation",
+        "missing-require-auth",
+        "missing-ttl-bump",
+        "unchecked-i128-arithmetic",
+        "unchecked-timestamp-arithmetic",
+    ];
+
+    // JSON format
+    let json_output = run(&["audit", "list-rules", "--format", "json"]);
+    assert!(json_output.status.success(), "{json_output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(report["tool"], "soroban-testkit");
+    assert_eq!(report["summary"]["rule_count"], 7);
+    let rules = report["rules"].as_array().expect("rules array");
+    assert_eq!(rules.len(), 7);
+    for (i, expected_id) in expected_rules.iter().enumerate() {
+        assert_eq!(rules[i]["id"], *expected_id);
+        assert!(!rules[i]["description"].as_str().unwrap().is_empty());
+        assert!(!rules[i]["severity"].as_str().unwrap().is_empty());
+    }
+
+    // SARIF format
+    let sarif_output = run(&["audit", "list-rules", "--format", "sarif"]);
+    assert!(sarif_output.status.success(), "{sarif_output:?}");
+    let sarif: serde_json::Value = serde_json::from_slice(&sarif_output.stdout).unwrap();
+    let sarif_rules = sarif["runs"][0]["tool"]["driver"]["rules"]
+        .as_array()
+        .expect("sarif rules array");
+    assert_eq!(sarif_rules.len(), 7);
+    for (i, expected_id) in expected_rules.iter().enumerate() {
+        assert_eq!(sarif_rules[i]["id"], *expected_id);
+    }
+}
+
+#[test]
+fn audit_list_rules_does_not_require_path_or_filesystem() {
+    let output = run(&["audit", "list-rules"]);
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn audit_normal_scan_unaffected_by_list_rules_capability() {
+    let fixture = AuditFixture::new("list-rules-unaffected");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+    assert_eq!(report["findings"][0]["rule"], "missing-require-auth");
+}

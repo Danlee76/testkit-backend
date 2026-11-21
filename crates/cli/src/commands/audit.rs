@@ -132,6 +132,9 @@ pub struct AuditArgs {
     /// the current directory. Paths inside it are relative to the workspace.
     #[arg(long, global = true)]
     baseline: Option<PathBuf>,
+    /// List all audit rules without running an audit.
+    #[arg(long, global = true)]
+    pub list_rules: bool,
 }
 
 #[derive(Subcommand)]
@@ -143,6 +146,8 @@ enum AuditCommand {
     },
     /// List all rules with their descriptions in machine-readable format.
     Rules,
+    /// List all audit rules without running an audit.
+    ListRules,
 }
 
 /// Machine- and human-readable audit output formats.
@@ -244,10 +249,16 @@ impl Finding {
 /// shared function (`sarif_level`), so text, JSON and SARIF can never
 /// disagree about the same finding.
 pub fn run(args: AuditArgs) -> Result<(), CliError> {
-    match &args.command {
-        Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
-        Some(AuditCommand::Rules) => return list_rules(args.format),
-        None => {}
+    if args.list_rules
+        || matches!(
+            &args.command,
+            Some(AuditCommand::Rules | AuditCommand::ListRules)
+        )
+    {
+        return list_rules(args.format);
+    }
+    if let Some(AuditCommand::Explain { rule }) = &args.command {
+        return explain_rule(rule);
     }
 
     let stdin = args.path == Path::new("-");
@@ -433,89 +444,113 @@ fn collect_rust_sources(
     Ok(sources)
 }
 
-fn explain_rule(rule: &str) -> Result<(), CliError> {
-    let explanation = match rule {
-        "missing-require-auth" => {
-            "missing-require-auth: Entry points that accept an Address parameter must validate the caller.\n\
-             This rule detects functions with Address parameters that never call require_auth().\n\
-             Fix: Call address.require_auth() to ensure the caller is authorized.\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security"
-        }
-        "unchecked-i128-arithmetic" => {
-            "unchecked-i128-arithmetic: Arithmetic on i128 values can silently overflow.\n\
-             This rule detects + - * / operations on i128 values outside of checked/saturating/wrapping variants.\n\
-             Fix: Use .checked_add(), .saturating_add(), or .wrapping_add() for safe overflow handling.\n\
-             Reference: https://doc.rust-lang.org/std/primitive.i128.html"
-        }
-        "missing-ttl-bump" => {
-            "missing-ttl-bump: Storage reads that are not followed by TTL extension can expire.\n\
-             This rule detects .persistent() or .temporary() reads without .extend_ttl() in the same function.\n\
-             Fix: Call .extend_ttl() after reading from storage to prevent premature expiration.\n\
-             Reference: https://developers.stellar.org/docs/smart-contracts/storing-data"
-        }
-        "broad-mock-all-auths" => {
-            "broad-mock-all-auths: Test functions using mock_all_auths() bypass auth checks entirely.\n\
+/// Definition of an audit rule in the central registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuleDefinition {
+    pub id: &'static str,
+    pub severity: &'static str,
+    pub description: &'static str,
+    pub explanation: &'static str,
+}
+
+pub const RULE_REGISTRY: &[RuleDefinition] = &[
+    RuleDefinition {
+        id: "broad-mock-all-auths",
+        severity: "warning",
+        description: "Test functions using mock_all_auths() bypass auth checks entirely.",
+        explanation: "broad-mock-all-auths: Test functions using mock_all_auths() bypass auth checks entirely.\n\
              This rule detects mock_all_auths in test functions.\n\
              Fix: Replace with granular auth checks for specific callers to ensure auth is properly tested.\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/testing"
-        }
-        "ignored-token-transfer-result" => {
-            "ignored-token-transfer-result: Token transfer operations can fail and their results must be handled.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/testing",
+    },
+    RuleDefinition {
+        id: "ignored-token-transfer-result",
+        severity: "warning",
+        description: "Token transfer operations can fail; their results must be handled.",
+        explanation: "ignored-token-transfer-result: Token transfer operations can fail and their results must be handled.\n\
              This rule detects transfer/transfer_from/try_transfer calls whose results are not used.\n\
              Fix: Propagate the result with ?, match on it, or explicitly bind it (let _ = ...).\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/tokens"
-        }
-        "missing-positive-amount-validation" => {
-            "missing-positive-amount-validation: Signed amount parameters should be validated.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/tokens",
+    },
+    RuleDefinition {
+        id: "missing-positive-amount-validation",
+        severity: "warning",
+        description: "Signed amount parameters should be validated against zero.",
+        explanation: "missing-positive-amount-validation: Signed amount parameters should be validated.\n\
              This rule detects amount parameters (signed integers) with no comparison against zero.\n\
              Fix: Add a check like assert!(amount > 0) to validate amounts before use.\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security"
-        }
-        "unchecked-timestamp-arithmetic" => {
-            "unchecked-timestamp-arithmetic: Timestamp arithmetic can overflow and cause silent failures.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security",
+    },
+    RuleDefinition {
+        id: "missing-require-auth",
+        severity: "warning",
+        description: "Entry points that accept an Address parameter must validate the caller with require_auth().",
+        explanation: "missing-require-auth: Entry points that accept an Address parameter must validate the caller.\n\
+             This rule detects functions with Address parameters that never call require_auth().\n\
+             Fix: Call address.require_auth() to ensure the caller is authorized.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security",
+    },
+    RuleDefinition {
+        id: "missing-ttl-bump",
+        severity: "warning",
+        description: "Storage reads without extend_ttl can expire prematurely.",
+        explanation: "missing-ttl-bump: Storage reads that are not followed by TTL extension can expire.\n\
+             This rule detects .persistent() or .temporary() reads without .extend_ttl() in the same function.\n\
+             Fix: Call .extend_ttl() after reading from storage to prevent premature expiration.\n\
+             Reference: https://developers.stellar.org/docs/smart-contracts/storing-data",
+    },
+    RuleDefinition {
+        id: "unchecked-i128-arithmetic",
+        severity: "warning",
+        description: "Arithmetic on i128 values can silently overflow; use checked/saturating/wrapping variants.",
+        explanation: "unchecked-i128-arithmetic: Arithmetic on i128 values can silently overflow.\n\
+             This rule detects + - * / operations on i128 values outside of checked/saturating/wrapping variants.\n\
+             Fix: Use .checked_add(), .saturating_add(), or .wrapping_add() for safe overflow handling.\n\
+             Reference: https://doc.rust-lang.org/std/primitive.i128.html",
+    },
+    RuleDefinition {
+        id: "unchecked-timestamp-arithmetic",
+        severity: "warning",
+        description: "Timestamp arithmetic can overflow and cause silent failures.",
+        explanation: "unchecked-timestamp-arithmetic: Timestamp arithmetic can overflow and cause silent failures.\n\
              This rule detects + - * / operations on timestamp values without overflow protection.\n\
              Fix: Use checked arithmetic or ensure your timestamps are bounded to valid ranges.\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time"
-        }
-        _ => return Err(CliError(format!("unknown rule: {}", rule))),
-    };
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time",
+    },
+];
+
+pub fn find_rule(id: &str) -> Option<&'static RuleDefinition> {
+    RULE_REGISTRY.iter().find(|r| r.id == id)
+}
+
+fn explain_rule(rule: &str) -> Result<(), CliError> {
+    let def = find_rule(rule).ok_or_else(|| CliError(format!("unknown rule: {rule}")))?;
     // Every message above describes a syntactic pattern, not a proven
     // defect: state the heuristic nature right next to the rule so the
     // distinction between "flagged" and "broken" is never left to guesswork.
-    println!("{explanation}\n\nnote: {FINDING_NATURE}");
+    println!("{}\n\nnote: {FINDING_NATURE}", def.explanation);
     Ok(())
 }
-
-/// Static metadata for all audit rules.
-const RULES: &[(&str, &str, &str)] = &[
-    ("missing-require-auth", "warning", "Entry points that accept an Address parameter must validate the caller with require_auth()."),
-    ("unchecked-i128-arithmetic", "warning", "Arithmetic on i128 values can silently overflow; use checked/saturating/wrapping variants."),
-    ("missing-ttl-bump", "warning", "Storage reads without extend_ttl can expire prematurely."),
-    ("broad-mock-all-auths", "warning", "Test functions using mock_all_auths() bypass auth checks entirely."),
-    ("ignored-token-transfer-result", "warning", "Token transfer operations can fail; their results must be handled."),
-    ("missing-positive-amount-validation", "warning", "Signed amount parameters should be validated against zero."),
-    ("unchecked-timestamp-arithmetic", "warning", "Timestamp arithmetic can overflow and cause silent failures."),
-];
 
 fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     match format {
         AuditOutputFormat::Text => {
             println!("{:<40} {:<10} DESCRIPTION", "RULE", "SEVERITY");
             println!("{}", "-".repeat(100));
-            for (rule, severity, desc) in RULES {
-                println!("{rule:<40} {severity:<10} {desc}");
+            for rule in RULE_REGISTRY {
+                println!("{:<40} {:<10} {}", rule.id, rule.severity, rule.description);
             }
             println!("note: {FINDING_NATURE}");
             Ok(())
         }
         AuditOutputFormat::Json => {
-            let rules: Vec<_> = RULES
+            let rules: Vec<_> = RULE_REGISTRY
                 .iter()
-                .map(|(id, severity, description)| {
+                .map(|rule| {
                     serde_json::json!({
-                        "id": id,
-                        "severity": severity,
-                        "description": description,
+                        "id": rule.id,
+                        "severity": rule.severity,
+                        "description": rule.description,
                     })
                 })
                 .collect();
@@ -532,15 +567,15 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
             Ok(())
         }
         AuditOutputFormat::Sarif => {
-            let rules: Vec<_> = RULES
+            let rules: Vec<_> = RULE_REGISTRY
                 .iter()
-                .map(|(id, severity, description)| {
+                .map(|rule| {
                     serde_json::json!({
-                        "id": id,
-                        "shortDescription": { "text": id.replace('-', " ") },
-                        "fullDescription": { "text": description },
+                        "id": rule.id,
+                        "shortDescription": { "text": rule.id.replace('-', " ") },
+                        "fullDescription": { "text": rule.description },
                         "defaultConfiguration": {
-                            "level": sarif_level(severity)
+                            "level": sarif_level(rule.severity)
                         },
                     })
                 })
@@ -558,6 +593,7 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
             Ok(())
         }
     }
+}
 }
 
 /// Centralized diagnostic renderer across Text, JSON, and SARIF formats.
@@ -681,13 +717,10 @@ impl<'a> DiagnosticRenderer<'a> {
         let rules: Vec<_> = rule_ids
             .into_iter()
             .map(|rule| {
-                let description = RULES
-                    .iter()
-                    .find(|(id, _, _)| *id == rule)
-                    .map(|(_, _, desc)| *desc);
+                let description = find_rule(rule).map(|r| r.description);
                 // The metadata level mirrors the level this scan gives the
                 // rule's findings: a config override takes effect, and with
-                // nothing configured the `RULES` default applies — both walk
+                // nothing configured the `RULE_REGISTRY` default applies — both walk
                 // through the shared `sarif_level` mapping, so the metadata
                 // level always matches how `results` display the same rule.
                 let effective_severity = self
@@ -695,12 +728,7 @@ impl<'a> DiagnosticRenderer<'a> {
                     .iter()
                     .find(|finding| finding.rule == rule)
                     .map(|finding| finding.severity.as_str())
-                    .or_else(|| {
-                        RULES
-                            .iter()
-                            .find(|(id, _, _)| *id == rule)
-                            .map(|(_, severity, _)| *severity)
-                    });
+                    .or_else(|| find_rule(rule).map(|r| r.severity));
                 let mut rule_obj = serde_json::json!({
                     "id": rule,
                     "shortDescription": { "text": rule.replace('-', " ") }
