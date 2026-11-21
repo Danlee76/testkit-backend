@@ -120,7 +120,9 @@ pub struct AuditArgs {
     /// spelling no matter how it was spelled on the command line.
     #[arg(value_name = "PATH", default_value = ".", global = true)]
     path: PathBuf,
-    /// Exit non-zero if any findings are reported.
+    /// Exit non-zero if any findings are reported. Inputs that fail to read
+    /// or parse always exit non-zero, with or without this flag, so `--strict`
+    /// never changes that rule.
     #[arg(long, global = true)]
     strict: bool,
     /// Output format. JSON and SARIF are intended for automation and code scanning.
