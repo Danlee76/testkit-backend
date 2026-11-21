@@ -884,6 +884,8 @@ pub const VALID_RULES: &[&str] = &[
     "unchecked-timestamp-arithmetic",
 ];
 
+pub const VALID_SEVERITIES: &[&str] = &["error", "warning", "note"];
+
 /// Known sections for other commands or tooling in a shared configuration file.
 const KNOWN_OTHER_SECTIONS: &[&str] = &[
     "coverage",
@@ -1057,9 +1059,31 @@ fn validate_rules_table(
         }
 
         if let toml::Value::Table(rule_props) = rule_val {
-            for (prop_key, _) in rule_props {
+            for (prop_key, prop_val) in rule_props {
                 let prop_key_path = format!("{rule_key_path}.{prop_key}");
-                if prop_key != "enabled" && prop_key != "severity" {
+                if prop_key == "severity" {
+                    if let toml::Value::String(sev) = prop_val {
+                        let normalized = sev.to_ascii_lowercase();
+                        if !VALID_SEVERITIES.contains(&normalized.as_str()) {
+                            let prop_line = find_line_for_key(content, &prop_key_path);
+                            let allowed = VALID_SEVERITIES.join(", ");
+                            errors.push(ConfigValidationError {
+                                line: prop_line,
+                                key_path: prop_key_path,
+                                message: format!(
+                                    "invalid severity `{sev}` for rule `{rule_name}`; allowed values are: {allowed}"
+                                ),
+                            });
+                        }
+                    } else {
+                        let prop_line = find_line_for_key(content, &prop_key_path);
+                        errors.push(ConfigValidationError {
+                            line: prop_line,
+                            key_path: prop_key_path,
+                            message: "severity must be a string".to_string(),
+                        });
+                    }
+                } else if prop_key != "enabled" {
                     let prop_line = find_line_for_key(content, &prop_key_path);
                     errors.push(ConfigValidationError {
                         line: prop_line,
@@ -1131,12 +1155,22 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
                 ))
             })?;
 
+            // Normalize severity strings to lowercase
+            for rule_cfg in config.rules.values_mut() {
+                if let Some(sev) = &rule_cfg.severity {
+                    rule_cfg.severity = Some(sev.to_ascii_lowercase());
+                }
+            }
+
             // If [audit.rules] was used, merge them into config.rules
             if let Some(toml::Value::Table(audit_tbl)) = table.get("audit") {
                 if let Some(toml::Value::Table(rules_tbl)) = audit_tbl.get("rules") {
                     for (k, v) in rules_tbl {
                         if !config.rules.contains_key(k) {
-                            if let Ok(rule_cfg) = v.clone().try_into::<RuleConfig>() {
+                            if let Ok(mut rule_cfg) = v.clone().try_into::<RuleConfig>() {
+                                if let Some(sev) = &rule_cfg.severity {
+                                    rule_cfg.severity = Some(sev.to_ascii_lowercase());
+                                }
                                 config.rules.insert(k.clone(), rule_cfg);
                             }
                         }

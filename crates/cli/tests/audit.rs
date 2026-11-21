@@ -549,7 +549,7 @@ fn audit_json_round_trips_control_characters_in_findings() {
     fixture.write(name, UNAUTHORIZED_ENTRY_POINT);
     fixture.write(
         ".soroban-testkit.toml",
-        "[rules.missing-require-auth]\nseverity = \"custom\\t\\n\\r\\u001b\\\"\\\\雪\"\n",
+        "[rules.missing-require-auth]\nseverity = 'error'\n",
     );
     let output = fixture.scan(&["--strict"]);
     assert!(!output.status.success());
@@ -557,7 +557,7 @@ fn audit_json_round_trips_control_characters_in_findings() {
     assert_eq!(report["findings"][0]["file"], name);
     assert_eq!(
         report["findings"][0]["severity"],
-        "custom\t\n\r\u{1b}\"\\雪"
+        "error"
     );
     // The snippet quoted from the file body carries no control sequences of
     // its own, so it round-trips verbatim even though the file path does not.
@@ -1852,4 +1852,91 @@ fn audit_config_validation_regression_previously_valid_config_still_loads() {
     let output = fixture.scan(&["--strict"]);
     assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
 }
+
+// ---- #322: allow per-rule severity overrides ----
+
+#[test]
+fn audit_severity_override_sets_effective_severity() {
+    let fixture = AuditFixture::new("severity-override");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nseverity = 'error'\n",
+    );
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["findings"][0]["severity"], "error");
+}
+
+#[test]
+fn audit_severity_override_case_insensitive() {
+    let fixture = AuditFixture::new("severity-case");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nseverity = 'ERROR'\n",
+    );
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["findings"][0]["severity"], "error");
+}
+
+#[test]
+fn audit_severity_override_rejects_invalid_severity_value() {
+    let fixture = AuditFixture::new("severity-invalid");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let path = fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nseverity = 'fatal'\n",
+    );
+    let output = fixture.scan(&[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to validate audit config"), "{stderr}");
+    assert!(stderr.contains(path.to_str().unwrap()), "{stderr}");
+    assert!(stderr.contains("invalid severity `fatal`"), "{stderr}");
+    assert!(stderr.contains("allowed values are: error, warning, note"), "{stderr}");
+}
+
+#[test]
+fn audit_severity_override_multiple_rules_at_once() {
+    let fixture = AuditFixture::new("severity-multiple");
+    fixture.write("crates/vault/src/lib.rs", r#"
+        #[contractimpl]
+        impl Contract {
+            pub fn withdraw(env: Env, from: Address) {
+                let x: i128 = 10;
+                let _ = x + 1;
+            }
+        }
+    "#);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nseverity = 'error'\n[rules.unchecked-i128-arithmetic]\nseverity = 'note'\n",
+    );
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    for finding in findings {
+        if finding["rule"] == "missing-require-auth" {
+            assert_eq!(finding["severity"], "error");
+        } else if finding["rule"] == "unchecked-i128-arithmetic" {
+            assert_eq!(finding["severity"], "note");
+        }
+    }
+}
+
+#[test]
+fn audit_no_severity_overrides_leaves_default_severities() {
+    let fixture = AuditFixture::new("severity-defaults");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["findings"][0]["severity"], "warning");
+}
+
 
