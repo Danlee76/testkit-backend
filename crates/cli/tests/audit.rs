@@ -1830,3 +1830,65 @@ fn audit_normal_scan_unaffected_by_list_rules_capability() {
     assert_eq!(report["summary"]["finding_count"], 1);
     assert_eq!(report["findings"][0]["rule"], "missing-require-auth");
 }
+
+// ---- #326: remediation guidance in findings ----
+
+#[test]
+fn audit_all_registered_rules_have_non_empty_remediation() {
+    let json_output = run(&["audit", "list-rules", "--format", "json"]);
+    assert!(json_output.status.success(), "{json_output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let rules = report["rules"].as_array().expect("rules array");
+    assert_eq!(rules.len(), 7);
+    for rule in rules {
+        let id = rule["id"].as_str().unwrap();
+        let remediation = rule["remediation"]
+            .as_str()
+            .unwrap_or_else(|| panic!("rule '{id}' missing remediation in JSON"));
+        assert!(
+            remediation.len() >= 20,
+            "rule '{id}' has too short remediation: '{remediation}'"
+        );
+    }
+}
+
+#[test]
+fn audit_finding_human_readable_prints_remediation_label_and_indentation() {
+    let fixture = AuditFixture::new("remediation-human-readable");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let output = fixture.scan(&["--format", "text"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Verify finding header line is unchanged
+    assert!(
+        stdout.contains("crates/vault/src/lib.rs:1: [warning] missing-require-auth: fn withdraw takes Address parameter(s) [\"from\"] but never calls require_auth in its body"),
+        "missing finding line in: {stdout}"
+    );
+    // Verify snippet line is unchanged
+    assert!(
+        stdout.contains("    --> pub fn withdraw(env: Env, from: Address) { let _ = &from; }"),
+        "missing snippet line in: {stdout}"
+    );
+    // Verify remediation label and 4-space indentation
+    assert!(
+        stdout.contains("    remediation: Call address.require_auth() or address.require_auth_for_args(...) at the start of the function body to verify that the transaction signer authorized the operation."),
+        "missing remediation line in: {stdout}"
+    );
+}
+
+#[test]
+fn audit_structured_output_includes_additive_remediation() {
+    let fixture = AuditFixture::new("remediation-structured");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = &report["findings"][0];
+    assert_eq!(finding["rule"], "missing-require-auth");
+    let remediation = finding["remediation"].as_str().expect("finding remediation");
+    assert!(
+        remediation.contains("require_auth"),
+        "remediation missing expected content: {remediation}"
+    );
+}

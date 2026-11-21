@@ -451,6 +451,7 @@ pub struct RuleDefinition {
     pub severity: &'static str,
     pub description: &'static str,
     pub explanation: &'static str,
+    pub remediation: &'static str,
 }
 
 pub const RULE_REGISTRY: &[RuleDefinition] = &[
@@ -462,6 +463,7 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
              This rule detects mock_all_auths in test functions.\n\
              Fix: Replace with granular auth checks for specific callers to ensure auth is properly tested.\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/testing",
+        remediation: "Replace broad mock_all_auths() with granular mock_auths(&[...]) or targeted caller authorizations so unintended missing auth checks are not masked.",
     },
     RuleDefinition {
         id: "ignored-token-transfer-result",
@@ -471,6 +473,7 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
              This rule detects transfer/transfer_from/try_transfer calls whose results are not used.\n\
              Fix: Propagate the result with ?, match on it, or explicitly bind it (let _ = ...).\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/tokens",
+        remediation: "Propagate the Result with ?, match on the return value, or assert on the outcome so failed token transfers cannot fail silently.",
     },
     RuleDefinition {
         id: "missing-positive-amount-validation",
@@ -480,6 +483,7 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
              This rule detects amount parameters (signed integers) with no comparison against zero.\n\
              Fix: Add a check like assert!(amount > 0) to validate amounts before use.\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security",
+        remediation: "Validate that the amount is strictly positive with require!(amount > 0, ...) or an explicit condition before transferring or updating state.",
     },
     RuleDefinition {
         id: "missing-require-auth",
@@ -489,6 +493,7 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
              This rule detects functions with Address parameters that never call require_auth().\n\
              Fix: Call address.require_auth() to ensure the caller is authorized.\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security",
+        remediation: "Call address.require_auth() or address.require_auth_for_args(...) at the start of the function body to verify that the transaction signer authorized the operation.",
     },
     RuleDefinition {
         id: "missing-ttl-bump",
@@ -498,6 +503,7 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
              This rule detects .persistent() or .temporary() reads without .extend_ttl() in the same function.\n\
              Fix: Call .extend_ttl() after reading from storage to prevent premature expiration.\n\
              Reference: https://developers.stellar.org/docs/smart-contracts/storing-data",
+        remediation: "Call env.storage().persistent().extend_ttl(...) or temporary().extend_ttl(...) for accessed keys to prevent state expiration before the next interaction.",
     },
     RuleDefinition {
         id: "unchecked-i128-arithmetic",
@@ -507,6 +513,7 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
              This rule detects + - * / operations on i128 values outside of checked/saturating/wrapping variants.\n\
              Fix: Use .checked_add(), .saturating_add(), or .wrapping_add() for safe overflow handling.\n\
              Reference: https://doc.rust-lang.org/std/primitive.i128.html",
+        remediation: "Use .checked_add(), .checked_sub(), .checked_mul(), or .checked_div() and handle overflow, or use saturating/wrapping arithmetic if truncation is intended.",
     },
     RuleDefinition {
         id: "unchecked-timestamp-arithmetic",
@@ -516,6 +523,7 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
              This rule detects + - * / operations on timestamp values without overflow protection.\n\
              Fix: Use checked arithmetic or ensure your timestamps are bounded to valid ranges.\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time",
+        remediation: "Use checked arithmetic (.checked_add, .checked_sub) on ledger timestamps and validate bounds to prevent timestamp overflow or underflow.",
     },
 ];
 
@@ -551,6 +559,7 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
                         "id": rule.id,
                         "severity": rule.severity,
                         "description": rule.description,
+                        "remediation": rule.remediation,
                     })
                 })
                 .collect();
@@ -593,7 +602,6 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
             Ok(())
         }
     }
-}
 }
 
 /// Centralized diagnostic renderer across Text, JSON, and SARIF formats.
@@ -650,6 +658,13 @@ impl<'a> DiagnosticRenderer<'a> {
             if let Some(snippet) = &finding.source_snippet {
                 output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
             }
+            if let Some(rule) = find_rule(finding.rule) {
+                if !rule.remediation.is_empty() {
+                    for line in rule.remediation.lines() {
+                        output.push_str(&format!("    remediation: {}\n", line));
+                    }
+                }
+            }
         }
         output.push_str(&format!(
             "\n{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
@@ -685,6 +700,9 @@ impl<'a> DiagnosticRenderer<'a> {
                     .expect("finding serializes despite sanitized snippet");
                 if let Some(snippet) = &finding.source_snippet {
                     value["source_snippet"] = serde_json::Value::String(sanitize_snippet(snippet));
+                }
+                if let Some(rule) = find_rule(finding.rule) {
+                    value["remediation"] = serde_json::Value::String(rule.remediation.to_string());
                 }
                 value
             })
