@@ -30,6 +30,9 @@ section, so a merge can never land without a place to record the change.
 
 ### Added
 
+- `audit --format json` lists inputs the scanner could not read or parse under
+  `summary.parser_limitations`, separate from `findings`. `finding_count` is
+  unchanged, and the stderr parse warnings are still printed.
 - `limits --timeout <SECONDS>` bounds the whole run. Probes never wait past
   the deadline, and a run that hits it fails with the best value verified so
   far instead of reporting an unconfirmed boundary.
