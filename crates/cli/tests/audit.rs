@@ -1289,6 +1289,44 @@ fn audit_strict_failure_reports_findings_and_no_parse_warnings() {
     assert!(!stderr.contains("audit: warning:"), "{stderr}");
 }
 
+// ---- #354: parser limitations are a separate list in JSON reports ----
+
+#[test]
+fn audit_json_lists_parser_limitations_separately_from_findings() {
+    let fixture = AuditFixture::new("parser-limitations");
+    fixture.write("broken.rs", "fn broken( {\n");
+    fixture.write("good.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(!output.status.success(), "{output:?}");
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1, "{report}");
+    assert_eq!(report["findings"].as_array().unwrap().len(), 1, "{report}");
+    let limitations = report["summary"]["parser_limitations"]
+        .as_array()
+        .unwrap();
+    assert_eq!(limitations.len(), 1, "{report}");
+    assert!(
+        limitations[0].as_str().unwrap().contains("broken.rs"),
+        "{report}"
+    );
+}
+
+#[test]
+fn audit_clean_json_report_has_no_parser_limitations() {
+    let fixture = AuditFixture::new("no-parser-limitations");
+    fixture.write("good.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "json"]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["summary"]["parser_limitations"],
+        serde_json::json!([]),
+        "{report}"
+    );
+}
+
 // ---- #486: regression snapshots for strict and report-only modes ----
 
 /// The exact report both modes must print. `--strict` changes only the exit
