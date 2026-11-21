@@ -179,8 +179,11 @@ Unreadable files, directory traversal failures, and Rust parse errors are
 reported separately on stderr with the affected path (and line/column for
 syntax errors). These are *parse warnings*, not findings: a warning means
 the input was skipped rather than scanned. JSON reports list them under
-`summary.parser_limitations`, separate from `findings`; they never count
-toward `finding_count` and never trigger `--strict`.
+`summary.parser_limitations`, separate from `findings`, and the number of
+skipped files is in `summary.skipped_file_count`. Skipped inputs never count
+toward `finding_count` and never trigger `--strict`. When any file is
+skipped, stderr also prints a `audit: summary:` line with the scanned and
+skipped counts.
 The scan continues through other files and writes their findings in the
 requested format, then exits non-zero to signal an incomplete audit even
 without `--strict`. Fix these warnings before treating an empty report as a
