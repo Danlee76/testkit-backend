@@ -159,6 +159,14 @@ directory or single file is still scanned. Empty, whitespace-only, and
 comment-only Rust files are valid inputs with no findings. Raw identifiers
 such as `r#amount` are checked the same way as their ordinary spellings.
 
+Run `audit` from a Cargo workspace root (`soroban-testkit audit .`) to scan
+every member crate in one pass. The same walk applies, so the exclusions above
+still hold. Running from a member crate resolves the same workspace root, so
+paths stay workspace-relative.
+
+`--strict` additionally exits non-zero when any finding is reported. Inputs
+that fail to read or parse always exit non-zero, with or without `--strict`.
+
 Findings use paths relative to the Cargo workspace root (or the repository
 root or crate root when there is no workspace). Every path the command
 compares or prints is normalized first — symlinks and `.`/`..` components
