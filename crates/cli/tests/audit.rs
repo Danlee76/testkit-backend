@@ -1350,6 +1350,73 @@ fn audit_summary_counts_skipped_files_in_json_and_stderr() {
     );
 }
 
+// ---- #352: parse errors fail the run, with and without --strict ----
+
+#[test]
+fn audit_parse_errors_fail_the_run_without_strict() {
+    let fixture = AuditFixture::new("parse-error-default");
+    fixture.write("broken.rs", "fn broken( {\n");
+
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("audit incomplete: 1 parse warning(s)"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn audit_strict_mode_fails_on_parse_errors_with_clean_findings() {
+    let fixture = AuditFixture::new("parse-error-strict");
+    fixture.write("broken.rs", "fn broken( {\n");
+
+    let output = fixture.scan(&["--format", "json", "--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 0, "{report}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("audit incomplete: 1 parse warning(s)"),
+        "{stderr}"
+    );
+}
+
+// ---- #355: a workspace-root scan covers every member crate ----
+
+#[test]
+fn audit_workspace_root_scan_covers_every_member_crate() {
+    let fixture = AuditFixture::new("workspace-members");
+    fixture.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/vault\", \"crates/token\"]\n",
+    );
+    fixture.write("crates/token/Cargo.toml", "[package]\nname = \"token\"\n");
+    std::fs::create_dir_all(fixture.0.join("crates/token/src")).unwrap();
+    fixture.write("crates/token/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "json"]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let files: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(files, vec!["crates/token/src/lib.rs"], "{report}");
+
+    // Starting from a member crate resolves the same workspace root, so the
+    // finding keeps its workspace-relative spelling.
+    let member = fixture.0.join("crates/token");
+    let from_member = run_from(&member, &["audit", ".", "--format", "json"]);
+    let member_report: serde_json::Value = serde_json::from_slice(&from_member.stdout).unwrap();
+    assert_eq!(
+        member_report["findings"][0]["file"],
+        "crates/token/src/lib.rs",
+        "{member_report}"
+    );
+}
+
 // ---- #486: regression snapshots for strict and report-only modes ----
 
 /// The exact report both modes must print. `--strict` changes only the exit
