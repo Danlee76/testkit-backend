@@ -874,6 +874,211 @@ fn config_error_context(content: &str, err: &toml::de::Error) -> String {
     }
 }
 
+pub const VALID_RULES: &[&str] = &[
+    "broad-mock-all-auths",
+    "ignored-token-transfer-result",
+    "missing-positive-amount-validation",
+    "missing-require-auth",
+    "missing-ttl-bump",
+    "unchecked-i128-arithmetic",
+    "unchecked-timestamp-arithmetic",
+];
+
+/// Known sections for other commands or tooling in a shared configuration file.
+const KNOWN_OTHER_SECTIONS: &[&str] = &[
+    "coverage",
+    "limits",
+    "completion",
+    "release_verify",
+    "release-verify",
+    "workspace",
+    "package",
+    "dependencies",
+    "dev-dependencies",
+    "profile",
+    "other",
+    "other_section",
+    "other-section",
+];
+
+struct ConfigValidationError {
+    line: usize,
+    key_path: String,
+    message: String,
+}
+
+fn find_line_for_key(content: &str, key_path: &str) -> usize {
+    let parts: Vec<&str> = key_path.split('.').collect();
+    if parts.is_empty() {
+        return 1;
+    }
+
+    let mut current_section = "";
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_section = &trimmed[1..trimmed.len() - 1].trim();
+            if current_section == key_path {
+                return idx + 1;
+            }
+            if parts.len() >= 2 && current_section == format!("{}.{}", parts[0], parts[1]) {
+                if parts.len() == 2 {
+                    return idx + 1;
+                }
+            }
+        }
+        if let Some((k, _)) = trimmed.split_once('=') {
+            let k = k.trim();
+            if parts.len() == 1 && k == parts[0] {
+                return idx + 1;
+            }
+            if parts.len() == 2 && current_section == parts[0] && k == parts[1] {
+                return idx + 1;
+            }
+            if parts.len() == 3
+                && current_section == format!("{}.{}", parts[0], parts[1])
+                && k == parts[2]
+            {
+                return idx + 1;
+            }
+            if let Some(last) = parts.last() {
+                if k == *last {
+                    return idx + 1;
+                }
+            }
+        }
+    }
+    1
+}
+
+fn validate_audit_config_table(
+    table: &toml::Table,
+    content: &str,
+    prefix: &str,
+    errors: &mut Vec<ConfigValidationError>,
+) {
+    let has_audit_table = table.contains_key("audit");
+
+    for (key, val) in table {
+        let full_key = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+
+        if prefix.is_empty() {
+            if key == "audit" {
+                if let toml::Value::Table(sub_table) = val {
+                    validate_audit_config_table(sub_table, content, "audit", errors);
+                } else {
+                    let line = find_line_for_key(content, &full_key);
+                    errors.push(ConfigValidationError {
+                        line,
+                        key_path: full_key,
+                        message: "key `audit` must be a table".to_string(),
+                    });
+                }
+                continue;
+            }
+
+            if key == "rules" {
+                validate_rules_table(val, content, "rules", errors);
+                continue;
+            }
+
+            if key == "exclude" {
+                continue;
+            }
+
+            if has_audit_table || KNOWN_OTHER_SECTIONS.contains(&key.as_str()) {
+                continue;
+            }
+
+            let line = find_line_for_key(content, &full_key);
+            errors.push(ConfigValidationError {
+                line,
+                key_path: full_key,
+                message: "unknown configuration key; valid audit keys are: audit, exclude, rules"
+                    .to_string(),
+            });
+        } else if prefix == "audit" {
+            if key == "rules" {
+                validate_rules_table(val, content, "audit.rules", errors);
+                continue;
+            }
+            if key == "exclude" {
+                continue;
+            }
+            let line = find_line_for_key(content, &full_key);
+            errors.push(ConfigValidationError {
+                line,
+                key_path: full_key,
+                message: "unknown configuration key; valid audit keys are: exclude, rules"
+                    .to_string(),
+            });
+        }
+    }
+}
+
+fn validate_rules_table(
+    val: &toml::Value,
+    content: &str,
+    rules_path: &str,
+    errors: &mut Vec<ConfigValidationError>,
+) {
+    let rules_table = match val {
+        toml::Value::Table(t) => t,
+        _ => {
+            let line = find_line_for_key(content, rules_path);
+            errors.push(ConfigValidationError {
+                line,
+                key_path: rules_path.to_string(),
+                message: format!("key `{rules_path}` must be a table"),
+            });
+            return;
+        }
+    };
+
+    let valid_rules_list = VALID_RULES.join(", ");
+
+    for (rule_name, rule_val) in rules_table {
+        let rule_key_path = format!("{rules_path}.{rule_name}");
+        let line = find_line_for_key(content, &rule_key_path);
+
+        if !VALID_RULES.contains(&rule_name.as_str()) {
+            errors.push(ConfigValidationError {
+                line,
+                key_path: rule_key_path,
+                message: format!(
+                    "unknown rule `{rule_name}`; valid rules are: {valid_rules_list}"
+                ),
+            });
+            continue;
+        }
+
+        if let toml::Value::Table(rule_props) = rule_val {
+            for (prop_key, _) in rule_props {
+                let prop_key_path = format!("{rule_key_path}.{prop_key}");
+                if prop_key != "enabled" && prop_key != "severity" {
+                    let prop_line = find_line_for_key(content, &prop_key_path);
+                    errors.push(ConfigValidationError {
+                        line: prop_line,
+                        key_path: prop_key_path,
+                        message: "unknown configuration key; valid keys are: enabled, severity"
+                            .to_string(),
+                    });
+                }
+            }
+        } else {
+            errors.push(ConfigValidationError {
+                line,
+                key_path: rule_key_path,
+                message: "rule configuration must be a table".to_string(),
+            });
+        }
+    }
+}
+
 fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliError> {
     for dir in source_dir.ancestors() {
         for name in [".soroban-testkit.toml", "soroban-testkit.toml"] {
@@ -888,13 +1093,58 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
                     )));
                 }
             };
-            return toml::from_str(&content).map_err(|err| {
+
+            let table: toml::Table = toml::from_str(&content).map_err(|err| {
                 CliError(format!(
                     "failed to parse audit config {}{} as TOML: {err}; fix the configuration syntax",
                     path.display(),
                     config_error_context(&content, &err)
                 ))
-            });
+            })?;
+
+            let mut validation_errors = Vec::new();
+            validate_audit_config_table(&table, &content, "", &mut validation_errors);
+
+            if !validation_errors.is_empty() {
+                validation_errors.sort_by(|a, b| a.line.cmp(&b.line).then(a.key_path.cmp(&b.key_path)));
+                let formatted_errors: Vec<String> = validation_errors
+                    .into_iter()
+                    .map(|e| {
+                        format!(
+                            "at line {} (key `{}`): {}",
+                            e.line, e.key_path, e.message
+                        )
+                    })
+                    .collect();
+                return Err(CliError(format!(
+                    "failed to validate audit config {}:\n  - {}",
+                    path.display(),
+                    formatted_errors.join("\n  - ")
+                )));
+            }
+
+            let mut config: AuditConfig = toml::from_str(&content).map_err(|err| {
+                CliError(format!(
+                    "failed to parse audit config {}{} as TOML: {err}; fix the configuration syntax",
+                    path.display(),
+                    config_error_context(&content, &err)
+                ))
+            })?;
+
+            // If [audit.rules] was used, merge them into config.rules
+            if let Some(toml::Value::Table(audit_tbl)) = table.get("audit") {
+                if let Some(toml::Value::Table(rules_tbl)) = audit_tbl.get("rules") {
+                    for (k, v) in rules_tbl {
+                        if !config.rules.contains_key(k) {
+                            if let Ok(rule_cfg) = v.clone().try_into::<RuleConfig>() {
+                                config.rules.insert(k.clone(), rule_cfg);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return Ok(config);
         }
         if dir == workspace {
             break;

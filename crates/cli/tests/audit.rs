@@ -1723,3 +1723,133 @@ impl Vault {
         "missing-require-auth should fire when only an unrelated helper is called"
     );
 }
+
+// ---- #323: validate configuration keys and report unknown rules ----
+
+#[test]
+fn audit_config_validation_accepts_valid_configuration() {
+    let fixture = AuditFixture::new("config-valid");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nenabled = true\nseverity = 'warning'\n",
+    );
+    let output = fixture.scan(&[]);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn audit_config_validation_rejects_unknown_top_level_key() {
+    let fixture = AuditFixture::new("config-unknown-top");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let path = fixture.write(
+        ".soroban-testkit.toml",
+        "unknown_option = true\n[rules.missing-require-auth]\nenabled = true\n",
+    );
+    let output = fixture.scan(&[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to validate audit config"), "{stderr}");
+    assert!(stderr.contains(path.to_str().unwrap()), "{stderr}");
+    assert!(stderr.contains("unknown_option"), "{stderr}");
+    assert!(stderr.contains("unknown configuration key"), "{stderr}");
+}
+
+#[test]
+fn audit_config_validation_rejects_unknown_nested_key() {
+    let fixture = AuditFixture::new("config-unknown-nested");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let path = fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nenabled = true\ninvalid_prop = 42\n",
+    );
+    let output = fixture.scan(&[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to validate audit config"), "{stderr}");
+    assert!(stderr.contains(path.to_str().unwrap()), "{stderr}");
+    assert!(stderr.contains("rules.missing-require-auth.invalid_prop"), "{stderr}");
+    assert!(stderr.contains("unknown configuration key"), "{stderr}");
+}
+
+#[test]
+fn audit_config_validation_rejects_unknown_rule_with_valid_choices() {
+    let fixture = AuditFixture::new("config-unknown-rule");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let path = fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.nonexistent-audit-rule]\nenabled = false\n",
+    );
+    let output = fixture.scan(&[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to validate audit config"), "{stderr}");
+    assert!(stderr.contains(path.to_str().unwrap()), "{stderr}");
+    assert!(stderr.contains("unknown rule `nonexistent-audit-rule`"), "{stderr}");
+    assert!(stderr.contains("missing-require-auth"), "{stderr}");
+    assert!(stderr.contains("unchecked-i128-arithmetic"), "{stderr}");
+}
+
+#[test]
+fn audit_config_validation_reports_multiple_problems_deterministically() {
+    let fixture = AuditFixture::new("config-multiple-errors");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "bad_key_1 = 'a'\n[rules.typo-rule]\nenabled = true\n[rules.missing-require-auth]\nbad_nested = 1\n",
+    );
+    let run1 = fixture.scan(&[]);
+    let run2 = fixture.scan(&[]);
+    assert!(!run1.status.success());
+    assert!(!run2.status.success());
+    let stderr1 = String::from_utf8_lossy(&run1.stderr);
+    let stderr2 = String::from_utf8_lossy(&run2.stderr);
+    assert_eq!(stderr1, stderr2);
+    assert!(stderr1.contains("bad_key_1"), "{stderr1}");
+    assert!(stderr1.contains("typo-rule"), "{stderr1}");
+    assert!(stderr1.contains("bad_nested"), "{stderr1}");
+}
+
+#[test]
+fn audit_config_validation_ignores_other_tool_sections() {
+    let fixture = AuditFixture::new("config-other-sections");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "[coverage]\nfail_under = 80\n[limits]\ntimeout = 30\n[other_section]\nfoo = 'bar'\n[rules.missing-require-auth]\nenabled = true\n",
+    );
+    let output = fixture.scan(&[]);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn audit_config_validation_handles_empty_or_missing_configuration() {
+    let fixture = AuditFixture::new("config-empty-missing");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    // Missing config
+    let output1 = fixture.scan(&[]);
+    assert!(output1.status.success());
+
+    // Empty config
+    fixture.write(".soroban-testkit.toml", "");
+    let output2 = fixture.scan(&[]);
+    assert!(output2.status.success());
+
+    // Whitespace only config
+    fixture.write(".soroban-testkit.toml", "   \n\n  \t\n");
+    let output3 = fixture.scan(&[]);
+    assert!(output3.status.success());
+}
+
+#[test]
+fn audit_config_validation_regression_previously_valid_config_still_loads() {
+    let fixture = AuditFixture::new("config-regression");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nenabled = false\n[rules.unchecked-i128-arithmetic]\nseverity = 'warning'\n",
+    );
+    let output = fixture.scan(&["--strict"]);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+}
+
