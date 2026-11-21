@@ -1327,6 +1327,29 @@ fn audit_clean_json_report_has_no_parser_limitations() {
     );
 }
 
+// ---- #353: summary count of skipped files ----
+
+#[test]
+fn audit_summary_counts_skipped_files_in_json_and_stderr() {
+    let fixture = AuditFixture::new("skipped-count");
+    fixture.write("a-unreadable.rs", [0xff, 0xfe]);
+    fixture.write("b-invalid.rs", "fn broken( {\n");
+    fixture.write("z-valid.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(!output.status.success(), "{output:?}");
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["skipped_file_count"], 2, "{report}");
+    assert_eq!(report["summary"]["finding_count"], 1, "{report}");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("audit: summary: 1 input(s) scanned, 2 skipped"),
+        "{stderr}"
+    );
+}
+
 // ---- #486: regression snapshots for strict and report-only modes ----
 
 /// The exact report both modes must print. `--strict` changes only the exit
