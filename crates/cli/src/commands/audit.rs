@@ -132,6 +132,10 @@ pub struct AuditArgs {
     /// the current directory. Paths inside it are relative to the workspace.
     #[arg(long, global = true)]
     baseline: Option<PathBuf>,
+    /// Print only the audit summary, omitting individual finding details.
+    /// Only supported with text output.
+    #[arg(long, global = true)]
+    pub summary_only: bool,
 }
 
 #[derive(Subcommand)]
@@ -244,6 +248,12 @@ impl Finding {
 /// shared function (`sarif_level`), so text, JSON and SARIF can never
 /// disagree about the same finding.
 pub fn run(args: AuditArgs) -> Result<(), CliError> {
+    if args.summary_only && args.format != AuditOutputFormat::Text {
+        return Err(CliError(
+            "--summary-only is only supported for text output; omit --summary-only or use --format text".into(),
+        ));
+    }
+
     match &args.command {
         Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
         Some(AuditCommand::Rules) => return list_rules(args.format),
@@ -318,15 +328,17 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     normalize_findings(&mut findings);
 
     let parser_limitations: Vec<String> = parse_warnings.iter().map(ToString::to_string).collect();
-    print!(
-        "{}",
+    let rendered_report = if args.summary_only {
+        DiagnosticRenderer::new(&findings).render_text_summary()
+    } else {
         render_findings_with_limitations(
             &findings,
             args.format,
             &parser_limitations,
             skipped_files,
         )?
-    );
+    };
+    print!("{rendered_report}");
 
     // Findings (heuristic pattern matches over parsed source) were just
     // rendered above; these are parse warnings (inputs that were never
@@ -588,6 +600,23 @@ impl<'a> DiagnosticRenderer<'a> {
         }
     }
 
+    /// Render only the summary line and heuristics disclaimer notes.
+    pub fn render_text_summary(&self) -> String {
+        if self.findings.is_empty() {
+            format!(
+                "audit: no findings\nnote: {MACRO_SOURCE_LIMITATION}\nnote: {FINDING_NATURE}\n"
+            )
+        } else {
+            format!(
+                "{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
+                 security product — a missing finding is not a security guarantee.\n\
+                 note: {FINDING_NATURE}\n\
+                 note: {MACRO_SOURCE_LIMITATION}\n",
+                self.findings.len()
+            )
+        }
+    }
+
     /// Render compiler-style human-readable text diagnostics.
     ///
     /// Every finding carries the offending source line (`-->`), with ANSI
@@ -596,9 +625,7 @@ impl<'a> DiagnosticRenderer<'a> {
     /// heuristic signal, spelled out in the closing note.
     pub fn render_text(&self) -> String {
         if self.findings.is_empty() {
-            return format!(
-                "audit: no findings\nnote: {MACRO_SOURCE_LIMITATION}\nnote: {FINDING_NATURE}\n"
-            );
+            return self.render_text_summary();
         }
 
         let mut output = String::new();
@@ -615,13 +642,8 @@ impl<'a> DiagnosticRenderer<'a> {
                 output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
             }
         }
-        output.push_str(&format!(
-            "\n{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
-             security product — a missing finding is not a security guarantee.\n",
-            self.findings.len()
-        ));
-        output.push_str(&format!("note: {FINDING_NATURE}\n"));
-        output.push_str(&format!("note: {MACRO_SOURCE_LIMITATION}\n"));
+        output.push('\n');
+        output.push_str(&self.render_text_summary());
         output
     }
 

@@ -104,6 +104,9 @@ soroban-testkit limits --contract target/wasm32v1-none/release/my_contract.wasm 
 # signed amount parameters with no positive-value validation.
 soroban-testkit audit ./src --strict
 
+# Print only the audit summary without individual finding details.
+soroban-testkit audit ./src --summary-only
+
 # Stable machine-readable reports for automation and GitHub code scanning.
 soroban-testkit audit ./src --format json
 soroban-testkit audit ./src --format sarif > audit.sarif

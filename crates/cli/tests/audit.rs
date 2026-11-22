@@ -1723,3 +1723,98 @@ impl Vault {
         "missing-require-auth should fire when only an unrelated helper is called"
     );
 }
+
+// ---- #336: summary-only output mode ----
+
+#[test]
+fn audit_summary_only_with_findings_prints_only_summary_and_preserves_exit_code() {
+    let fixture = AuditFixture::new("summary-only-findings");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        UNAUTHORIZED_ENTRY_POINT,
+    );
+    // Findings present with --strict: exit code must fail.
+    let output = run_from(&fixture.0, &["audit", ".", "--strict", "--summary-only"]);
+    assert!(!output.status.success(), "exit code must indicate failure when findings exist under --strict");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("1 finding(s)"), "stdout must contain summary count: {stdout}");
+    assert!(stdout.contains("soroban-testkit audit is a linter"), "stdout must contain linter disclaimer: {stdout}");
+    assert!(stdout.contains("note:"), "stdout must contain notes: {stdout}");
+
+    // Assert individual finding text is absent:
+    assert!(!stdout.contains("missing-require-auth"), "individual rule ID must not appear in summary-only: {stdout}");
+    assert!(!stdout.contains("fn withdraw"), "individual finding message must not appear in summary-only: {stdout}");
+    assert!(!stdout.contains("-->"), "source snippet pointer must not appear in summary-only: {stdout}");
+    assert!(!stdout.contains("crates/vault/src/lib.rs:"), "file location must not appear in summary-only: {stdout}");
+}
+
+#[test]
+fn audit_summary_only_zero_findings_prints_zero_summary_and_succeeds() {
+    let fixture = AuditFixture::new("summary-only-zero");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        "// empty file\n",
+    );
+    let output = run_from(&fixture.0, &["audit", ".", "--summary-only"]);
+    assert!(output.status.success(), "clean run must succeed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("audit: no findings"), "zero findings must print zero summary: {stdout}");
+    assert!(stdout.contains("note:"), "must print note disclaimers: {stdout}");
+}
+
+#[test]
+fn audit_summary_only_matches_summary_section_of_full_output() {
+    let fixture = AuditFixture::new("summary-only-matches");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        UNAUTHORIZED_ENTRY_POINT,
+    );
+
+    let full_output = run_from(&fixture.0, &["audit", "."]);
+    let summary_output = run_from(&fixture.0, &["audit", ".", "--summary-only"]);
+
+    let full_stdout = String::from_utf8_lossy(&full_output.stdout);
+    let summary_stdout = String::from_utf8_lossy(&summary_output.stdout);
+
+    // Summary lines in summary-only output must match the summary lines at the bottom of full output
+    let full_summary_start = full_stdout.find("1 finding(s)").expect("full output must contain summary");
+    let full_summary = &full_stdout[full_summary_start..];
+
+    assert_eq!(summary_stdout.trim(), full_summary.trim(), "summary-only output must exactly match full output's summary section");
+}
+
+#[test]
+fn audit_summary_only_rejected_with_structured_formats() {
+    let fixture = AuditFixture::new("summary-only-formats");
+    let json_output = run_from(&fixture.0, &["audit", ".", "--summary-only", "--format", "json"]);
+    assert!(!json_output.status.success(), "--summary-only with --format json must fail");
+    let json_stderr = String::from_utf8_lossy(&json_output.stderr);
+    assert!(
+        json_stderr.contains("--summary-only is only supported for text output"),
+        "stderr must contain actionable error: {json_stderr}"
+    );
+
+    let sarif_output = run_from(&fixture.0, &["audit", ".", "--summary-only", "--format", "sarif"]);
+    assert!(!sarif_output.status.success(), "--summary-only with --format sarif must fail");
+    let sarif_stderr = String::from_utf8_lossy(&sarif_output.stderr);
+    assert!(
+        sarif_stderr.contains("--summary-only is only supported for text output"),
+        "stderr must contain actionable error: {sarif_stderr}"
+    );
+}
+
+#[test]
+fn audit_summary_only_default_output_unchanged_regression() {
+    let fixture = AuditFixture::new("summary-only-regression");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        UNAUTHORIZED_ENTRY_POINT,
+    );
+    let default_output = run_from(&fixture.0, &["audit", "."]);
+    let stdout = String::from_utf8_lossy(&default_output.stdout);
+    assert!(stdout.contains("crates/vault/src/lib.rs:"), "default output must still include finding locations");
+    assert!(stdout.contains("missing-require-auth"), "default output must still include rule name");
+    assert!(stdout.contains("1 finding(s)"), "default output must still include summary count");
+}
