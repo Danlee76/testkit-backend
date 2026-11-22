@@ -566,7 +566,7 @@ fn audit_json_round_trips_control_characters_in_findings() {
     fixture.write(name, UNAUTHORIZED_ENTRY_POINT);
     fixture.write(
         ".soroban-testkit.toml",
-        "[rules.missing-require-auth]\nseverity = \"custom\\t\\n\\r\\u001b\\\"\\\\雪\"\n",
+        "[rules.missing-require-auth]\nseverity = 'error'\n",
     );
     let output = fixture.scan(&["--strict"]);
     assert!(!output.status.success());
@@ -574,7 +574,7 @@ fn audit_json_round_trips_control_characters_in_findings() {
     assert_eq!(report["findings"][0]["file"], name);
     assert_eq!(
         report["findings"][0]["severity"],
-        "custom\t\n\r\u{1b}\"\\雪"
+        "error"
     );
     // The snippet quoted from the file body carries no control sequences of
     // its own, so it round-trips verbatim even though the file path does not.
@@ -2192,3 +2192,549 @@ impl Vault {
         "documented limitation: parameters without 'amount' in identifier are not flagged"
     );
 }
+// ---- #323: validate configuration keys and report unknown rules ----
+
+#[test]
+fn audit_config_validation_accepts_valid_configuration() {
+    let fixture = AuditFixture::new("config-valid");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nenabled = true\nseverity = 'warning'\n",
+    );
+    let output = fixture.scan(&[]);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn audit_config_validation_rejects_unknown_top_level_key() {
+    let fixture = AuditFixture::new("config-unknown-top");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let path = fixture.write(
+        ".soroban-testkit.toml",
+        "unknown_option = true\n[rules.missing-require-auth]\nenabled = true\n",
+    );
+    let output = fixture.scan(&[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to validate audit config"), "{stderr}");
+    assert!(stderr.contains(path.to_str().unwrap()), "{stderr}");
+    assert!(stderr.contains("unknown_option"), "{stderr}");
+    assert!(stderr.contains("unknown configuration key"), "{stderr}");
+}
+
+#[test]
+fn audit_config_validation_rejects_unknown_nested_key() {
+    let fixture = AuditFixture::new("config-unknown-nested");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let path = fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nenabled = true\ninvalid_prop = 42\n",
+    );
+    let output = fixture.scan(&[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to validate audit config"), "{stderr}");
+    assert!(stderr.contains(path.to_str().unwrap()), "{stderr}");
+    assert!(stderr.contains("rules.missing-require-auth.invalid_prop"), "{stderr}");
+    assert!(stderr.contains("unknown configuration key"), "{stderr}");
+}
+
+#[test]
+fn audit_config_validation_rejects_unknown_rule_with_valid_choices() {
+    let fixture = AuditFixture::new("config-unknown-rule");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let path = fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.nonexistent-audit-rule]\nenabled = false\n",
+    );
+    let output = fixture.scan(&[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to validate audit config"), "{stderr}");
+    assert!(stderr.contains(path.to_str().unwrap()), "{stderr}");
+    assert!(stderr.contains("unknown rule `nonexistent-audit-rule`"), "{stderr}");
+    assert!(stderr.contains("missing-require-auth"), "{stderr}");
+    assert!(stderr.contains("unchecked-i128-arithmetic"), "{stderr}");
+}
+
+#[test]
+fn audit_config_validation_reports_multiple_problems_deterministically() {
+    let fixture = AuditFixture::new("config-multiple-errors");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "bad_key_1 = 'a'\n[rules.typo-rule]\nenabled = true\n[rules.missing-require-auth]\nbad_nested = 1\n",
+    );
+    let run1 = fixture.scan(&[]);
+    let run2 = fixture.scan(&[]);
+    assert!(!run1.status.success());
+    assert!(!run2.status.success());
+    let stderr1 = String::from_utf8_lossy(&run1.stderr);
+    let stderr2 = String::from_utf8_lossy(&run2.stderr);
+    assert_eq!(stderr1, stderr2);
+    assert!(stderr1.contains("bad_key_1"), "{stderr1}");
+    assert!(stderr1.contains("typo-rule"), "{stderr1}");
+    assert!(stderr1.contains("bad_nested"), "{stderr1}");
+}
+
+#[test]
+fn audit_config_validation_ignores_other_tool_sections() {
+    let fixture = AuditFixture::new("config-other-sections");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "[coverage]\nfail_under = 80\n[limits]\ntimeout = 30\n[other_section]\nfoo = 'bar'\n[rules.missing-require-auth]\nenabled = true\n",
+    );
+    let output = fixture.scan(&[]);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn audit_config_validation_handles_empty_or_missing_configuration() {
+    let fixture = AuditFixture::new("config-empty-missing");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    // Missing config
+    let output1 = fixture.scan(&[]);
+    assert!(output1.status.success());
+
+    // Empty config
+    fixture.write(".soroban-testkit.toml", "");
+    let output2 = fixture.scan(&[]);
+    assert!(output2.status.success());
+
+    // Whitespace only config
+    fixture.write(".soroban-testkit.toml", "   \n\n  \t\n");
+    let output3 = fixture.scan(&[]);
+    assert!(output3.status.success());
+}
+
+#[test]
+fn audit_config_validation_regression_previously_valid_config_still_loads() {
+    let fixture = AuditFixture::new("config-regression");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nenabled = false\n[rules.unchecked-i128-arithmetic]\nseverity = 'warning'\n",
+    );
+    let output = fixture.scan(&["--strict"]);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+// ---- #322: allow per-rule severity overrides ----
+
+#[test]
+fn audit_severity_override_sets_effective_severity() {
+    let fixture = AuditFixture::new("severity-override");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nseverity = 'error'\n",
+    );
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["findings"][0]["severity"], "error");
+}
+
+#[test]
+fn audit_severity_override_case_insensitive() {
+    let fixture = AuditFixture::new("severity-case");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nseverity = 'ERROR'\n",
+    );
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["findings"][0]["severity"], "error");
+}
+
+#[test]
+fn audit_severity_override_rejects_invalid_severity_value() {
+    let fixture = AuditFixture::new("severity-invalid");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let path = fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nseverity = 'fatal'\n",
+    );
+    let output = fixture.scan(&[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to validate audit config"), "{stderr}");
+    assert!(stderr.contains(path.to_str().unwrap()), "{stderr}");
+    assert!(stderr.contains("invalid severity `fatal`"), "{stderr}");
+    assert!(stderr.contains("allowed values are: error, warning, note"), "{stderr}");
+}
+
+#[test]
+fn audit_severity_override_multiple_rules_at_once() {
+    let fixture = AuditFixture::new("severity-multiple");
+    fixture.write("crates/vault/src/lib.rs", r#"
+        #[contractimpl]
+        impl Contract {
+            pub fn withdraw(env: Env, from: Address) {
+                let x: i128 = 10;
+                let _ = x + 1;
+            }
+        }
+    "#);
+    fixture.write(
+        ".soroban-testkit.toml",
+        "[rules.missing-require-auth]\nseverity = 'error'\n[rules.unchecked-i128-arithmetic]\nseverity = 'note'\n",
+    );
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    for finding in findings {
+        if finding["rule"] == "missing-require-auth" {
+            assert_eq!(finding["severity"], "error");
+        } else if finding["rule"] == "unchecked-i128-arithmetic" {
+            assert_eq!(finding["severity"], "note");
+        }
+    }
+}
+
+#[test]
+fn audit_no_severity_overrides_leaves_default_severities() {
+    let fixture = AuditFixture::new("severity-defaults");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["findings"][0]["severity"], "warning");
+}
+
+// ---- #321: support excluding generated source directories ----
+
+#[test]
+fn audit_excludes_directory_via_cli_flag() {
+    let fixture = AuditFixture::new("exclude-cli");
+    std::fs::create_dir_all(fixture.0.join("src/gen")).unwrap();
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("src/gen/generated.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--exclude", "src/gen"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["file"], "src/lib.rs");
+}
+
+#[test]
+fn audit_excludes_directory_via_config() {
+    let fixture = AuditFixture::new("exclude-config");
+    std::fs::create_dir_all(fixture.0.join("generated")).unwrap();
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("generated/code.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(".soroban-testkit.toml", "exclude = [\"generated\"]\n");
+
+    let output = fixture.scan(&[]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["file"], "src/lib.rs");
+}
+
+#[test]
+fn audit_excludes_directory_matches_whole_path_components() {
+    let fixture = AuditFixture::new("exclude-whole-component");
+    std::fs::create_dir_all(fixture.0.join("gen")).unwrap();
+    std::fs::create_dir_all(fixture.0.join("generated_utils")).unwrap();
+    std::fs::create_dir_all(fixture.0.join("src/regen")).unwrap();
+    fixture.write("gen/a.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("generated_utils/b.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("src/regen/c.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--exclude", "gen"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    let files: Vec<&str> = findings.iter().map(|f| f["file"].as_str().unwrap()).collect();
+    assert!(!files.contains(&"gen/a.rs"), "{files:?}");
+    assert!(files.contains(&"generated_utils/b.rs"), "{files:?}");
+    assert!(files.contains(&"src/regen/c.rs"), "{files:?}");
+}
+
+#[test]
+fn audit_excludes_normalizes_trailing_slashes_and_leading_dotslash() {
+    let fixture = AuditFixture::new("exclude-normalize");
+    std::fs::create_dir_all(fixture.0.join("gen/nested")).unwrap();
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("gen/nested/gen.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--exclude", "./gen/nested/"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["file"], "src/lib.rs");
+}
+
+#[test]
+fn audit_excludes_nonexistent_directory_is_safe_and_does_not_fail() {
+    let fixture = AuditFixture::new("exclude-nonexistent");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--exclude", "does_not_exist"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+}
+
+#[test]
+fn audit_excludes_rejects_paths_that_escape_project_root() {
+    let fixture = AuditFixture::new("exclude-escape");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--exclude", "../escaped"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("escapes the project root"), "{stderr}");
+}
+
+#[test]
+fn audit_scans_explicit_file_inside_excluded_directory() {
+    let fixture = AuditFixture::new("exclude-explicit-file");
+    std::fs::create_dir_all(fixture.0.join("gen")).unwrap();
+    let file = fixture.write("gen/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = run_from(
+        &fixture.0,
+        &["audit", file.to_str().unwrap(), "--exclude", "gen", "--format", "json"],
+    );
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+}
+
+#[test]
+fn audit_combines_config_and_cli_exclusions() {
+    let fixture = AuditFixture::new("exclude-combined");
+    std::fs::create_dir_all(fixture.0.join("gen1")).unwrap();
+    std::fs::create_dir_all(fixture.0.join("gen2")).unwrap();
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("gen1/a.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write("gen2/b.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(".soroban-testkit.toml", "exclude = [\"gen1\"]\n");
+
+    let output = fixture.scan(&["--exclude", "gen2"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["file"], "src/lib.rs");
+}
+
+#[test]
+fn audit_no_exclusions_regression() {
+    let fixture = AuditFixture::new("exclude-none");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let output = fixture.scan(&[]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1);
+}
+
+// ---- #320: report source ranges for multi-line findings ----
+
+#[test]
+fn audit_single_line_finding_looks_exactly_as_before() {
+    let fixture = AuditFixture::new("ranges-single-line");
+    fixture.write("src/lib.rs", "fn test_broad() { mock_all_auths(); }\n");
+
+    // Text format: prefix is file:line: without range suffix
+    let text_output = fixture.scan(&["--format", "text"]);
+    assert!(text_output.status.success());
+    let text = String::from_utf8_lossy(&text_output.stdout);
+    assert!(text.contains("src/lib.rs:1: ["), "text: {text}");
+    assert!(!text.contains("src/lib.rs:1:-"), "text: {text}");
+
+    // JSON format: end_line is omitted for single-line findings
+    let json_output = fixture.scan(&["--format", "json"]);
+    assert!(json_output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let finding = &report["findings"][0];
+    assert_eq!(finding["line"], 1);
+    assert!(finding.get("end_line").is_none(), "end_line should not be serialized for single-line: {finding}");
+
+    // SARIF format: region contains startLine and no endLine
+    let sarif_output = fixture.scan(&["--format", "sarif"]);
+    assert!(sarif_output.status.success());
+    let sarif: serde_json::Value = serde_json::from_slice(&sarif_output.stdout).unwrap();
+    let region = &sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
+    assert_eq!(region["startLine"], 1);
+    assert!(region.get("endLine").is_none(), "endLine should not be present in SARIF: {region}");
+}
+
+#[test]
+fn audit_multi_line_finding_has_correct_start_and_end() {
+    // Arithmetic worked out by hand:
+    // Line 1: #[contractimpl]
+    // Line 2: impl Contract {
+    // Line 3:     pub fn withdraw(
+    // Line 4:         env: Env,
+    // Line 5:         from: Address,
+    // Line 6:     ) {
+    // Line 7:         save(&from);
+    // Line 8:     }
+    // Line 9: }
+    // The fn `withdraw` starts at line 3 (token `pub`) and ends at line 8 (token `}`).
+    // Spanned lines: [3, 8], span length = 8 - 3 + 1 = 6 lines.
+    let source = "\
+#[contractimpl]
+impl Contract {
+    pub fn withdraw(
+        env: Env,
+        from: Address,
+    ) {
+        save(&from);
+    }
+}
+";
+    let fixture = AuditFixture::new("ranges-multiline");
+    fixture.write("src/lib.rs", source);
+
+    // JSON format
+    let json_output = fixture.scan(&["--format", "json"]);
+    assert!(json_output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["rule"] == "missing-require-auth")
+        .expect("missing-require-auth finding must be present");
+    assert_eq!(finding["line"], 3, "start line: {finding}");
+    assert_eq!(finding["end_line"], 8, "end line: {finding}");
+
+    // SARIF format
+    let sarif_output = fixture.scan(&["--format", "sarif"]);
+    assert!(sarif_output.status.success());
+    let sarif: serde_json::Value = serde_json::from_slice(&sarif_output.stdout).unwrap();
+    let result = sarif["runs"][0]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["ruleId"] == "missing-require-auth")
+        .expect("missing-require-auth result must be present in SARIF");
+    let region = &result["locations"][0]["physicalLocation"]["region"];
+    assert_eq!(region["startLine"], 3);
+    assert_eq!(region["endLine"], 8);
+
+    // Text format: keeps file:line: prefix and appends range
+    let text_output = fixture.scan(&["--format", "text"]);
+    assert!(text_output.status.success());
+    let text = String::from_utf8_lossy(&text_output.stdout);
+    assert!(text.contains("src/lib.rs:3:-8:"), "text must keep prefix and append range: {text}");
+}
+
+#[test]
+fn audit_multi_line_finding_crlf_input() {
+    // Arithmetic worked out by hand:
+    // Line 1: #[contractimpl]\r\n
+    // Line 2: impl Contract {\r\n
+    // Line 3:     pub fn withdraw(\r\n
+    // Line 4:         env: Env,\r\n
+    // Line 5:         from: Address,\r\n
+    // Line 6:     ) {\r\n
+    // Line 7:         save(&from);\r\n
+    // Line 8:     }\r\n
+    // Line 9: }\r\n
+    // Line range: start = 3, end = 8.
+    let crlf_source = "#[contractimpl]\r\nimpl Contract {\r\n    pub fn withdraw(\r\n        env: Env,\r\n        from: Address,\r\n    ) {\r\n        save(&from);\r\n    }\r\n}\r\n";
+    let fixture = AuditFixture::new("ranges-crlf");
+    fixture.write("src/lib.rs", crlf_source);
+
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = &report["findings"][0];
+    assert_eq!(finding["line"], 3);
+    assert_eq!(finding["end_line"], 8);
+}
+
+#[test]
+fn audit_multi_line_finding_with_multibyte_characters_before_finding() {
+    // Arithmetic worked out by hand:
+    // Line 1: // 🦀 Stellar Smart Contracts 🚀\n
+    // Line 2: // 日本語コメント 雪\n
+    // Line 3: #[contractimpl]\n
+    // Line 4: impl Contract {\n
+    // Line 5:     pub fn withdraw(\n
+    // Line 6:         env: Env,\n
+    // Line 7:         from: Address,\n
+    // Line 8:     ) {\n
+    // Line 9:         save(&from);\n
+    // Line 10:    }\n
+    // Line 11: }\n
+    // With 2 multibyte comment lines before the impl, `withdraw` starts at line 5 and ends at line 10.
+    let source = "// 🦀 Stellar Smart Contracts 🚀\n// 日本語コメント 雪\n#[contractimpl]\nimpl Contract {\n    pub fn withdraw(\n        env: Env,\n        from: Address,\n    ) {\n        save(&from);\n    }\n}\n";
+    let fixture = AuditFixture::new("ranges-multibyte");
+    fixture.write("src/lib.rs", source);
+
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = &report["findings"][0];
+    assert_eq!(finding["line"], 5);
+    assert_eq!(finding["end_line"], 10);
+}
+
+#[test]
+fn audit_multi_line_finding_ending_at_end_of_file() {
+    // Arithmetic worked out by hand:
+    // Line 1: pub fn withdraw(
+    // Line 2:     env: Env,
+    // Line 3:     from: Address,
+    // Line 4: ) { save(&from); }
+    // No trailing newline after line 4.
+    // Start line: 1. End line: 4.
+    let source = "pub fn withdraw(\n    env: Env,\n    from: Address,\n) { save(&from); }";
+    let fixture = AuditFixture::new("ranges-eof");
+    fixture.write("src/lib.rs", source);
+
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = &report["findings"][0];
+    assert_eq!(finding["line"], 1);
+    assert_eq!(finding["end_line"], 4);
+}
+
+#[test]
+fn audit_structured_output_only_gained_fields() {
+    let fixture = AuditFixture::new("ranges-fields");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = &report["findings"][0];
+    assert!(finding.get("file").is_some());
+    assert!(finding.get("line").is_some());
+    assert!(finding.get("rule").is_some());
+    assert!(finding.get("severity").is_some());
+    assert!(finding.get("message").is_some());
+    assert!(finding.get("source_snippet").is_some());
+    assert!(finding.get("end_line").is_some());
+}
+
+#[test]
+fn audit_text_output_keeps_prefix() {
+    let fixture = AuditFixture::new("ranges-text-prefix");
+    fixture.write("src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let output = fixture.scan(&["--format", "text"]);
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("src/lib.rs:3:"), "must keep src/lib.rs:3: prefix: {text}");
+}
+
+
+
+
