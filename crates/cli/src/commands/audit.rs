@@ -148,6 +148,19 @@ pub struct AuditArgs {
     /// Allowed values: integers between 20 and 1000. When omitted, messages are not wrapped.
     #[arg(long, value_name = "WIDTH", allow_hyphen_values = true, global = true)]
     pub width: Option<String>,
+    /// List all audit rules without running an audit.
+    #[arg(long, global = true)]
+    pub list_rules: bool,
+    /// Include glob patterns to filter scanned files. Can be specified multiple times.
+    /// A file is scanned if it matches at least one include pattern (or if no include
+    /// patterns are specified).
+    #[arg(long = "include", value_name = "GLOB", action = clap::ArgAction::Append, global = true)]
+    pub include: Vec<String>,
+    /// Exclude glob patterns to filter scanned files. Can be specified multiple times.
+    /// Files matching any exclude pattern are skipped. Exclude patterns take precedence
+    /// over include patterns.
+    #[arg(long = "exclude", value_name = "GLOB", action = clap::ArgAction::Append, global = true)]
+    pub exclude: Vec<String>,
     /// Exclude directory path(s) relative to the workspace root from recursive scans.
     /// Repeatable. Exact relative directory paths only (glob patterns are not supported).
     #[arg(long = "exclude", value_name = "DIR", action = clap::ArgAction::Append, global = true)]
@@ -163,6 +176,8 @@ enum AuditCommand {
     },
     /// List all rules with their descriptions in machine-readable format.
     Rules,
+    /// List all audit rules without running an audit.
+    ListRules,
 }
 
 /// Machine- and human-readable audit output formats.
@@ -324,12 +339,80 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
         Some(AuditCommand::Rules) => return list_rules(args.format),
         None => {}
+    if args.list_rules
+        || matches!(
+            &args.command,
+            Some(AuditCommand::Rules | AuditCommand::ListRules)
+        )
+    {
+        return list_rules(args.format);
+    }
+    if let Some(AuditCommand::Explain { rule }) = &args.command {
+        return explain_rule(rule);
+    }
+
+    for pat in &args.include {
+        validate_glob(pat)?;
+    }
+    for pat in &args.exclude {
+        validate_glob(pat)?;
     }
 
     let stdin = args.path == Path::new("-");
     let mut parse_warnings = Vec::new();
     let mut scanned_files = 0usize;
     let mut skipped_files = 0usize;
+    let sources = if stdin {
+        Vec::new()
+    } else {
+        collect_rust_sources_filtered(
+            &args.path,
+            &mut parse_warnings,
+            &args.include,
+            &args.exclude,
+        )?
+    };
+
+    if !stdin && (!args.include.is_empty() || !args.exclude.is_empty()) && sources.is_empty() {
+        match args.format {
+            AuditOutputFormat::Text => {
+                println!("audit: no files matched the configured include/exclude filters");
+            }
+            AuditOutputFormat::Json => {
+                let report = serde_json::json!({
+                    "tool": "soroban-testkit",
+                    "version": 1,
+                    "findings": [],
+                    "summary": {
+                        "finding_count": 0,
+                        "files_scanned": 0,
+                        "skipped_file_count": 0,
+                        "by_severity": [],
+                        "parser_limitations": [],
+                        "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE],
+                        "message": "no files matched the configured include/exclude filters"
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            }
+            AuditOutputFormat::Sarif => {
+                let report = serde_json::json!({
+                    "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                    "version": "2.1.0",
+                    "runs": [{
+                        "tool": { "driver": { "name": "soroban-testkit", "rules": [] } },
+                        "results": [],
+                        "properties": {
+                            "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE],
+                            "message": "no files matched the configured include/exclude filters"
+                        }
+                    }]
+                });
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            }
+        }
+        return Ok(());
+    }
     let source_dir = if stdin {
         canonical_path(&std::env::current_dir()?)?
     } else {
@@ -426,10 +509,14 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         DiagnosticRenderer::new(&findings).render_text_colored_with_width(use_color, width)
     } else {
         render_findings_with_limitations(
+    print!(
+        "{}",
+        render_findings_with_limitations_and_scanned(
             &findings,
             args.format,
             &parser_limitations,
             skipped_files,
+            scanned_files,
         )?
     };
     print!("{rendered_report}");
@@ -554,10 +641,255 @@ fn normalize_and_validate_exclusions(
 
 /// Walks `root` and returns the `.rs` files that should be audited, applying
 /// the exclusions documented on `AuditArgs::path`.
+///
+/// A root that does not exist is an error, not an empty scan: silently
+/// reporting "no findings" for a typo'd path would be worse than useless in
+/// CI, so the message names every supported input form.
+/// Validates a glob pattern syntax, ensuring no unclosed classes or invalid ranges.
+pub fn validate_glob(pattern: &str) -> Result<(), CliError> {
+    if pattern.trim().is_empty() {
+        return Err(CliError(format!(
+            "invalid glob pattern '{pattern}': pattern cannot be empty; provide a pattern like '**/*.rs'"
+        )));
+    }
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            let mut j = i + 1;
+            let mut found_close = false;
+            while j < bytes.len() {
+                if bytes[j] == b']' {
+                    found_close = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !found_close {
+                return Err(CliError(format!(
+                    "invalid glob pattern '{pattern}': unclosed character class '['; provide a closing ']'"
+                )));
+            }
+            let class = &bytes[i + 1..j];
+            let class_content = if !class.is_empty() && (class[0] == b'!' || class[0] == b'^') {
+                &class[1..]
+            } else {
+                class
+            };
+            if class_content.is_empty() {
+                return Err(CliError(format!(
+                    "invalid glob pattern '{pattern}': empty character class '[]'"
+                )));
+            }
+            let mut k = 0;
+            while k < class_content.len() {
+                if k + 2 < class_content.len() && class_content[k + 1] == b'-' {
+                    if class_content[k] > class_content[k + 2] {
+                        return Err(CliError(format!(
+                            "invalid glob pattern '{pattern}': invalid range '{}-{}' in character class",
+                            class_content[k] as char, class_content[k + 2] as char
+                        )));
+                    }
+                    k += 3;
+                } else {
+                    k += 1;
+                }
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+fn match_char_class(class: &[u8], ch: u8) -> bool {
+    if class.is_empty() {
+        return false;
+    }
+    let (negated, class) = if class[0] == b'!' || class[0] == b'^' {
+        (true, &class[1..])
+    } else {
+        (false, class)
+    };
+    let mut matched = false;
+    let mut i = 0;
+    while i < class.len() {
+        if i + 2 < class.len() && class[i + 1] == b'-' {
+            let start = class[i];
+            let end = class[i + 2];
+            if ch >= start && ch <= end {
+                matched = true;
+                break;
+            }
+            i += 3;
+        } else {
+            if class[i] == ch {
+                matched = true;
+                break;
+            }
+            i += 1;
+        }
+    }
+    if negated {
+        !matched
+    } else {
+        matched
+    }
+}
+
+fn match_single_segment(pat: &[u8], text: &[u8]) -> bool {
+    let mut p = 0;
+    let mut t = 0;
+    let mut star_p = None;
+    let mut star_t = 0;
+
+    while t < text.len() {
+        if p < pat.len() && pat[p] == b'[' {
+            let close = match pat[p + 1..].iter().position(|&b| b == b']') {
+                Some(pos) => p + 1 + pos,
+                None => return false,
+            };
+            let class = &pat[p + 1..close];
+            if match_char_class(class, text[t]) {
+                p = close + 1;
+                t += 1;
+                continue;
+            } else if let Some(sp) = star_p {
+                star_t += 1;
+                t = star_t;
+                p = sp + 1;
+                continue;
+            } else {
+                return false;
+            }
+        } else if p < pat.len() && pat[p] == b'?' {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star_p = Some(p);
+            p += 1;
+            star_t = t;
+        } else if p < pat.len() && pat[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if let Some(sp) = star_p {
+            star_t += 1;
+            t = star_t;
+            p = sp + 1;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+fn match_segments(pat: &[&str], path: &[&str]) -> bool {
+    match (pat.first(), path.first()) {
+        (None, None) => true,
+        (Some(&"**"), _) => {
+            if match_segments(&pat[1..], path) {
+                return true;
+            }
+            if !path.is_empty() && match_segments(pat, &path[1..]) {
+                return true;
+            }
+            false
+        }
+        (Some(p), Some(t)) => {
+            if match_single_segment(p.as_bytes(), t.as_bytes()) {
+                match_segments(&pat[1..], &path[1..])
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Matches a glob pattern against a relative path.
+pub fn glob_matches(pattern: &str, path: &str) -> bool {
+    let mut pat_norm = pattern.replace('\\', "/");
+    let has_slash = pat_norm.contains('/');
+
+    if pat_norm.ends_with('/') {
+        pat_norm.push_str("**");
+    }
+
+    let pat_clean = pat_norm.strip_prefix("./").unwrap_or(&pat_norm);
+    let pat_clean = pat_clean.strip_prefix('/').unwrap_or(pat_clean);
+
+    let path_norm = path.replace('\\', "/");
+    let path_clean = path_norm.strip_prefix("./").unwrap_or(&path_norm);
+    let path_clean = path_clean.strip_prefix('/').unwrap_or(path_clean);
+
+    let path_segs: Vec<&str> = path_clean.split('/').filter(|s| !s.is_empty()).collect();
+
+    // If pattern had no slash and no wildcards, match against any directory component or file name
+    if !has_slash && !pattern.contains('*') && !pattern.contains('?') && !pattern.contains('[') {
+        if path_segs.contains(&pat_clean) {
+            return true;
+        }
+    }
+
+    // If pattern had no slash, it matches against the file's basename
+    if !has_slash {
+        if let Some(file_name) = path_segs.last() {
+            if match_single_segment(pat_clean.as_bytes(), file_name.as_bytes()) {
+                return true;
+            }
+        }
+    }
+
+    let pat_segs: Vec<&str> = pat_clean.split('/').filter(|s| !s.is_empty()).collect();
+    match_segments(&pat_segs, &path_segs)
+}
+
+/// Evaluates include and exclude patterns against a relative path.
+/// Exclude patterns take precedence over include patterns.
+pub fn matches_filter(
+    rel_path: &str,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> bool {
+    let rel_norm = rel_path.replace('\\', "/");
+    let rel_norm = rel_norm.strip_prefix("./").unwrap_or(&rel_norm);
+    let rel_norm = rel_norm.strip_prefix('/').unwrap_or(rel_norm);
+
+    // 1. Exclude wins: if matches any exclude pattern, skip file
+    for pat in exclude_patterns {
+        if glob_matches(pat, rel_norm) {
+            return false;
+        }
+    }
+
+    // 2. Include patterns: if specified, must match at least one
+    if !include_patterns.is_empty() {
+        return include_patterns.iter().any(|pat| glob_matches(pat, rel_norm));
+    }
+
+    // 3. Otherwise included by default
+    true
+}
+
 fn collect_rust_sources(
     root: &Path,
     warnings: &mut Vec<CliError>,
 ) -> Result<Vec<PathBuf>, CliError> {
+    collect_rust_sources_filtered(root, warnings, &[], &[])
+}
+
+fn collect_rust_sources_filtered(
+    root: &Path,
+    warnings: &mut Vec<CliError>,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> Result<Vec<PathBuf>, CliError> {
+    let metadata = fs::metadata(root).map_err(|err| {
     collect_rust_sources_with_exclusions(root, root, &[], warnings)
 }
 
@@ -581,6 +913,15 @@ fn collect_rust_sources_with_exclusions(
             ))
         }
     })?;
+
+    if metadata.is_file() {
+        let file_name = root.file_name().unwrap_or_default().to_string_lossy();
+        if matches_filter(&file_name, include_patterns, exclude_patterns) {
+            return Ok(vec![root.to_path_buf()]);
+        } else {
+            return Ok(Vec::new());
+        }
+    }
 
     let is_root_file = root.is_file();
     let mut sources = Vec::new();
@@ -615,6 +956,10 @@ fn collect_rust_sources_with_exclusions(
         };
         let is_rust = entry.path().extension().is_some_and(|ext| ext == "rs");
         if entry.file_type().is_file() && is_rust {
+            let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
+            let rel_str = rel.to_string_lossy();
+            if matches_filter(&rel_str, include_patterns, exclude_patterns) {
+                sources.push(entry.path().to_path_buf());
             if entry.depth() == 0 && is_root_file {
                 sources.push(entry.path().to_path_buf());
             } else {
@@ -630,46 +975,82 @@ fn collect_rust_sources_with_exclusions(
     Ok(sources)
 }
 
-fn explain_rule(rule: &str) -> Result<(), CliError> {
-    let explanation = match rule {
-        "missing-require-auth" => {
-            "missing-require-auth: Entry points that accept an Address parameter must validate the caller.\n\
-             This rule detects functions with Address parameters that never call require_auth().\n\
-             Fix: Call address.require_auth() to ensure the caller is authorized.\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security"
-        }
-        "unchecked-i128-arithmetic" => {
-            "unchecked-i128-arithmetic: Arithmetic on i128 values can silently overflow.\n\
-             This rule detects + - * / operations on i128 values outside of checked/saturating/wrapping variants.\n\
-             Fix: Use .checked_add(), .saturating_add(), or .wrapping_add() for safe overflow handling.\n\
-             Reference: https://doc.rust-lang.org/std/primitive.i128.html"
-        }
-        "missing-ttl-bump" => {
-            "missing-ttl-bump: Storage reads that are not followed by TTL extension can expire.\n\
-             This rule detects .persistent() or .temporary() reads without .extend_ttl() in the same function.\n\
-             Fix: Call .extend_ttl() after reading from storage to prevent premature expiration.\n\
-             Reference: https://developers.stellar.org/docs/smart-contracts/storing-data"
-        }
-        "broad-mock-all-auths" => {
-            "broad-mock-all-auths: Test functions using mock_all_auths() bypass auth checks entirely.\n\
+/// Definition of an audit rule in the central registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuleDefinition {
+    pub id: &'static str,
+    pub severity: &'static str,
+    pub description: &'static str,
+    pub explanation: &'static str,
+    pub remediation: &'static str,
+}
+
+pub const RULE_REGISTRY: &[RuleDefinition] = &[
+    RuleDefinition {
+        id: "broad-mock-all-auths",
+        severity: "warning",
+        description: "Test functions using mock_all_auths() bypass auth checks entirely.",
+        explanation: "broad-mock-all-auths: Test functions using mock_all_auths() bypass auth checks entirely.\n\
              This rule detects mock_all_auths in test functions.\n\
              Fix: Replace with granular auth checks for specific callers to ensure auth is properly tested.\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/testing"
-        }
-        "ignored-token-transfer-result" => {
-            "ignored-token-transfer-result: Token transfer operations can fail and their results must be handled.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/testing",
+        remediation: "Replace broad mock_all_auths() with granular mock_auths(&[...]) or targeted caller authorizations so unintended missing auth checks are not masked.",
+    },
+    RuleDefinition {
+        id: "ignored-token-transfer-result",
+        severity: "warning",
+        description: "Token transfer operations can fail; their results must be handled.",
+        explanation: "ignored-token-transfer-result: Token transfer operations can fail and their results must be handled.\n\
              This rule detects transfer/transfer_from/try_transfer calls whose results are not used.\n\
              Fix: Propagate the result with ?, match on it, or explicitly bind it (let _ = ...).\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/tokens"
-        }
-        "missing-positive-amount-validation" => {
-            "missing-positive-amount-validation: Signed amount parameters should be validated.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/tokens",
+        remediation: "Propagate the Result with ?, match on the return value, or assert on the outcome so failed token transfers cannot fail silently.",
+    },
+    RuleDefinition {
+        id: "missing-positive-amount-validation",
+        severity: "warning",
+        description: "Signed amount parameters should be validated against zero.",
+        explanation: "missing-positive-amount-validation: Signed amount parameters should be validated.\n\
              This rule detects amount parameters (signed integers) with no comparison against zero.\n\
              Fix: Add a check like assert!(amount > 0) to validate amounts before use.\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security"
-        }
-        "unchecked-timestamp-arithmetic" => {
-            "unchecked-timestamp-arithmetic: Timestamp arithmetic can overflow and cause silent failures.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security",
+        remediation: "Validate that the amount is strictly positive with require!(amount > 0, ...) or an explicit condition before transferring or updating state.",
+    },
+    RuleDefinition {
+        id: "missing-require-auth",
+        severity: "warning",
+        description: "Entry points that accept an Address parameter must validate the caller with require_auth().",
+        explanation: "missing-require-auth: Entry points that accept an Address parameter must validate the caller.\n\
+             This rule detects functions with Address parameters that never call require_auth().\n\
+             Fix: Call address.require_auth() to ensure the caller is authorized.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security",
+        remediation: "Call address.require_auth() or address.require_auth_for_args(...) at the start of the function body to verify that the transaction signer authorized the operation.",
+    },
+    RuleDefinition {
+        id: "missing-ttl-bump",
+        severity: "warning",
+        description: "Storage reads without extend_ttl can expire prematurely.",
+        explanation: "missing-ttl-bump: Storage reads that are not followed by TTL extension can expire.\n\
+             This rule detects .persistent() or .temporary() reads without .extend_ttl() in the same function.\n\
+             Fix: Call .extend_ttl() after reading from storage to prevent premature expiration.\n\
+             Reference: https://developers.stellar.org/docs/smart-contracts/storing-data",
+        remediation: "Call env.storage().persistent().extend_ttl(...) or temporary().extend_ttl(...) for accessed keys to prevent state expiration before the next interaction.",
+    },
+    RuleDefinition {
+        id: "unchecked-i128-arithmetic",
+        severity: "warning",
+        description: "Arithmetic on i128 values can silently overflow; use checked/saturating/wrapping variants.",
+        explanation: "unchecked-i128-arithmetic: Arithmetic on i128 values can silently overflow.\n\
+             This rule detects + - * / operations on i128 values outside of checked/saturating/wrapping variants.\n\
+             Fix: Use .checked_add(), .saturating_add(), or .wrapping_add() for safe overflow handling.\n\
+             Reference: https://doc.rust-lang.org/std/primitive.i128.html",
+        remediation: "Use .checked_add(), .checked_sub(), .checked_mul(), or .checked_div() and handle overflow, or use saturating/wrapping arithmetic if truncation is intended.",
+    },
+    RuleDefinition {
+        id: "unchecked-timestamp-arithmetic",
+        severity: "warning",
+        description: "Timestamp arithmetic can overflow and cause silent failures.",
+        explanation: "unchecked-timestamp-arithmetic: Timestamp arithmetic can overflow and cause silent failures.\n\
              This rule detects + - * / operations on timestamp values without overflow protection.\n\
              Fix: Use checked arithmetic or ensure your timestamps are bounded to valid ranges.\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time"
@@ -776,6 +1157,24 @@ pub const RULES: &[RuleMeta] = &[
     },
 ];
 
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time",
+        remediation: "Use checked arithmetic (.checked_add, .checked_sub) on ledger timestamps and validate bounds to prevent timestamp overflow or underflow.",
+    },
+];
+
+pub fn find_rule(id: &str) -> Option<&'static RuleDefinition> {
+    RULE_REGISTRY.iter().find(|r| r.id == id)
+}
+
+fn explain_rule(rule: &str) -> Result<(), CliError> {
+    let def = find_rule(rule).ok_or_else(|| CliError(format!("unknown rule: {rule}")))?;
+    // Every message above describes a syntactic pattern, not a proven
+    // defect: state the heuristic nature right next to the rule so the
+    // distinction between "flagged" and "broken" is never left to guesswork.
+    println!("{}\n\nnote: {FINDING_NATURE}", def.explanation);
+    Ok(())
+}
+
 fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     match format {
         AuditOutputFormat::Text => {
@@ -786,12 +1185,14 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
                 for lim in rule.limitations {
                     println!("    * limitation: {lim}");
                 }
+            for rule in RULE_REGISTRY {
+                println!("{:<40} {:<10} {}", rule.id, rule.severity, rule.description);
             }
             println!("note: {FINDING_NATURE}");
             Ok(())
         }
         AuditOutputFormat::Json => {
-            let rules: Vec<_> = RULES
+            let rules: Vec<_> = RULE_REGISTRY
                 .iter()
                 .map(|rule| {
                     serde_json::json!({
@@ -800,6 +1201,8 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
                         "confidence": rule.confidence,
                         "description": rule.description,
                         "limitations": rule.limitations,
+                        "description": rule.description,
+                        "remediation": rule.remediation,
                     })
                 })
                 .collect();
@@ -816,7 +1219,7 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
             Ok(())
         }
         AuditOutputFormat::Sarif => {
-            let rules: Vec<_> = RULES
+            let rules: Vec<_> = RULE_REGISTRY
                 .iter()
                 .map(|rule| {
                     serde_json::json!({
@@ -991,11 +1394,82 @@ pub fn should_color(no_color_flag: bool) -> bool {
     }
     use std::io::IsTerminal;
     std::io::stdout().is_terminal()
+/// Counts of findings for a single rule within a severity level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleFindingCount {
+    pub rule: String,
+    pub count: usize,
+}
+
+/// Summary of findings grouped under a specific severity level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeveritySummary {
+    pub severity: String,
+    pub total: usize,
+    pub rules: Vec<RuleFindingCount>,
+}
+
+/// Aggregated summary across all findings and scanned files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditSummary {
+    pub total_findings: usize,
+    pub files_scanned: usize,
+    pub severities: Vec<SeveritySummary>,
+}
+
+/// Priority rank for rule severities: most severe first.
+pub fn severity_rank(s: &str) -> u8 {
+    match s.to_lowercase().as_str() {
+        "error" => 0,
+        "warning" => 1,
+        "note" => 2,
+        _ => 3,
+    }
+}
+
+/// Computes an aggregated audit summary from findings and scanned files.
+/// Rule counts are sorted by count descending and then rule id ascending for determinism.
+pub fn compute_summary(findings: &[Finding], files_scanned: usize) -> AuditSummary {
+    let mut map: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    for finding in findings {
+        let rule_map = map.entry(finding.severity.clone()).or_default();
+        *rule_map.entry(finding.rule.to_string()).or_default() += 1;
+    }
+
+    let mut severities: Vec<SeveritySummary> = map
+        .into_iter()
+        .map(|(severity, rules_map)| {
+            let total = rules_map.values().sum();
+            let mut rules: Vec<RuleFindingCount> = rules_map
+                .into_iter()
+                .map(|(rule, count)| RuleFindingCount { rule, count })
+                .collect();
+            rules.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.rule.cmp(&b.rule)));
+            SeveritySummary {
+                severity,
+                total,
+                rules,
+            }
+        })
+        .collect();
+
+    severities.sort_by(|a, b| {
+        severity_rank(&a.severity)
+            .cmp(&severity_rank(&b.severity))
+            .then_with(|| a.severity.cmp(&b.severity))
+    });
+
+    AuditSummary {
+        total_findings: findings.len(),
+        files_scanned,
+        severities,
+    }
 }
 
 /// Centralized diagnostic renderer across Text, JSON, and SARIF formats.
 pub struct DiagnosticRenderer<'a> {
     findings: &'a [Finding],
+    files_scanned: usize,
 }
 
 /// Present non-UTF-8 names unambiguously rather than replacing bytes with U+FFFD.
@@ -1009,15 +1483,42 @@ fn display_audit_path(path: &Path) -> String {
 impl<'a> DiagnosticRenderer<'a> {
     /// Create a new diagnostic renderer for the given findings.
     pub fn new(findings: &'a [Finding]) -> Self {
-        Self { findings }
+        Self {
+            findings,
+            files_scanned: 0,
+        }
+    }
+
+    /// Set the number of scanned files.
+    pub fn with_files_scanned(mut self, files_scanned: usize) -> Self {
+        self.files_scanned = files_scanned;
+        self
+    }
+
+    fn effective_files_scanned(&self) -> usize {
+        if self.files_scanned > 0 {
+            self.files_scanned
+        } else {
+            let distinct = self
+                .findings
+                .iter()
+                .map(|f| &f.file)
+                .collect::<HashSet<_>>()
+                .len();
+            if distinct > 0 {
+                distinct
+            } else {
+                1
+            }
+        }
     }
 
     /// Render diagnostics according to the specified output format.
     pub fn render(&self, format: AuditOutputFormat) -> Result<String, CliError> {
         match format {
-            AuditOutputFormat::Text => Ok(render_text(self.findings)),
-            AuditOutputFormat::Json => render_json(self.findings),
-            AuditOutputFormat::Sarif => render_sarif(self.findings),
+            AuditOutputFormat::Text => Ok(self.render_text()),
+            AuditOutputFormat::Json => self.render_json(),
+            AuditOutputFormat::Sarif => self.render_sarif(),
         }
     }
 
@@ -1125,9 +1626,37 @@ impl<'a> DiagnosticRenderer<'a> {
                     output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
                 }
             }
+            if let Some(rule) = find_rule(finding.rule) {
+                if !rule.remediation.is_empty() {
+                    for line in rule.remediation.lines() {
+                        output.push_str(&format!("    remediation: {}\n", line));
+                    }
+                }
+            }
         }
         output.push('\n');
         output.push_str(&self.render_text_summary_colored(color));
+        output.push_str(&format!(
+            "\n{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
+             security product — a missing finding is not a security guarantee.\n",
+            self.findings.len()
+        ));
+        output.push_str(&format!("note: {FINDING_NATURE}\n"));
+        output.push_str(&format!("note: {MACRO_SOURCE_LIMITATION}\n"));
+
+        let summary = compute_summary(self.findings, self.effective_files_scanned());
+        output.push_str("\nSummary:\n");
+        for sev in &summary.severities {
+            output.push_str(&format!("  {}: {} finding(s)\n", sev.severity, sev.total));
+            for rule in &sev.rules {
+                output.push_str(&format!("    - {}: {}\n", rule.rule, rule.count));
+            }
+        }
+        output.push_str(&format!(
+            "  Total: {} finding(s) across {} file(s) scanned\n",
+            summary.total_findings, summary.files_scanned
+        ));
+
         output
     }
 
@@ -1156,16 +1685,22 @@ impl<'a> DiagnosticRenderer<'a> {
                 if let Some(snippet) = &finding.source_snippet {
                     value["source_snippet"] = serde_json::Value::String(sanitize_snippet(snippet));
                 }
+                if let Some(rule) = find_rule(finding.rule) {
+                    value["remediation"] = serde_json::Value::String(rule.remediation.to_string());
+                }
                 value
             })
             .collect();
+        let summary = compute_summary(self.findings, self.effective_files_scanned());
         serde_json::to_string_pretty(&serde_json::json!({
             "tool": "soroban-testkit",
             "version": 1,
             "findings": findings,
             "summary": {
                 "finding_count": self.findings.len(),
+                "files_scanned": summary.files_scanned,
                 "skipped_file_count": skipped_file_count,
+                "by_severity": summary.severities,
                 "parser_limitations": parser_limitations,
                 "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE]
             }
@@ -1189,9 +1724,10 @@ impl<'a> DiagnosticRenderer<'a> {
             .map(|rule| {
                 let meta = RULES.iter().find(|m| m.id == rule);
                 let description = meta.map(|m| m.description);
+                let description = find_rule(rule).map(|r| r.description);
                 // The metadata level mirrors the level this scan gives the
                 // rule's findings: a config override takes effect, and with
-                // nothing configured the `RULES` default applies — both walk
+                // nothing configured the `RULE_REGISTRY` default applies — both walk
                 // through the shared `sarif_level` mapping, so the metadata
                 // level always matches how `results` display the same rule.
                 let effective_severity = self
@@ -1200,6 +1736,7 @@ impl<'a> DiagnosticRenderer<'a> {
                     .find(|finding| finding.rule == rule)
                     .map(|finding| finding.severity.as_str())
                     .or_else(|| meta.map(|m| m.severity));
+                    .or_else(|| find_rule(rule).map(|r| r.severity));
                 let mut rule_obj = serde_json::json!({
                     "id": rule,
                     "shortDescription": { "text": rule.replace('-', " ") }
@@ -1279,10 +1816,29 @@ pub fn render_findings_with_limitations(
     parser_limitations: &[String],
     skipped_file_count: usize,
 ) -> Result<String, CliError> {
+    render_findings_with_limitations_and_scanned(
+        findings,
+        format,
+        parser_limitations,
+        skipped_file_count,
+        0,
+    )
+}
+
+/// Renders the report for `format` with both parser limitations and scanned file count.
+pub fn render_findings_with_limitations_and_scanned(
+    findings: &[Finding],
+    format: AuditOutputFormat,
+    parser_limitations: &[String],
+    skipped_file_count: usize,
+    files_scanned: usize,
+) -> Result<String, CliError> {
+    let renderer = DiagnosticRenderer::new(findings).with_files_scanned(files_scanned);
     match format {
-        AuditOutputFormat::Json => DiagnosticRenderer::new(findings)
-            .render_json_with_limitations(parser_limitations, skipped_file_count),
-        _ => render_findings(findings, format),
+        AuditOutputFormat::Json => {
+            renderer.render_json_with_limitations(parser_limitations, skipped_file_count)
+        }
+        _ => renderer.render(format),
     }
 }
 
