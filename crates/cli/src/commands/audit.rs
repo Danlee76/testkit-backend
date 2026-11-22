@@ -95,7 +95,10 @@ pub struct AuditArgs {
     ///
     /// While scanning a directory these are excluded (skipped, never
     /// descended into): `target/`, `vendor/`, `node_modules/`, and any hidden
-    /// directory (its name begins with `.`, e.g. `.git/`, `.github/`, `.cargo/`). A
+    /// directory (its name begins with `.`, e.g. `.git/`, `.github/`, `.cargo/`),
+    /// along with any directories specified via `--exclude <DIR>` or `exclude` in
+    /// configuration (supporting exact directory paths relative to the project root;
+    /// glob matching is not supported). A
     /// missing path is reported as an actionable error rather than an empty
     /// "no findings" result. Explicitly selecting an excluded directory or
     /// one of its files still scans that input. Empty Rust files are valid
@@ -145,6 +148,10 @@ pub struct AuditArgs {
     /// over include patterns.
     #[arg(long = "exclude", value_name = "GLOB", action = clap::ArgAction::Append, global = true)]
     pub exclude: Vec<String>,
+    /// Exclude directory path(s) relative to the workspace root from recursive scans.
+    /// Repeatable. Exact relative directory paths only (glob patterns are not supported).
+    #[arg(long = "exclude", value_name = "DIR", action = clap::ArgAction::Append, global = true)]
+    pub exclude: Vec<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -178,6 +185,26 @@ pub enum AuditOutputFormat {
 pub struct AuditConfig {
     #[serde(default)]
     pub rules: HashMap<String, RuleConfig>,
+    #[serde(default, deserialize_with = "deserialize_exclude")]
+    pub exclude: Vec<PathBuf>,
+}
+
+fn deserialize_exclude<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ExcludeVal {
+        Single(String),
+        List(Vec<String>),
+    }
+
+    match Option::<ExcludeVal>::deserialize(deserializer)? {
+        Some(ExcludeVal::Single(s)) => Ok(vec![PathBuf::from(s)]),
+        Some(ExcludeVal::List(l)) => Ok(l.into_iter().map(PathBuf::from).collect()),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Per-rule configuration.
@@ -196,6 +223,8 @@ fn default_enabled() -> bool {
 pub struct Finding {
     pub file: PathBuf,
     pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
     pub rule: &'static str,
     pub severity: String,
     pub message: String,
@@ -336,6 +365,20 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     let source_dir = if stdin {
         canonical_path(&std::env::current_dir()?)?
     } else {
+        fs::metadata(&args.path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                CliError(format!(
+                    "path {} does not exist; pass a contract crate directory, a single .rs file, \
+                     or `-` to read Rust source from stdin",
+                    args.path.display()
+                ))
+            } else {
+                CliError(format!(
+                    "failed to access scan path {}: {err}; check path permissions and re-run",
+                    args.path.display()
+                ))
+            }
+        })?;
         let root = canonical_path(&args.path)?;
         if root.is_dir() {
             root
@@ -345,6 +388,21 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     };
     let workspace = find_workspace_root(&source_dir);
     let config = load_config(&source_dir, &workspace)?;
+
+    let mut raw_exclusions = config.exclude.clone();
+    raw_exclusions.extend(args.exclude.clone());
+    let exclusions = normalize_and_validate_exclusions(&raw_exclusions, &workspace)?;
+
+    let sources = if stdin {
+        Vec::new()
+    } else {
+        collect_rust_sources_with_exclusions(
+            &args.path,
+            &workspace,
+            &exclusions,
+            &mut parse_warnings,
+        )?
+    };
     let mut baseline = load_baseline(&args.baseline)?;
     for entry in &mut baseline {
         entry.file = workspace_relative_path(&workspace.join(&entry.file), &workspace)
@@ -456,6 +514,69 @@ fn is_scannable_entry(entry: &walkdir::DirEntry) -> bool {
     let name = file_name.to_string_lossy();
     let name: &str = &name;
     !(name.starts_with('.') || AUDIT_EXCLUDED_DIRS.contains(&name))
+}
+
+fn normalize_and_validate_exclusions(
+    raw_exclusions: &[PathBuf],
+    workspace: &Path,
+) -> Result<Vec<PathBuf>, CliError> {
+    let mut normalized = Vec::new();
+    for raw in raw_exclusions {
+        let mut clean = Vec::new();
+        let mut is_relative = true;
+
+        if raw.is_absolute() {
+            if let Ok(rel) = raw.strip_prefix(workspace) {
+                for comp in rel.components() {
+                    match comp {
+                        std::path::Component::CurDir => {}
+                        std::path::Component::ParentDir => {
+                            if clean.pop().is_none() {
+                                return Err(CliError(format!(
+                                    "excluded directory `{}` escapes the project root",
+                                    raw.display()
+                                )));
+                            }
+                        }
+                        std::path::Component::Normal(c) => clean.push(c),
+                        _ => {}
+                    }
+                }
+                is_relative = false;
+            } else {
+                return Err(CliError(format!(
+                    "excluded directory `{}` escapes the project root",
+                    raw.display()
+                )));
+            }
+        }
+
+        if is_relative {
+            for comp in raw.components() {
+                match comp {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        if clean.pop().is_none() {
+                            return Err(CliError(format!(
+                                "excluded directory `{}` escapes the project root",
+                                raw.display()
+                            )));
+                        }
+                    }
+                    std::path::Component::Normal(c) => clean.push(c),
+                    _ => {}
+                }
+            }
+        }
+
+        if !clean.is_empty() {
+            let p: PathBuf = clean.into_iter().collect();
+            normalized.push(p);
+        }
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 /// Walks `root` and returns the `.rs` files that should be audited, applying
@@ -709,6 +830,16 @@ fn collect_rust_sources_filtered(
     exclude_patterns: &[String],
 ) -> Result<Vec<PathBuf>, CliError> {
     let metadata = fs::metadata(root).map_err(|err| {
+    collect_rust_sources_with_exclusions(root, root, &[], warnings)
+}
+
+fn collect_rust_sources_with_exclusions(
+    root: &Path,
+    workspace: &Path,
+    exclusions: &[PathBuf],
+    warnings: &mut Vec<CliError>,
+) -> Result<Vec<PathBuf>, CliError> {
+    fs::metadata(root).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             CliError(format!(
                 "path {} does not exist; pass a contract crate directory, a single .rs file, \
@@ -732,11 +863,26 @@ fn collect_rust_sources_filtered(
         }
     }
 
+    let is_root_file = root.is_file();
     let mut sources = Vec::new();
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(is_scannable_entry)
+        .filter_entry(|entry| {
+            if !entry.file_type().is_dir() {
+                return true;
+            }
+            if entry.depth() == 0 {
+                return true;
+            }
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if name.starts_with('.') || AUDIT_EXCLUDED_DIRS.contains(&name.as_ref()) {
+                return false;
+            }
+            let rel = workspace_relative_path(entry.path(), workspace);
+            !exclusions.iter().any(|excl| rel == *excl || rel.starts_with(excl))
+        })
     {
         let entry = match entry {
             Ok(entry) => entry,
@@ -754,6 +900,14 @@ fn collect_rust_sources_filtered(
             let rel_str = rel.to_string_lossy();
             if matches_filter(&rel_str, include_patterns, exclude_patterns) {
                 sources.push(entry.path().to_path_buf());
+            if entry.depth() == 0 && is_root_file {
+                sources.push(entry.path().to_path_buf());
+            } else {
+                let rel = workspace_relative_path(entry.path(), workspace);
+                let is_excluded = exclusions.iter().any(|excl| rel == *excl || rel.starts_with(excl));
+                if !is_excluded {
+                    sources.push(entry.path().to_path_buf());
+                }
             }
         }
     }
@@ -1064,10 +1218,15 @@ impl<'a> DiagnosticRenderer<'a> {
 
         let mut output = String::new();
         for finding in self.findings {
+            let loc = match finding.end_line {
+                Some(end) if end > finding.line => {
+                    format!("{}:{}:-{}:", display_audit_path(&finding.file), finding.line, end)
+                }
+                _ => format!("{}:{}:", display_audit_path(&finding.file), finding.line),
+            };
             output.push_str(&format!(
-                "{}:{}: [{}] {}: {}\n",
-                display_audit_path(&finding.file),
-                finding.line,
+                "{} [{}] {}: {}\n",
+                loc,
                 finding.severity,
                 finding.rule,
                 finding.message
@@ -1199,13 +1358,18 @@ impl<'a> DiagnosticRenderer<'a> {
             .findings
             .iter()
             .map(|finding| {
-                let region = match &finding.source_snippet {
+                let mut region = match &finding.source_snippet {
                     Some(snippet) => serde_json::json!({
                         "startLine": finding.line.max(1),
                         "snippet": { "text": sanitize_snippet(snippet) }
                     }),
                     None => serde_json::json!({ "startLine": finding.line.max(1) }),
                 };
+                if let Some(end) = finding.end_line {
+                    if end > finding.line {
+                        region["endLine"] = serde_json::json!(end);
+                    }
+                }
                 serde_json::json!({
                     "ruleId": finding.rule,
                     "level": sarif_level(&finding.severity),
@@ -1373,6 +1537,283 @@ fn config_error_context(content: &str, err: &toml::de::Error) -> String {
     }
 }
 
+pub const VALID_RULES: &[&str] = &[
+    "broad-mock-all-auths",
+    "ignored-token-transfer-result",
+    "missing-positive-amount-validation",
+    "missing-require-auth",
+    "missing-ttl-bump",
+    "unchecked-i128-arithmetic",
+    "unchecked-timestamp-arithmetic",
+];
+
+pub const VALID_SEVERITIES: &[&str] = &["error", "warning", "note"];
+
+/// Known sections for other commands or tooling in a shared configuration file.
+const KNOWN_OTHER_SECTIONS: &[&str] = &[
+    "coverage",
+    "limits",
+    "completion",
+    "release_verify",
+    "release-verify",
+    "workspace",
+    "package",
+    "dependencies",
+    "dev-dependencies",
+    "profile",
+    "other",
+    "other_section",
+    "other-section",
+];
+
+struct ConfigValidationError {
+    line: usize,
+    key_path: String,
+    message: String,
+}
+
+fn find_line_for_key(content: &str, key_path: &str) -> usize {
+    let parts: Vec<&str> = key_path.split('.').collect();
+    if parts.is_empty() {
+        return 1;
+    }
+
+    let mut current_section = "";
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_section = &trimmed[1..trimmed.len() - 1].trim();
+            if current_section == key_path {
+                return idx + 1;
+            }
+            if parts.len() >= 2 && current_section == format!("{}.{}", parts[0], parts[1]) {
+                if parts.len() == 2 {
+                    return idx + 1;
+                }
+            }
+        }
+        if let Some((k, _)) = trimmed.split_once('=') {
+            let k = k.trim();
+            if parts.len() == 1 && k == parts[0] {
+                return idx + 1;
+            }
+            if parts.len() == 2 && current_section == parts[0] && k == parts[1] {
+                return idx + 1;
+            }
+            if parts.len() == 3
+                && current_section == format!("{}.{}", parts[0], parts[1])
+                && k == parts[2]
+            {
+                return idx + 1;
+            }
+            if let Some(last) = parts.last() {
+                if k == *last {
+                    return idx + 1;
+                }
+            }
+        }
+    }
+    1
+}
+
+fn validate_audit_config_table(
+    table: &toml::Table,
+    content: &str,
+    prefix: &str,
+    errors: &mut Vec<ConfigValidationError>,
+) {
+    let has_audit_table = table.contains_key("audit");
+
+    for (key, val) in table {
+        let full_key = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+
+        if prefix.is_empty() {
+            if key == "audit" {
+                if let toml::Value::Table(sub_table) = val {
+                    validate_audit_config_table(sub_table, content, "audit", errors);
+                } else {
+                    let line = find_line_for_key(content, &full_key);
+                    errors.push(ConfigValidationError {
+                        line,
+                        key_path: full_key,
+                        message: "key `audit` must be a table".to_string(),
+                    });
+                }
+                continue;
+            }
+
+            if key == "rules" {
+                validate_rules_table(val, content, "rules", errors);
+                continue;
+            }
+
+            if key == "exclude" {
+                match val {
+                    toml::Value::String(_) => {}
+                    toml::Value::Array(arr) => {
+                        for item in arr {
+                            if !item.is_str() {
+                                let line = find_line_for_key(content, &full_key);
+                                errors.push(ConfigValidationError {
+                                    line,
+                                    key_path: full_key.clone(),
+                                    message: "key `exclude` elements must be directory path strings".to_string(),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        let line = find_line_for_key(content, &full_key);
+                        errors.push(ConfigValidationError {
+                            line,
+                            key_path: full_key,
+                            message: "key `exclude` must be a string or list of directory path strings".to_string(),
+                        });
+                    }
+                }
+                continue;
+            }
+
+            if has_audit_table || KNOWN_OTHER_SECTIONS.contains(&key.as_str()) {
+                continue;
+            }
+
+            let line = find_line_for_key(content, &full_key);
+            errors.push(ConfigValidationError {
+                line,
+                key_path: full_key,
+                message: "unknown configuration key; valid audit keys are: audit, exclude, rules"
+                    .to_string(),
+            });
+        } else if prefix == "audit" {
+            if key == "rules" {
+                validate_rules_table(val, content, "audit.rules", errors);
+                continue;
+            }
+            if key == "exclude" {
+                match val {
+                    toml::Value::String(_) => {}
+                    toml::Value::Array(arr) => {
+                        for item in arr {
+                            if !item.is_str() {
+                                let line = find_line_for_key(content, &full_key);
+                                errors.push(ConfigValidationError {
+                                    line,
+                                    key_path: full_key.clone(),
+                                    message: "key `audit.exclude` elements must be directory path strings".to_string(),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        let line = find_line_for_key(content, &full_key);
+                        errors.push(ConfigValidationError {
+                            line,
+                            key_path: full_key,
+                            message: "key `audit.exclude` must be a string or list of directory path strings".to_string(),
+                        });
+                    }
+                }
+                continue;
+            }
+            let line = find_line_for_key(content, &full_key);
+            errors.push(ConfigValidationError {
+                line,
+                key_path: full_key,
+                message: "unknown configuration key; valid audit keys are: exclude, rules"
+                    .to_string(),
+            });
+        }
+    }
+}
+
+fn validate_rules_table(
+    val: &toml::Value,
+    content: &str,
+    rules_path: &str,
+    errors: &mut Vec<ConfigValidationError>,
+) {
+    let rules_table = match val {
+        toml::Value::Table(t) => t,
+        _ => {
+            let line = find_line_for_key(content, rules_path);
+            errors.push(ConfigValidationError {
+                line,
+                key_path: rules_path.to_string(),
+                message: format!("key `{rules_path}` must be a table"),
+            });
+            return;
+        }
+    };
+
+    let valid_rules_list = VALID_RULES.join(", ");
+
+    for (rule_name, rule_val) in rules_table {
+        let rule_key_path = format!("{rules_path}.{rule_name}");
+        let line = find_line_for_key(content, &rule_key_path);
+
+        if !VALID_RULES.contains(&rule_name.as_str()) {
+            errors.push(ConfigValidationError {
+                line,
+                key_path: rule_key_path,
+                message: format!(
+                    "unknown rule `{rule_name}`; valid rules are: {valid_rules_list}"
+                ),
+            });
+            continue;
+        }
+
+        if let toml::Value::Table(rule_props) = rule_val {
+            for (prop_key, prop_val) in rule_props {
+                let prop_key_path = format!("{rule_key_path}.{prop_key}");
+                if prop_key == "severity" {
+                    if let toml::Value::String(sev) = prop_val {
+                        let normalized = sev.to_ascii_lowercase();
+                        if !VALID_SEVERITIES.contains(&normalized.as_str()) {
+                            let prop_line = find_line_for_key(content, &prop_key_path);
+                            let allowed = VALID_SEVERITIES.join(", ");
+                            errors.push(ConfigValidationError {
+                                line: prop_line,
+                                key_path: prop_key_path,
+                                message: format!(
+                                    "invalid severity `{sev}` for rule `{rule_name}`; allowed values are: {allowed}"
+                                ),
+                            });
+                        }
+                    } else {
+                        let prop_line = find_line_for_key(content, &prop_key_path);
+                        errors.push(ConfigValidationError {
+                            line: prop_line,
+                            key_path: prop_key_path,
+                            message: "severity must be a string".to_string(),
+                        });
+                    }
+                } else if prop_key != "enabled" {
+                    let prop_line = find_line_for_key(content, &prop_key_path);
+                    errors.push(ConfigValidationError {
+                        line: prop_line,
+                        key_path: prop_key_path,
+                        message: "unknown configuration key; valid keys are: enabled, severity"
+                            .to_string(),
+                    });
+                }
+            }
+        } else {
+            errors.push(ConfigValidationError {
+                line,
+                key_path: rule_key_path,
+                message: "rule configuration must be a table".to_string(),
+            });
+        }
+    }
+}
+
 fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliError> {
     for dir in source_dir.ancestors() {
         for name in [".soroban-testkit.toml", "soroban-testkit.toml"] {
@@ -1387,13 +1828,81 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
                     )));
                 }
             };
-            return toml::from_str(&content).map_err(|err| {
+
+            let table: toml::Table = toml::from_str(&content).map_err(|err| {
                 CliError(format!(
                     "failed to parse audit config {}{} as TOML: {err}; fix the configuration syntax",
                     path.display(),
                     config_error_context(&content, &err)
                 ))
-            });
+            })?;
+
+            let mut validation_errors = Vec::new();
+            validate_audit_config_table(&table, &content, "", &mut validation_errors);
+
+            if !validation_errors.is_empty() {
+                validation_errors.sort_by(|a, b| a.line.cmp(&b.line).then(a.key_path.cmp(&b.key_path)));
+                let formatted_errors: Vec<String> = validation_errors
+                    .into_iter()
+                    .map(|e| {
+                        format!(
+                            "at line {} (key `{}`): {}",
+                            e.line, e.key_path, e.message
+                        )
+                    })
+                    .collect();
+                return Err(CliError(format!(
+                    "failed to validate audit config {}:\n  - {}",
+                    path.display(),
+                    formatted_errors.join("\n  - ")
+                )));
+            }
+
+            let mut config: AuditConfig = toml::from_str(&content).map_err(|err| {
+                CliError(format!(
+                    "failed to parse audit config {}{} as TOML: {err}; fix the configuration syntax",
+                    path.display(),
+                    config_error_context(&content, &err)
+                ))
+            })?;
+
+            // Normalize severity strings to lowercase
+            for rule_cfg in config.rules.values_mut() {
+                if let Some(sev) = &rule_cfg.severity {
+                    rule_cfg.severity = Some(sev.to_ascii_lowercase());
+                }
+            }
+
+            // If [audit.rules] or [audit.exclude] was used, merge them into config
+            if let Some(toml::Value::Table(audit_tbl)) = table.get("audit") {
+                if let Some(toml::Value::Table(rules_tbl)) = audit_tbl.get("rules") {
+                    for (k, v) in rules_tbl {
+                        if !config.rules.contains_key(k) {
+                            if let Ok(mut rule_cfg) = v.clone().try_into::<RuleConfig>() {
+                                if let Some(sev) = &rule_cfg.severity {
+                                    rule_cfg.severity = Some(sev.to_ascii_lowercase());
+                                }
+                                config.rules.insert(k.clone(), rule_cfg);
+                            }
+                        }
+                    }
+                }
+                if let Some(audit_excl) = audit_tbl.get("exclude") {
+                    match audit_excl {
+                        toml::Value::String(s) => config.exclude.push(PathBuf::from(s)),
+                        toml::Value::Array(arr) => {
+                            for item in arr {
+                                if let toml::Value::String(s) = item {
+                                    config.exclude.push(PathBuf::from(s));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            return Ok(config);
         }
         if dir == workspace {
             break;
@@ -1427,12 +1936,14 @@ fn normalize_findings(findings: &mut Vec<Finding>) {
         left.file
             .cmp(&right.file)
             .then(left.line.cmp(&right.line))
+            .then(left.end_line.cmp(&right.end_line))
             .then(left.rule.cmp(right.rule))
             .then(left.message.cmp(&right.message))
     });
     findings.dedup_by(|left, right| {
         left.file == right.file
             && left.line == right.line
+            && left.end_line == right.end_line
             && left.rule == right.rule
             && left.message == right.message
     });
@@ -2057,9 +2568,14 @@ impl FunctionVisitor<'_> {
         // struct; sanitizing happens in the renderer.
         let source_snippet = self.source.get(line).cloned();
 
+        let end_line = fn_range
+            .map(|(_, end)| end)
+            .filter(|&end| end > line);
+
         self.findings.push(Finding {
             file: self.path.clone(),
             line,
+            end_line,
             rule,
             severity: severity.to_string(),
             message,
@@ -2249,9 +2765,12 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
                     .and_then(|rule| rule.severity.as_deref())
                     .unwrap_or("warning");
                 let method = transfer_method_name(expr).unwrap_or("transfer");
+                let (_, end) = item_line_range(expr);
+                let end_line = if end > line { Some(end) } else { None };
                 self.findings.push(Finding {
                     file: self.path.clone(),
                     line,
+                    end_line,
                     rule: "ignored-token-transfer-result",
                     severity: severity.to_string(),
                     message: format!(
@@ -2345,9 +2864,16 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
                     .and_then(|r| r.severity.as_deref())
                     .unwrap_or("warning");
 
+                let end_line = if self.fn_range.1 > self.fn_line {
+                    Some(self.fn_range.1)
+                } else {
+                    None
+                };
+
                 self.findings.push(Finding {
                     file: self.path.clone(),
                     line: self.fn_line,
+                    end_line,
                     rule: "unchecked-i128-arithmetic",
                     severity: severity.to_string(),
                     message: format!(
@@ -2553,7 +3079,10 @@ mod tests {
                 severity: None,
             },
         );
-        let config = AuditConfig { rules };
+        let config = AuditConfig {
+            rules,
+            ..Default::default()
+        };
         assert!(!config.rules["missing-require-auth"].enabled);
     }
 
@@ -2567,7 +3096,10 @@ mod tests {
                 severity: Some("error".to_string()),
             },
         );
-        let config = AuditConfig { rules };
+        let config = AuditConfig {
+            rules,
+            ..Default::default()
+        };
         assert_eq!(
             config.rules["missing-require-auth"].severity,
             Some("error".to_string())
@@ -2773,6 +3305,7 @@ mod tests {
         let findings = [Finding {
             file: PathBuf::from(&value),
             line: 1,
+            end_line: None,
             rule: "missing-require-auth",
             severity: value.clone(),
             message: value.clone(),
@@ -3078,6 +3611,7 @@ mod tests {
         Finding {
             file: PathBuf::from(file),
             line,
+            end_line: None,
             rule,
             severity: "warning".to_string(),
             message: message.to_string(),
