@@ -1723,3 +1723,192 @@ impl Vault {
         "missing-require-auth should fire when only an unrelated helper is called"
     );
 }
+
+// ---- #346: inconsistent validation across related entry points ----
+
+#[test]
+fn audit_detects_inconsistent_amount_validation_across_entry_points() {
+    let source = br#"
+#[contractimpl]
+impl Vault {
+    pub fn deposit(env: Env, amount: i128) {
+        assert!(amount > 0);
+    }
+
+    pub fn withdraw(env: Env, amount: i128) {
+        let _ = amount;
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], source);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "inconsistent-validation-across-entry-points")
+        .collect();
+    assert_eq!(findings.len(), 1, "findings: {findings:?}");
+    assert!(findings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("withdraw"));
+}
+
+#[test]
+fn audit_does_not_flag_consistent_amount_validation() {
+    let source = br#"
+#[contractimpl]
+impl Vault {
+    pub fn deposit(env: Env, amount: i128) {
+        assert!(amount > 0);
+    }
+
+    pub fn withdraw(env: Env, amount: i128) {
+        assert!(amount > 0);
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], source);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "inconsistent-validation-across-entry-points")
+        .collect();
+    assert!(findings.is_empty(), "findings: {findings:?}");
+}
+
+// ---- #348: rule explanations with code examples ----
+
+#[test]
+fn audit_explain_includes_code_examples() {
+    for rule in [
+        "missing-require-auth",
+        "unchecked-i128-arithmetic",
+        "missing-ttl-bump",
+        "broad-mock-all-auths",
+        "ignored-token-transfer-result",
+        "missing-positive-amount-validation",
+        "unchecked-timestamp-arithmetic",
+        "inconsistent-validation-across-entry-points",
+    ] {
+        let output = run(&["audit", "explain", rule]);
+        assert!(output.status.success(), "rule {rule}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Example (vulnerable):"), "{rule}: {stdout}");
+        assert!(stdout.contains("Example (fixed):"), "{rule}: {stdout}");
+    }
+}
+
+// ---- #350: scope allow comments to a single finding ----
+
+#[test]
+fn audit_allow_comment_scopes_to_single_finding() {
+    let root = std::env::temp_dir().join(format!(
+        "stk-audit-scope-single-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[contractimpl]
+impl Contract {
+    // soroban_testkit::audit(skip, rule = "missing-require-auth")
+    pub fn withdraw(env: Env, from: Address, amount: i128) {
+        let _ = (env, from, amount);
+    }
+
+    pub fn deposit(env: Env, from: Address, amount: i128) {
+        let _ = (env, from, amount);
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run(&["audit", root.to_str().unwrap(), "--format", "json"]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let auth_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "missing-require-auth")
+        .collect();
+    // Only withdraw's auth finding is suppressed; deposit should still be reported.
+    assert_eq!(auth_findings.len(), 1, "findings: {auth_findings:?}");
+    assert!(auth_findings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("deposit"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---- #351: report duplicate suppressions as stale configuration ----
+
+#[test]
+fn audit_reports_duplicate_suppressions_as_stale_configuration() {
+    let root = std::env::temp_dir().join(format!(
+        "stk-audit-dup-suppression-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[contractimpl]
+impl Contract {
+    // soroban_testkit::audit(skip, rule = "missing-require-auth")
+    // soroban_testkit::audit(skip, rule = "missing-require-auth")
+    pub fn withdraw(env: Env, from: Address) {
+        let _ = (env, from);
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run(&["audit", root.to_str().unwrap(), "--format", "json"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stale suppression") || stderr.contains("duplicate"), "{stderr}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn audit_reports_unused_suppression_as_stale_configuration() {
+    let root = std::env::temp_dir().join(format!(
+        "stk-audit-unused-suppression-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[contractimpl]
+impl Contract {
+    // soroban_testkit::audit(skip, rule = "missing-require-auth")
+    pub fn withdraw(env: Env, from: Address) {
+        from.require_auth();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = run(&["audit", root.to_str().unwrap(), "--format", "json"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stale suppression"), "{stderr}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

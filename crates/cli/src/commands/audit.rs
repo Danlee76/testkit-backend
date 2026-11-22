@@ -207,7 +207,7 @@ impl Finding {
 }
 
 /// Static checks over a contract crate. **Not a security product** — a
-/// linter with seven heuristics, each independently useful and each
+/// linter with heuristics, each independently useful and each
 /// capable of missing real bugs or flagging non-bugs. The absence of a
 /// finding here is never a security guarantee.
 ///
@@ -439,43 +439,89 @@ fn explain_rule(rule: &str) -> Result<(), CliError> {
             "missing-require-auth: Entry points that accept an Address parameter must validate the caller.\n\
              This rule detects functions with Address parameters that never call require_auth().\n\
              Fix: Call address.require_auth() to ensure the caller is authorized.\n\
+             Example (vulnerable):\n\
+               pub fn withdraw(env: Env, from: Address, amount: i128) {\n\
+                   token.transfer(&from, &to, &amount);\n\
+               }\n\
+             Example (fixed):\n\
+               pub fn withdraw(env: Env, from: Address, amount: i128) {\n\
+                   from.require_auth();\n\
+                   token.transfer(&from, &to, &amount);\n\
+               }\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security"
         }
         "unchecked-i128-arithmetic" => {
             "unchecked-i128-arithmetic: Arithmetic on i128 values can silently overflow.\n\
              This rule detects + - * / operations on i128 values outside of checked/saturating/wrapping variants.\n\
              Fix: Use .checked_add(), .saturating_add(), or .wrapping_add() for safe overflow handling.\n\
+             Example (vulnerable):\n\
+               let total: i128 = balance + amount;\n\
+             Example (fixed):\n\
+               let total = balance.checked_add(amount).expect(\"overflow\");\n\
              Reference: https://doc.rust-lang.org/std/primitive.i128.html"
         }
         "missing-ttl-bump" => {
             "missing-ttl-bump: Storage reads that are not followed by TTL extension can expire.\n\
              This rule detects .persistent() or .temporary() reads without .extend_ttl() in the same function.\n\
              Fix: Call .extend_ttl() after reading from storage to prevent premature expiration.\n\
+             Example (vulnerable):\n\
+               let bal: i128 = env.storage().persistent().get(&key).unwrap_or(0);\n\
+             Example (fixed):\n\
+               let bal: i128 = env.storage().persistent().get(&key).unwrap_or(0);\n\
+               env.storage().persistent().extend_ttl(&key, 100, 1000);\n\
              Reference: https://developers.stellar.org/docs/smart-contracts/storing-data"
         }
         "broad-mock-all-auths" => {
             "broad-mock-all-auths: Test functions using mock_all_auths() bypass auth checks entirely.\n\
              This rule detects mock_all_auths in test functions.\n\
              Fix: Replace with granular auth checks for specific callers to ensure auth is properly tested.\n\
+             Example (vulnerable):\n\
+               #[test] fn test_withdraw() { env.mock_all_auths(); /* ... */ }\n\
+             Example (fixed):\n\
+               #[test] fn test_withdraw() { env.mock_all_auths_allowing_non_root_auth(); /* ... */ }\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/testing"
         }
         "ignored-token-transfer-result" => {
             "ignored-token-transfer-result: Token transfer operations can fail and their results must be handled.\n\
              This rule detects transfer/transfer_from/try_transfer calls whose results are not used.\n\
              Fix: Propagate the result with ?, match on it, or explicitly bind it (let _ = ...).\n\
+             Example (vulnerable):\n\
+               token.transfer(&from, &to, &amount);\n\
+             Example (fixed):\n\
+               token.transfer(&from, &to, &amount)?;\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/tokens"
         }
         "missing-positive-amount-validation" => {
             "missing-positive-amount-validation: Signed amount parameters should be validated.\n\
              This rule detects amount parameters (signed integers) with no comparison against zero.\n\
              Fix: Add a check like assert!(amount > 0) to validate amounts before use.\n\
+             Example (vulnerable):\n\
+               pub fn deposit(env: Env, amount: i128) { save(amount); }\n\
+             Example (fixed):\n\
+               pub fn deposit(env: Env, amount: i128) { assert!(amount > 0); save(amount); }\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security"
         }
         "unchecked-timestamp-arithmetic" => {
             "unchecked-timestamp-arithmetic: Timestamp arithmetic can overflow and cause silent failures.\n\
              This rule detects + - * / operations on timestamp values without overflow protection.\n\
              Fix: Use checked arithmetic or ensure your timestamps are bounded to valid ranges.\n\
+             Example (vulnerable):\n\
+               let deadline = env.ledger().timestamp() + duration;\n\
+             Example (fixed):\n\
+               let deadline = env.ledger().timestamp().checked_add(duration).expect(\"overflow\");\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time"
+        }
+        "inconsistent-validation-across-entry-points" => {
+            "inconsistent-validation-across-entry-points: Related entry points should apply consistent input validation.\n\
+             This rule detects when some entry points validate signed amount parameters against zero while other related entry points with amount parameters do not.\n\
+             Fix: Apply the same positive-amount validation in every related entry point that accepts an amount.\n\
+             Example (vulnerable):\n\
+               pub fn deposit(env: Env, amount: i128) { assert!(amount > 0); }\n\
+               pub fn withdraw(env: Env, amount: i128) { /* missing validation */ }\n\
+             Example (fixed):\n\
+               pub fn deposit(env: Env, amount: i128) { assert!(amount > 0); }\n\
+               pub fn withdraw(env: Env, amount: i128) { assert!(amount > 0); }\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security"
         }
         _ => return Err(CliError(format!("unknown rule: {}", rule))),
     };
@@ -495,6 +541,7 @@ const RULES: &[(&str, &str, &str)] = &[
     ("ignored-token-transfer-result", "warning", "Token transfer operations can fail; their results must be handled."),
     ("missing-positive-amount-validation", "warning", "Signed amount parameters should be validated against zero."),
     ("unchecked-timestamp-arithmetic", "warning", "Timestamp arithmetic can overflow and cause silent failures."),
+    ("inconsistent-validation-across-entry-points", "warning", "Related entry points should consistently validate amount parameters against zero."),
 ];
 
 fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
@@ -616,7 +663,7 @@ impl<'a> DiagnosticRenderer<'a> {
             }
         }
         output.push_str(&format!(
-            "\n{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
+            "\n{} finding(s). soroban-testkit audit is a linter with heuristics, not a \
              security product — a missing finding is not a security guarantee.\n",
             self.findings.len()
         ));
@@ -973,17 +1020,42 @@ fn audit_source(
     let suppressions = extract_suppressions(full_src);
     let source_lines = SourceLines::new(full_src);
 
+    let findings_before = findings.len();
+    let mut suppression_list = suppressions;
     let mut visitor = FunctionVisitor {
         path: path.to_path_buf(),
         findings,
         config,
-        suppressions: &suppressions,
+        suppressions: &mut suppression_list,
         test_context: path
             .components()
             .any(|part| part.as_os_str() == "tests" || part.as_os_str() == "benches"),
         source: &source_lines,
     };
     visitor.visit_file(&file);
+
+    // Issue #351: duplicate/stale suppressions are stale configuration.
+    let mut seen: HashSet<(String, usize)> = HashSet::new();
+    for suppression in &suppression_list {
+        let mut sorted_rules = suppression.rules.clone();
+        sorted_rules.sort();
+        let key = (sorted_rules.join(","), suppression.line);
+        let is_duplicate = !seen.insert(key);
+        if !suppression.used || is_duplicate {
+            findings.truncate(findings_before);
+            let reason = if is_duplicate {
+                "duplicate suppression"
+            } else {
+                "suppression does not apply to any finding"
+            };
+            return Err(CliError(format!(
+                "stale suppression at {}:{}: {reason}; remove or update it",
+                path.display(),
+                suppression.line
+            )));
+        }
+    }
+
     normalize_findings(findings);
     Ok(())
 }
@@ -1012,6 +1084,7 @@ struct Suppression {
     rules: Vec<String>,
     #[allow(dead_code)]
     reason: Option<String>,
+    used: bool,
 }
 
 fn find_audit_directive(line: &str) -> Option<&str> {
@@ -1078,6 +1151,7 @@ fn extract_suppressions(src: &str) -> Vec<Suppression> {
                 line: idx + 1,
                 rules,
                 reason,
+                used: false,
             });
         }
     }
@@ -1099,25 +1173,31 @@ fn item_line_range(node: impl quote::ToTokens) -> (usize, usize) {
     }
 }
 
-fn is_finding_suppressed(
-    suppressions: &[Suppression],
+fn suppression_targets_finding(
+    suppression: &Suppression,
     rule: &str,
     finding_line: usize,
-    fn_range: Option<(usize, usize)>,
 ) -> bool {
-    suppressions.iter().any(|suppression| {
-        let matches_rule = suppression
-            .rules
-            .iter()
-            .any(|item| item == "*" || item == rule);
-        matches_rule
-            && (suppression.line <= 10
-                || suppression.line == finding_line
-                || suppression.line + 1 == finding_line
-                || fn_range.is_some_and(|(start, end)| {
-                    suppression.line + 1 >= start && suppression.line <= end
-                }))
-    })
+    suppression
+        .rules
+        .iter()
+        .any(|item| item == "*" || item == rule)
+        && (suppression.line == finding_line || suppression.line + 1 == finding_line)
+}
+
+fn is_finding_suppressed(
+    suppressions: &mut [Suppression],
+    rule: &str,
+    finding_line: usize,
+) -> bool {
+    let mut suppressed = false;
+    for suppression in suppressions.iter_mut() {
+        if suppression_targets_finding(suppression, rule, finding_line) {
+            suppression.used = true;
+            suppressed = true;
+        }
+    }
+    suppressed
 }
 
 fn is_require_auth_call(expr: &Expr) -> bool {
@@ -1316,7 +1396,7 @@ struct FunctionVisitor<'a> {
     path: PathBuf,
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
-    suppressions: &'a [Suppression],
+    suppressions: &'a mut [Suppression],
     test_context: bool,
     source: &'a SourceLines,
 }
@@ -1332,6 +1412,9 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
         let previous = self.test_context;
         self.test_context |= is_test_only(&node.attrs);
+        if !self.test_context {
+            self.audit_inconsistent_validation(node);
+        }
         visit::visit_item_impl(self, node);
         self.test_context = previous;
     }
@@ -1492,6 +1575,66 @@ impl FunctionVisitor<'_> {
         }
     }
 
+    fn audit_inconsistent_validation(&mut self, node: &syn::ItemImpl) {
+        if !self.is_enabled("inconsistent-validation-across-entry-points") {
+            return;
+        }
+
+        struct FnInfo {
+            name: String,
+            line: usize,
+            range: (usize, usize),
+            amount_params: Vec<String>,
+            has_validation: bool,
+        }
+
+        let mut infos = Vec::new();
+        for item in &node.items {
+            let syn::ImplItem::Fn(method) = item else {
+                continue;
+            };
+            if self.test_context || is_test_only(&method.attrs) {
+                continue;
+            }
+            let amount_params = signed_amount_params(&method.sig);
+            if amount_params.is_empty() {
+                continue;
+            }
+            let body_src = normalized_tokens(method.to_token_stream()).to_string();
+            let has_validation = amount_params
+                .iter()
+                .all(|p| has_positive_amount_validation(&body_src, p));
+            infos.push(FnInfo {
+                name: method.sig.ident.to_string(),
+                line: line_of(method),
+                range: item_line_range(method),
+                amount_params,
+                has_validation,
+            });
+        }
+
+        let any_validated = infos.iter().any(|i| i.has_validation);
+        let any_unvalidated = infos.iter().any(|i| !i.has_validation);
+        if !(any_validated && any_unvalidated) {
+            return;
+        }
+
+        for info in infos.iter().filter(|i| !i.has_validation) {
+            let params = info.amount_params.join(", ");
+            self.push_with_range(
+                info.line,
+                "inconsistent-validation-across-entry-points",
+                "warning",
+                format!(
+                    "fn {} takes signed amount parameter(s) [{params}] without positive validation, \
+                     but other related entry points in the same impl validate amount inputs",
+                    info.name
+                ),
+                Some(info.range),
+            );
+        }
+    }
+
     fn audit_mock_all_auths(
         &mut self,
         body_src: &str,
@@ -1535,13 +1678,13 @@ impl FunctionVisitor<'_> {
         rule: &'static str,
         default_severity: &'static str,
         message: String,
-        fn_range: Option<(usize, usize)>,
+        _fn_range: Option<(usize, usize)>,
     ) {
         if !self.is_enabled(rule) {
             return;
         }
 
-        if is_finding_suppressed(self.suppressions, rule, line, fn_range) {
+        if is_finding_suppressed(self.suppressions, rule, line) {
             return;
         }
 
@@ -1594,7 +1737,6 @@ impl FunctionVisitor<'_> {
             path: self.path.clone(),
             fn_name: sig.ident.to_string(),
             fn_line: line,
-            fn_range,
             i128_bindings,
             findings: self.findings,
             config: self.config,
@@ -1617,7 +1759,6 @@ impl FunctionVisitor<'_> {
         let mut visitor = IgnoredTransferVisitor {
             path: self.path.clone(),
             fn_name: sig.ident.to_string(),
-            fn_range,
             findings: self.findings,
             config: self.config,
             suppressions: self.suppressions,
@@ -1710,10 +1851,9 @@ fn line_of(node: impl quote::ToTokens) -> usize {
 struct IgnoredTransferVisitor<'a> {
     path: PathBuf,
     fn_name: String,
-    fn_range: (usize, usize),
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
-    suppressions: &'a [Suppression],
+    suppressions: &'a mut [Suppression],
     source: &'a SourceLines,
 }
 
@@ -1735,12 +1875,8 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
 
         if let Some(expr) = ignored_call {
             let line = line_of(expr);
-            let is_suppressed = is_finding_suppressed(
-                self.suppressions,
-                "ignored-token-transfer-result",
-                line,
-                Some(self.fn_range),
-            );
+            let is_suppressed =
+                is_finding_suppressed(self.suppressions, "ignored-token-transfer-result", line);
 
             if !is_suppressed {
                 let severity = self
@@ -1805,11 +1941,10 @@ struct I128ArithmeticVisitor<'a> {
     path: PathBuf,
     fn_name: String,
     fn_line: usize,
-    fn_range: (usize, usize),
     i128_bindings: HashSet<String>,
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
-    suppressions: &'a [Suppression],
+    suppressions: &'a mut [Suppression],
     source: &'a SourceLines,
 }
 
@@ -1831,12 +1966,8 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
             BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) | BinOp::Div(_)
         );
         if is_arith && (self.touches_i128(&node.left) || self.touches_i128(&node.right)) {
-            let is_suppressed = is_finding_suppressed(
-                self.suppressions,
-                "unchecked-i128-arithmetic",
-                self.fn_line,
-                Some(self.fn_range),
-            );
+            let is_suppressed =
+                is_finding_suppressed(self.suppressions, "unchecked-i128-arithmetic", self.fn_line);
 
             if !is_suppressed {
                 let severity = self
@@ -1906,13 +2037,13 @@ mod tests {
     fn unit_findings(code: &str, config: &AuditConfig) -> Vec<Finding> {
         let mut findings = Vec::new();
         let file = syn::parse_file(code).unwrap();
-        let suppressions = Vec::new();
+        let mut suppressions = Vec::new();
         let source_lines = SourceLines::new(code);
         let mut visitor = FunctionVisitor {
             path: PathBuf::from("test.rs"),
             findings: &mut findings,
             config,
-            suppressions: &suppressions,
+            suppressions: &mut suppressions,
             source: &source_lines,
             test_context: false,
         };
@@ -2646,5 +2777,56 @@ mod tests {
             messages,
             vec!["fn f takes `amount1`", "fn f takes `amount2`"]
         );
+    }
+
+    #[test]
+    fn detects_inconsistent_validation_across_entry_points() {
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Vault {
+                pub fn deposit(env: Env, amount: i128) {
+                    assert!(amount > 0);
+                }
+                pub fn withdraw(env: Env, amount: i128) {
+                    let _ = amount;
+                }
+            }
+            "#,
+        );
+        assert!(findings
+            .iter()
+            .any(|f| f.rule == "inconsistent-validation-across-entry-points"
+                && f.message.contains("withdraw")));
+    }
+
+    #[test]
+    fn reports_unused_suppression_as_stale_configuration() {
+        let mut findings = Vec::new();
+        let err = audit_source(
+            Path::new("<test>"),
+            r#"
+            #[contractimpl]
+            impl Contract {
+                // soroban_testkit::audit(skip, rule = "missing-require-auth")
+                pub fn withdraw(env: Env, from: Address) {
+                    from.require_auth();
+                }
+            }
+            "#,
+            &mut findings,
+            &AuditConfig::default(),
+            r#"
+            #[contractimpl]
+            impl Contract {
+                // soroban_testkit::audit(skip, rule = "missing-require-auth")
+                pub fn withdraw(env: Env, from: Address) {
+                    from.require_auth();
+                }
+            }
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.0.contains("stale suppression"), "{}", err.0);
     }
 }
