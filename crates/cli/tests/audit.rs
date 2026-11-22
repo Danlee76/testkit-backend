@@ -1992,3 +1992,99 @@ fn audit_color_default_regression_plain_in_non_terminal() {
         "default execution in test process without terminal must not produce ANSI codes: {stdout}"
     );
 }
+
+// ---- #338: configurable text output width ----
+
+#[test]
+fn audit_width_long_message_wraps_at_specified_width() {
+    let fixture = AuditFixture::new("width-wrap");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        UNAUTHORIZED_ENTRY_POINT,
+    );
+    let output = run_from(&fixture.0, &["audit", ".", "--width", "50"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Finding line should wrap into continuation lines indented with 4 spaces
+    assert!(stdout.contains("\n    "), "continuation line must be indented with 4 spaces: {stdout}");
+    for line in stdout.lines() {
+        if line.starts_with("crates/vault/src/lib.rs:") || line.starts_with("    ") {
+            // Check that line length (visible characters) does not exceed 50
+            assert!(line.chars().count() <= 50, "line exceeds width 50: {line}");
+        }
+    }
+}
+
+#[test]
+fn audit_width_invalid_values_rejected_with_actionable_error() {
+    let fixture = AuditFixture::new("width-invalid");
+
+    // Zero
+    let out_zero = run_from(&fixture.0, &["audit", ".", "--width", "0"]);
+    assert!(!out_zero.status.success());
+    let err_zero = String::from_utf8_lossy(&out_zero.stderr);
+    assert!(err_zero.contains("invalid width `0`"), "stderr: {err_zero}");
+
+    // Negative
+    let out_neg = run_from(&fixture.0, &["audit", ".", "--width", "-5"]);
+    assert!(!out_neg.status.success());
+    let err_neg = String::from_utf8_lossy(&out_neg.stderr);
+    assert!(err_neg.contains("invalid width `-5`"), "stderr: {err_neg}");
+
+    // Non-numeric
+    let out_alpha = run_from(&fixture.0, &["audit", ".", "--width", "abc"]);
+    assert!(!out_alpha.status.success());
+    let err_alpha = String::from_utf8_lossy(&out_alpha.stderr);
+    assert!(err_alpha.contains("invalid width `abc`"), "stderr: {err_alpha}");
+
+    // Absurdly large
+    let out_huge = run_from(&fixture.0, &["audit", ".", "--width", "50000"]);
+    assert!(!out_huge.status.success());
+    let err_huge = String::from_utf8_lossy(&out_huge.stderr);
+    assert!(err_huge.contains("invalid width `50000`"), "stderr: {err_huge}");
+}
+
+#[test]
+fn audit_width_configuration_in_toml_honored() {
+    let fixture = AuditFixture::new("width-toml");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        UNAUTHORIZED_ENTRY_POINT,
+    );
+    fixture.write(
+        ".soroban-testkit.toml",
+        "width = 45\n",
+    );
+    let output = run_from(&fixture.0, &["audit", "."]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\n    "), "must wrap based on config file width: {stdout}");
+
+    // CLI overrides configuration file
+    let cli_output = run_from(&fixture.0, &["audit", ".", "--width", "120"]);
+    let cli_stdout = String::from_utf8_lossy(&cli_output.stdout);
+    let finding_line = cli_stdout
+        .lines()
+        .find(|l| l.starts_with("crates/vault/src/lib.rs:"))
+        .expect("finding line must exist");
+    assert!(!finding_line.is_empty());
+}
+
+#[test]
+fn audit_width_default_unwrapped_regression() {
+    let fixture = AuditFixture::new("width-unwrapped");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        UNAUTHORIZED_ENTRY_POINT,
+    );
+    let output = run_from(&fixture.0, &["audit", "."]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let finding_line = stdout
+        .lines()
+        .find(|l| l.starts_with("crates/vault/src/lib.rs:"))
+        .expect("finding line must exist");
+    // Default has no continuation lines for the finding message
+    assert!(
+        finding_line.contains("fn withdraw takes Address parameter(s)"),
+        "default finding line must contain full message without wrapping: {finding_line}"
+    );
+}

@@ -141,6 +141,10 @@ pub struct AuditArgs {
     /// then automatic terminal detection (or `CLICOLOR_FORCE`).
     #[arg(long, global = true)]
     pub no_color: bool,
+    /// Wrap human-readable finding messages to the specified maximum character width.
+    /// Allowed values: integers between 20 and 1000. When omitted, messages are not wrapped.
+    #[arg(long, value_name = "WIDTH", allow_hyphen_values = true, global = true)]
+    pub width: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -172,6 +176,8 @@ pub enum AuditOutputFormat {
 pub struct AuditConfig {
     #[serde(default)]
     pub rules: HashMap<String, RuleConfig>,
+    #[serde(default)]
+    pub width: Option<toml::Value>,
 }
 
 /// Per-rule configuration.
@@ -332,12 +338,13 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     // is guaranteed to follow.
     normalize_findings(&mut findings);
 
+    let width = resolve_width(&args.width, &config)?;
     let parser_limitations: Vec<String> = parse_warnings.iter().map(ToString::to_string).collect();
     let use_color = should_color(args.no_color);
     let rendered_report = if args.summary_only {
         DiagnosticRenderer::new(&findings).render_text_summary_colored(use_color)
     } else if args.format == AuditOutputFormat::Text {
-        DiagnosticRenderer::new(&findings).render_text_colored(use_color)
+        DiagnosticRenderer::new(&findings).render_text_colored_with_width(use_color, width)
     } else {
         render_findings_with_limitations(
             &findings,
@@ -580,6 +587,126 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     }
 }
 
+/// Count visible character width of a string, ignoring ANSI escape sequences.
+/// Wide characters are counted as 1 character width.
+pub fn visible_width(s: &str) -> usize {
+    let mut count = 0;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Wraps the human-readable message part of a finding at word boundaries,
+/// leaving the location prefix intact on line 1, and indenting continuation
+/// lines with 4 spaces. Unbreakable tokens longer than the width are not split.
+pub fn wrap_finding_message(
+    prefix: &str,
+    message: &str,
+    width: Option<usize>,
+) -> String {
+    let Some(max_width) = width else {
+        return format!("{prefix}{message}\n");
+    };
+
+    let words: Vec<&str> = message.split_whitespace().collect();
+    if words.is_empty() {
+        return format!("{prefix}\n");
+    }
+
+    let prefix_vis = visible_width(prefix);
+    let indent = "    ";
+    let indent_vis = 4;
+
+    let mut result = String::new();
+    let mut current_line = String::new();
+    let mut current_vis = 0;
+
+    let first_word = words[0];
+    let first_word_vis = visible_width(first_word);
+
+    if prefix_vis + first_word_vis <= max_width {
+        current_line.push_str(prefix);
+        current_line.push_str(first_word);
+        current_vis = prefix_vis + first_word_vis;
+    } else {
+        result.push_str(prefix.trim_end());
+        result.push('\n');
+        current_line.push_str(indent);
+        current_line.push_str(first_word);
+        current_vis = indent_vis + first_word_vis;
+    }
+
+    for &word in &words[1..] {
+        let w_vis = visible_width(word);
+        if current_vis + 1 + w_vis > max_width {
+            result.push_str(&current_line);
+            result.push('\n');
+            current_line.clear();
+            current_line.push_str(indent);
+            current_line.push_str(word);
+            current_vis = indent_vis + w_vis;
+        } else {
+            current_line.push(' ');
+            current_line.push_str(word);
+            current_vis += 1 + w_vis;
+        }
+    }
+
+    if !current_line.is_empty() {
+        result.push_str(&current_line);
+        result.push('\n');
+    }
+
+    result
+}
+
+fn validate_width_str(val: &str) -> Result<usize, CliError> {
+    match val.parse::<isize>() {
+        Ok(n) if n >= 20 && n <= 1000 => Ok(n as usize),
+        _ => Err(CliError(format!(
+            "invalid width `{val}`: width must be an integer between 20 and 1000 characters; specify a value in that range"
+        ))),
+    }
+}
+
+fn resolve_width(cli_width: &Option<String>, config: &AuditConfig) -> Result<Option<usize>, CliError> {
+    if let Some(w) = cli_width {
+        return validate_width_str(w).map(Some);
+    }
+    if let Some(val) = &config.width {
+        match val {
+            toml::Value::Integer(n) => {
+                if *n >= 20 && *n <= 1000 {
+                    return Ok(Some(*n as usize));
+                } else {
+                    return Err(CliError(format!(
+                        "invalid width `{n}`: width must be an integer between 20 and 1000 characters; specify a value in that range"
+                    )));
+                }
+            }
+            toml::Value::String(s) => {
+                return validate_width_str(s).map(Some);
+            }
+            other => {
+                return Err(CliError(format!(
+                    "invalid width `{other}`: width must be an integer between 20 and 1000 characters; specify a value in that range"
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Determines whether ANSI color codes should be emitted for text output.
 ///
 /// Precedence:
@@ -681,39 +808,46 @@ impl<'a> DiagnosticRenderer<'a> {
 
     /// Render compiler-style human-readable text diagnostics with optional ANSI color.
     pub fn render_text_colored(&self, color: bool) -> String {
+        self.render_text_colored_with_width(color, None)
+    }
+
+    /// Render compiler-style human-readable text diagnostics with optional ANSI color and configurable width.
+    pub fn render_text_colored_with_width(&self, color: bool, width: Option<usize>) -> String {
         if self.findings.is_empty() {
             return self.render_text_summary_colored(color);
         }
 
         let mut output = String::new();
         for finding in self.findings {
-            if color {
+            let prefix = if color {
                 let sev_str = match finding.severity.as_str() {
                     "error" => "\x1b[1;31m[error]\x1b[0m",
                     "warning" => "\x1b[1;33m[warning]\x1b[0m",
                     _ => &format!("\x1b[1;34m[{}]\x1b[0m", finding.severity),
                 };
-                output.push_str(&format!(
-                    "\x1b[1m{}:{}:\x1b[0m {} \x1b[1;36m{}:\x1b[0m {}\n",
+                format!(
+                    "\x1b[1m{}:{}:\x1b[0m {} \x1b[1;36m{}:\x1b[0m ",
                     display_audit_path(&finding.file),
                     finding.line,
                     sev_str,
                     finding.rule,
-                    finding.message
-                ));
-                if let Some(snippet) = &finding.source_snippet {
-                    output.push_str(&format!("    \x1b[1;34m-->\x1b[0m {}\n", sanitize_snippet(snippet)));
-                }
+                )
             } else {
-                output.push_str(&format!(
-                    "{}:{}: [{}] {}: {}\n",
+                format!(
+                    "{}:{}: [{}] {}: ",
                     display_audit_path(&finding.file),
                     finding.line,
                     finding.severity,
                     finding.rule,
-                    finding.message
-                ));
-                if let Some(snippet) = &finding.source_snippet {
+                )
+            };
+
+            output.push_str(&wrap_finding_message(&prefix, &finding.message, width));
+
+            if let Some(snippet) = &finding.source_snippet {
+                if color {
+                    output.push_str(&format!("    \x1b[1;34m-->\x1b[0m {}\n", sanitize_snippet(snippet)));
+                } else {
                     output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
                 }
             }
@@ -2775,5 +2909,58 @@ mod tests {
     #[test]
     fn test_should_color_flag_precedence() {
         assert!(!should_color(true));
+    }
+
+    #[test]
+    fn test_width_wrapping_and_validation() {
+        let prefix = "src/lib.rs:1: [warning] rule: "; // 30 chars
+        let message = "one two three four five six seven";
+
+        // No width: single line
+        let no_wrap = wrap_finding_message(prefix, message, None);
+        assert_eq!(no_wrap, format!("{prefix}{message}\n"));
+
+        // Width 40: "src/lib.rs:1: [warning] rule: one two\n    three four\n    five six\n    seven\n"
+        let wrapped_40 = wrap_finding_message(prefix, message, Some(40));
+        for line in wrapped_40.lines() {
+            assert!(visible_width(line) <= 40, "line exceeds width 40: {line}");
+        }
+
+        // Exact fit vs one character over
+        // prefix is 30. "hello" is 5. Total = 35.
+        let fit = wrap_finding_message(prefix, "hello", Some(35));
+        assert_eq!(fit.lines().count(), 1, "exact fit must not wrap: {fit}");
+
+        // "hello!" is 6. Total = 36. At width 35, it wraps!
+        let one_over = wrap_finding_message(prefix, "hello!", Some(35));
+        assert_eq!(one_over.lines().count(), 2, "one over must wrap: {one_over}");
+
+        // Unbreakable token longer than width is not split
+        let long_token = "verylongunbreakabletokenlongerthanwidth";
+        let wrapped_token = wrap_finding_message(prefix, long_token, Some(25));
+        assert!(wrapped_token.contains(long_token), "token must not be split: {wrapped_token}");
+
+        // Width smaller than prefix
+        let small_width = wrap_finding_message(prefix, "a b c", Some(20));
+        let lines: Vec<_> = small_width.lines().collect();
+        assert_eq!(lines[0], prefix.trim_end(), "prefix must remain intact on line 1");
+        assert!(lines[1].starts_with("    "), "continuation line must be indented");
+
+        // Colored prefix wraps at identical word boundaries
+        let colored_prefix = "\x1b[1msrc/lib.rs:1:\x1b[0m \x1b[1;33m[warning]\x1b[0m rule: ";
+        let wrapped_colored = wrap_finding_message(colored_prefix, message, Some(40));
+        let plain_lines: Vec<_> = wrapped_40.lines().collect();
+        let colored_lines: Vec<_> = wrapped_colored.lines().collect();
+        assert_eq!(plain_lines.len(), colored_lines.len());
+
+        // Multi-byte Unicode characters counted as 1
+        assert_eq!(visible_width("雪花"), 2);
+
+        // Validation of invalid width values
+        assert!(validate_width_str("0").is_err());
+        assert!(validate_width_str("-5").is_err());
+        assert!(validate_width_str("abc").is_err());
+        assert!(validate_width_str("10000").is_err());
+        assert!(validate_width_str("80").is_ok());
     }
 }

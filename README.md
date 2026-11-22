@@ -110,6 +110,9 @@ soroban-testkit audit ./src --summary-only
 # Disable ANSI color escape codes (also honors NO_COLOR env var).
 soroban-testkit audit ./src --no-color
 
+# Wrap text findings to a specified character width (e.g. 80 columns).
+soroban-testkit audit ./src --width 80
+
 # Stable machine-readable reports for automation and GitHub code scanning.
 soroban-testkit audit ./src --format json
 soroban-testkit audit ./src --format sarif > audit.sarif
