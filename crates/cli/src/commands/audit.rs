@@ -477,6 +477,18 @@ fn explain_rule(rule: &str) -> Result<(), CliError> {
              Fix: Use checked arithmetic or ensure your timestamps are bounded to valid ranges.\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time"
         }
+        "zero-transfer-amount" => {
+            "zero-transfer-amount: Zero-value transfers may indicate logic errors.\n\
+             This rule detects token transfer calls where the amount argument is a literal zero.\n\
+             Fix: Validate that the amount is non-zero before calling transfer.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/tokens"
+        }
+        "arithmetic-before-range-check" => {
+            "arithmetic-before-range-check: Arithmetic performed before range validation can overflow.\n\
+             This rule detects arithmetic on a value that is used in a comparison only after the operation.\n\
+             Fix: Validate input ranges before performing arithmetic, not after.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security"
+        }
         _ => return Err(CliError(format!("unknown rule: {}", rule))),
     };
     // Every message above describes a syntactic pattern, not a proven
@@ -495,6 +507,8 @@ const RULES: &[(&str, &str, &str)] = &[
     ("ignored-token-transfer-result", "warning", "Token transfer operations can fail; their results must be handled."),
     ("missing-positive-amount-validation", "warning", "Signed amount parameters should be validated against zero."),
     ("unchecked-timestamp-arithmetic", "warning", "Timestamp arithmetic can overflow and cause silent failures."),
+    ("zero-transfer-amount", "warning", "Zero-value transfers may indicate logic errors when policy requires positive amounts."),
+    ("arithmetic-before-range-check", "warning", "Arithmetic performed before range validation can overflow; validate inputs first."),
 ];
 
 fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
@@ -1015,6 +1029,16 @@ struct Suppression {
 }
 
 fn find_audit_directive(line: &str) -> Option<&str> {
+    // Support multiple suppression comment formats for flexibility
+    // Format 1: audit:allow(<rule_id>) or audit:allow_all
+    if let Some(pos) = line.to_lowercase().find("audit:allow") {
+        let after_audit = &line[pos + "audit:allow".len()..];
+        let open_paren = after_audit.find('(')?;
+        let close_paren = after_audit.rfind(')')?;
+        return Some(&after_audit[open_paren + 1..close_paren]);
+    }
+    
+    // Format 2: soroban_testkit audit(...) or soroban-testkit audit(...)
     let lower = line.to_lowercase();
     let prefix_pos = lower
         .find("soroban_testkit")
@@ -1490,6 +1514,52 @@ impl FunctionVisitor<'_> {
                 }
             }
         }
+
+        // Rule 8 (#345): zero-value transfers — a transfer call with a literal
+        // zero amount is almost always a logic error; policies that forbid zero
+        // transfers should catch this statically.
+        if self.is_enabled("zero-transfer-amount") {
+            // Look for transfer( ... , &0 ) or transfer( ... , 0 ) patterns
+            // in the normalised body source.
+            let has_zero_transfer =
+                (body_src.contains(". transfer (") || body_src.contains(". try_transfer ("))
+                    && (body_src.contains(", & 0 )") || body_src.contains(", 0 )") || body_src.contains(", & 0i128 )") || body_src.contains(", 0i128 )"));
+            if has_zero_transfer {
+                self.push_with_range(
+                    line,
+                    "zero-transfer-amount",
+                    "warning",
+                    format!(
+                        "fn {name} calls transfer with a literal zero amount; validate that amounts are non-zero before transferring"
+                    ),
+                    Some(fn_range),
+                );
+            }
+        }
+
+        // Rule 9 (#347): arithmetic performed before range validation — detects
+        // when arithmetic (+ - * /) on a signed i128 binding appears before any
+        // comparison of that binding against a bound in the same function body.
+        // This catches the common pattern of computing a result and then checking
+        // whether it's valid, rather than checking inputs first.
+        if self.is_enabled("arithmetic-before-range-check") {
+            for amount_param in signed_amount_params(sig) {
+                // Check if arithmetic is used before any range comparison
+                let arith_before_check =
+                    has_arithmetic_before_range_check(&body_src, &amount_param);
+                if arith_before_check {
+                    self.push_with_range(
+                        line,
+                        "arithmetic-before-range-check",
+                        "warning",
+                        format!(
+                            "fn {name} performs arithmetic on `{amount_param}` before validating its range; validate inputs before arithmetic"
+                        ),
+                        Some(fn_range),
+                    );
+                }
+            }
+        }
     }
 
     fn audit_mock_all_auths(
@@ -1672,6 +1742,58 @@ fn has_positive_amount_validation(body_src: &str, amount_param: &str) -> bool {
     ]
     .iter()
     .any(|pattern| compact.contains(pattern))
+}
+
+/// Returns `true` when the function body performs arithmetic on `param_name`
+/// before any range comparison of that parameter.  The heuristic scans the
+/// compact (space-stripped) source for the first arithmetic operator involving
+/// `param_name` and the first comparison; if the arithmetic position precedes
+/// the comparison position, that is flagged.
+fn has_arithmetic_before_range_check(body_src: &str, param_name: &str) -> bool {
+    let compact = body_src.replace(' ', "");
+    // Arithmetic patterns on the parameter
+    let arith_patterns = [
+        format!("{param_name}+"),
+        format!("{param_name}-"),
+        format!("{param_name}*"),
+        format!("{param_name}/"),
+        format!("+{param_name}"),
+        format!("*{param_name}"),
+    ];
+    // Range-check patterns on the parameter
+    let check_patterns = [
+        format!("{param_name}>0"),
+        format!("{param_name}>=0"),
+        format!("{param_name}<=0"),
+        format!("{param_name}<0"),
+        format!("0<{param_name}"),
+        format!("0<={param_name}"),
+        format!("0>{param_name}"),
+        format!("0>={param_name}"),
+        format!("{param_name}.is_positive()"),
+        format!("{param_name}.is_negative()"),
+        format!("assert!({param_name}"),
+        format!("require({param_name}"),
+        format!("if{param_name}"),
+        format!("if!{param_name}"),
+    ];
+
+    let first_arith = arith_patterns
+        .iter()
+        .filter_map(|p| compact.find(p.as_str()))
+        .min();
+    let first_check = check_patterns
+        .iter()
+        .filter_map(|p| compact.find(p.as_str()))
+        .min();
+
+    match (first_arith, first_check) {
+        // Arithmetic exists but no range check at all
+        (Some(_), None) => false, // already caught by missing-positive-amount-validation
+        // Both exist — flag if arithmetic comes before the check
+        (Some(arith_pos), Some(check_pos)) => arith_pos < check_pos,
+        _ => false,
+    }
 }
 
 fn address_typed_params(sig: &Signature) -> Vec<String> {
