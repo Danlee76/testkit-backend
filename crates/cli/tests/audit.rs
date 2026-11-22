@@ -29,6 +29,23 @@ fn run_from(dir: &Path, args: &[&str]) -> Output {
         .expect("failed to run soroban-testkit")
 }
 
+fn run_from_with_env(
+    dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    remove_envs: &[&str],
+) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"));
+    cmd.args(args).current_dir(dir);
+    for var in remove_envs {
+        cmd.env_remove(var);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("failed to run soroban-testkit")
+}
+
 struct AuditFixture(PathBuf);
 
 impl AuditFixture {
@@ -1817,4 +1834,161 @@ fn audit_summary_only_default_output_unchanged_regression() {
     assert!(stdout.contains("crates/vault/src/lib.rs:"), "default output must still include finding locations");
     assert!(stdout.contains("missing-require-auth"), "default output must still include rule name");
     assert!(stdout.contains("1 finding(s)"), "default output must still include summary count");
+}
+
+// ---- #337: no-color option and NO_COLOR convention ----
+
+#[test]
+fn audit_color_positive_control_forced_color_produces_ansi_codes() {
+    let fixture = AuditFixture::new("color-positive");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        UNAUTHORIZED_ENTRY_POINT,
+    );
+    let output = run_from_with_env(
+        &fixture.0,
+        &["audit", "."],
+        &[("CLICOLOR_FORCE", "1")],
+        &["NO_COLOR"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\x1b["),
+        "positive control: forced color with CLICOLOR_FORCE=1 must produce ANSI escape codes: {stdout}"
+    );
+}
+
+#[test]
+fn audit_color_no_color_flag_removes_ansi_codes() {
+    let fixture = AuditFixture::new("color-flag-removes");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        UNAUTHORIZED_ENTRY_POINT,
+    );
+    let output = run_from_with_env(
+        &fixture.0,
+        &["audit", ".", "--no-color"],
+        &[("CLICOLOR_FORCE", "1")],
+        &["NO_COLOR"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("\x1b["),
+        "--no-color flag must eliminate all ANSI escape codes even when CLICOLOR_FORCE=1: {stdout}"
+    );
+}
+
+#[test]
+fn audit_color_no_color_env_var_removes_ansi_codes() {
+    let fixture = AuditFixture::new("color-env-removes");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        UNAUTHORIZED_ENTRY_POINT,
+    );
+    let output = run_from_with_env(
+        &fixture.0,
+        &["audit", "."],
+        &[("CLICOLOR_FORCE", "1"), ("NO_COLOR", "1")],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("\x1b["),
+        "non-empty NO_COLOR must eliminate all ANSI escape codes: {stdout}"
+    );
+}
+
+#[test]
+fn audit_color_empty_no_color_does_not_disable_color() {
+    let fixture = AuditFixture::new("color-empty-env");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        UNAUTHORIZED_ENTRY_POINT,
+    );
+    let output = run_from_with_env(
+        &fixture.0,
+        &["audit", "."],
+        &[("CLICOLOR_FORCE", "1"), ("NO_COLOR", "")],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\x1b["),
+        "empty NO_COLOR=\"\" must not disable color: {stdout}"
+    );
+}
+
+#[test]
+fn audit_color_precedence_flag_overrides_no_color_and_force() {
+    let fixture = AuditFixture::new("color-precedence");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        UNAUTHORIZED_ENTRY_POINT,
+    );
+    // Flag takes precedence over everything
+    let output = run_from_with_env(
+        &fixture.0,
+        &["audit", ".", "--no-color"],
+        &[("CLICOLOR_FORCE", "1"), ("NO_COLOR", "")],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("\x1b["),
+        "--no-color flag must take precedence over CLICOLOR_FORCE: {stdout}"
+    );
+}
+
+#[test]
+fn audit_color_summary_only_mode_respects_no_color() {
+    let fixture = AuditFixture::new("color-summary-only");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        UNAUTHORIZED_ENTRY_POINT,
+    );
+    // Forced color with summary-only produces ANSI
+    let colored_output = run_from_with_env(
+        &fixture.0,
+        &["audit", ".", "--summary-only"],
+        &[("CLICOLOR_FORCE", "1")],
+        &["NO_COLOR"],
+    );
+    let colored_stdout = String::from_utf8_lossy(&colored_output.stdout);
+    assert!(
+        colored_stdout.contains("\x1b["),
+        "summary-only with forced color must contain ANSI codes: {colored_stdout}"
+    );
+
+    // Summary-only with --no-color contains no ANSI
+    let plain_output = run_from_with_env(
+        &fixture.0,
+        &["audit", ".", "--summary-only", "--no-color"],
+        &[("CLICOLOR_FORCE", "1")],
+        &["NO_COLOR"],
+    );
+    let plain_stdout = String::from_utf8_lossy(&plain_output.stdout);
+    assert!(
+        !plain_stdout.contains("\x1b["),
+        "summary-only with --no-color must contain no ANSI codes: {plain_stdout}"
+    );
+}
+
+#[test]
+fn audit_color_default_regression_plain_in_non_terminal() {
+    let fixture = AuditFixture::new("color-default-reg");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        UNAUTHORIZED_ENTRY_POINT,
+    );
+    let output = run_from_with_env(
+        &fixture.0,
+        &["audit", "."],
+        &[],
+        &["CLICOLOR_FORCE", "NO_COLOR"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("\x1b["),
+        "default execution in test process without terminal must not produce ANSI codes: {stdout}"
+    );
 }

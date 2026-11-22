@@ -107,6 +107,9 @@ soroban-testkit audit ./src --strict
 # Print only the audit summary without individual finding details.
 soroban-testkit audit ./src --summary-only
 
+# Disable ANSI color escape codes (also honors NO_COLOR env var).
+soroban-testkit audit ./src --no-color
+
 # Stable machine-readable reports for automation and GitHub code scanning.
 soroban-testkit audit ./src --format json
 soroban-testkit audit ./src --format sarif > audit.sarif

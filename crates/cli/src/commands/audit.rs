@@ -136,6 +136,11 @@ pub struct AuditArgs {
     /// Only supported with text output.
     #[arg(long, global = true)]
     pub summary_only: bool,
+    /// Suppress ANSI color escape sequences in text output.
+    /// Precedence: `--no-color` flag, then `NO_COLOR` environment variable,
+    /// then automatic terminal detection (or `CLICOLOR_FORCE`).
+    #[arg(long, global = true)]
+    pub no_color: bool,
 }
 
 #[derive(Subcommand)]
@@ -328,8 +333,11 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     normalize_findings(&mut findings);
 
     let parser_limitations: Vec<String> = parse_warnings.iter().map(ToString::to_string).collect();
+    let use_color = should_color(args.no_color);
     let rendered_report = if args.summary_only {
-        DiagnosticRenderer::new(&findings).render_text_summary()
+        DiagnosticRenderer::new(&findings).render_text_summary_colored(use_color)
+    } else if args.format == AuditOutputFormat::Text {
+        DiagnosticRenderer::new(&findings).render_text_colored(use_color)
     } else {
         render_findings_with_limitations(
             &findings,
@@ -572,6 +580,31 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     }
 }
 
+/// Determines whether ANSI color codes should be emitted for text output.
+///
+/// Precedence:
+/// 1. The `--no-color` command line flag (if `true`, color is off).
+/// 2. The `NO_COLOR` environment variable (if set and non-empty, color is off).
+/// 3. Automatic detection: `CLICOLOR_FORCE` environment variable (if set and != "0",
+///    color is forced on), otherwise terminal detection (`std::io::stdout().is_terminal()`).
+pub fn should_color(no_color_flag: bool) -> bool {
+    if no_color_flag {
+        return false;
+    }
+    if let Ok(val) = std::env::var("NO_COLOR") {
+        if !val.is_empty() {
+            return false;
+        }
+    }
+    if let Ok(force) = std::env::var("CLICOLOR_FORCE") {
+        if force != "0" {
+            return true;
+        }
+    }
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+}
+
 /// Centralized diagnostic renderer across Text, JSON, and SARIF formats.
 pub struct DiagnosticRenderer<'a> {
     findings: &'a [Finding],
@@ -602,9 +635,28 @@ impl<'a> DiagnosticRenderer<'a> {
 
     /// Render only the summary line and heuristics disclaimer notes.
     pub fn render_text_summary(&self) -> String {
+        self.render_text_summary_colored(false)
+    }
+
+    /// Render only the summary line and heuristics disclaimer notes with optional ANSI color.
+    pub fn render_text_summary_colored(&self, color: bool) -> String {
         if self.findings.is_empty() {
+            if color {
+                format!(
+                    "\x1b[1;32maudit: no findings\x1b[0m\n\x1b[1;36mnote:\x1b[0m {MACRO_SOURCE_LIMITATION}\n\x1b[1;36mnote:\x1b[0m {FINDING_NATURE}\n"
+                )
+            } else {
+                format!(
+                    "audit: no findings\nnote: {MACRO_SOURCE_LIMITATION}\nnote: {FINDING_NATURE}\n"
+                )
+            }
+        } else if color {
             format!(
-                "audit: no findings\nnote: {MACRO_SOURCE_LIMITATION}\nnote: {FINDING_NATURE}\n"
+                "\x1b[1m{} finding(s).\x1b[0m soroban-testkit audit is a linter with seven heuristics, not a \
+                 security product — a missing finding is not a security guarantee.\n\
+                 \x1b[1;36mnote:\x1b[0m {FINDING_NATURE}\n\
+                 \x1b[1;36mnote:\x1b[0m {MACRO_SOURCE_LIMITATION}\n",
+                self.findings.len()
             )
         } else {
             format!(
@@ -624,26 +676,50 @@ impl<'a> DiagnosticRenderer<'a> {
     /// copied snippet can never inject terminal output. Each finding is a
     /// heuristic signal, spelled out in the closing note.
     pub fn render_text(&self) -> String {
+        self.render_text_colored(false)
+    }
+
+    /// Render compiler-style human-readable text diagnostics with optional ANSI color.
+    pub fn render_text_colored(&self, color: bool) -> String {
         if self.findings.is_empty() {
-            return self.render_text_summary();
+            return self.render_text_summary_colored(color);
         }
 
         let mut output = String::new();
         for finding in self.findings {
-            output.push_str(&format!(
-                "{}:{}: [{}] {}: {}\n",
-                display_audit_path(&finding.file),
-                finding.line,
-                finding.severity,
-                finding.rule,
-                finding.message
-            ));
-            if let Some(snippet) = &finding.source_snippet {
-                output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
+            if color {
+                let sev_str = match finding.severity.as_str() {
+                    "error" => "\x1b[1;31m[error]\x1b[0m",
+                    "warning" => "\x1b[1;33m[warning]\x1b[0m",
+                    _ => &format!("\x1b[1;34m[{}]\x1b[0m", finding.severity),
+                };
+                output.push_str(&format!(
+                    "\x1b[1m{}:{}:\x1b[0m {} \x1b[1;36m{}:\x1b[0m {}\n",
+                    display_audit_path(&finding.file),
+                    finding.line,
+                    sev_str,
+                    finding.rule,
+                    finding.message
+                ));
+                if let Some(snippet) = &finding.source_snippet {
+                    output.push_str(&format!("    \x1b[1;34m-->\x1b[0m {}\n", sanitize_snippet(snippet)));
+                }
+            } else {
+                output.push_str(&format!(
+                    "{}:{}: [{}] {}: {}\n",
+                    display_audit_path(&finding.file),
+                    finding.line,
+                    finding.severity,
+                    finding.rule,
+                    finding.message
+                ));
+                if let Some(snippet) = &finding.source_snippet {
+                    output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
+                }
             }
         }
         output.push('\n');
-        output.push_str(&self.render_text_summary());
+        output.push_str(&self.render_text_summary_colored(color));
         output
     }
 
@@ -2668,5 +2744,36 @@ mod tests {
             messages,
             vec!["fn f takes `amount1`", "fn f takes `amount2`"]
         );
+    }
+
+    #[test]
+    fn test_renderer_color_and_no_color() {
+        let findings = vec![sample_finding(
+            "a.rs",
+            10,
+            "missing-require-auth",
+            "fn withdraw needs auth",
+        )];
+        let renderer = DiagnosticRenderer::new(&findings);
+        let colored = renderer.render_text_colored(true);
+        let plain = renderer.render_text_colored(false);
+
+        assert!(colored.contains("\x1b["), "colored text must contain ANSI escape codes");
+        assert!(!plain.contains("\x1b["), "plain text must not contain ANSI escape codes");
+
+        let summary_colored = renderer.render_text_summary_colored(true);
+        let summary_plain = renderer.render_text_summary_colored(false);
+
+        assert!(summary_colored.contains("\x1b["), "colored summary must contain ANSI escape codes");
+        assert!(!summary_plain.contains("\x1b["), "plain summary must not contain ANSI escape codes");
+
+        let empty_renderer = DiagnosticRenderer::new(&[]);
+        assert!(empty_renderer.render_text_summary_colored(true).contains("\x1b["));
+        assert!(!empty_renderer.render_text_summary_colored(false).contains("\x1b["));
+    }
+
+    #[test]
+    fn test_should_color_flag_precedence() {
+        assert!(!should_color(true));
     }
 }
