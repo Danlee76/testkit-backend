@@ -226,16 +226,42 @@ impl Finding {
 /// capable of missing real bugs or flagging non-bugs. The absence of a
 /// finding here is never a security guarantee.
 ///
-/// 1. Entry points taking an `Address` parameter that never call
-///    `require_auth` anywhere in the function body.
-/// 2. Arithmetic (`+ - * /`) on an explicitly `i128`-typed binding, done
-///    outside a `checked_`/`saturating_`/`wrapping_` call.
-/// 3. A `.persistent()`/`.temporary()` storage read with no
-///    `.extend_ttl(` call anywhere in the same function.
-/// 4. Broad use of `mock_all_auths` in test functions.
-/// 5. Token transfer calls whose return value is explicitly or implicitly ignored.
-/// 6. Signed `amount` parameters with no comparison against zero.
-/// 7. Unchecked timestamp arithmetic operations that could overflow.
+/// # Rule Confidence & Known Limitations
+///
+/// Confidence scale:
+/// - `high`: direct syntactic match for specific APIs with minimal false positives.
+/// - `medium`: AST-based pattern matching within single-function scope; limited by
+///   lack of cross-function, cross-crate, or macro expansion analysis.
+/// - `low`: token/string heuristics based on identifiers or substring matches; prone
+///   to false positives and negatives due to lack of type and execution flow analysis.
+/// - `not assessed`: rule has not been formally evaluated.
+///
+/// 1. `missing-require-auth` [medium]: Entry points taking an `Address` parameter
+///    that never call `require_auth` in the function body.
+///    Limitations: Cannot inspect macro-generated code; auth in private helpers
+///    without recognized auth stems is missed; no cross-file call graph analysis.
+/// 2. `unchecked-i128-arithmetic` [medium]: Arithmetic (`+ - * /`) on an explicitly
+///    `i128`-typed binding, done outside a `checked_`/`saturating_`/`wrapping_` call.
+///    Limitations: Only tracks parameter bindings; ignores local `let` bindings
+///    and struct fields; does not inspect macro expansions.
+/// 3. `missing-ttl-bump` [low]: Storage reads with no `.extend_ttl(` call in the same function.
+///    Limitations: Heuristic token matching; does not verify key equivalence; does
+///    not detect TTL bumps in helper functions or separate transactions; ignores
+///    instance storage.
+/// 4. `broad-mock-all-auths` [high]: Test functions using `mock_all_auths()` bypassing auth.
+///    Limitations: Cannot detect calls generated through external test macros or
+///    helper functions outside test modules.
+/// 5. `ignored-token-transfer-result` [medium]: Token transfer operations whose return
+///    value is not handled.
+///    Limitations: Syntactic heuristic matching transfer methods without type resolution;
+///    `let _ = ...` bypasses detection.
+/// 6. `missing-positive-amount-validation` [low]: Signed amount parameters with no comparison
+///    against zero.
+///    Limitations: Only inspects parameters named `*amount*`; does not evaluate
+///    branching/control flow; helper validation missed.
+/// 7. `unchecked-timestamp-arithmetic` [low]: Unchecked timestamp arithmetic operations.
+///    Limitations: Substring match on `timestamp`; flags unrelated arithmetic in the
+///    same function; no semantic type checking.
 ///
 /// # Scan roots and exclusions
 ///
@@ -506,31 +532,116 @@ fn explain_rule(rule: &str) -> Result<(), CliError> {
         }
         _ => return Err(CliError(format!("unknown rule: {}", rule))),
     };
-    // Every message above describes a syntactic pattern, not a proven
-    // defect: state the heuristic nature right next to the rule so the
-    // distinction between "flagged" and "broken" is never left to guesswork.
-    println!("{explanation}\n\nnote: {FINDING_NATURE}");
+
+    let meta = RULES.iter().find(|m| m.id == rule);
+    println!("{explanation}");
+    if let Some(m) = meta {
+        println!("\nConfidence: {}", m.confidence);
+        println!("Known limitations:");
+        for lim in m.limitations {
+            println!("- {lim}");
+        }
+    }
+    println!("\nnote: {FINDING_NATURE}");
     Ok(())
 }
 
+/// Static metadata for an audit rule, including confidence and verified limitations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuleMeta {
+    pub id: &'static str,
+    pub severity: &'static str,
+    pub description: &'static str,
+    pub confidence: &'static str,
+    pub limitations: &'static [&'static str],
+}
+
 /// Static metadata for all audit rules.
-const RULES: &[(&str, &str, &str)] = &[
-    ("missing-require-auth", "warning", "Entry points that accept an Address parameter must validate the caller with require_auth()."),
-    ("unchecked-i128-arithmetic", "warning", "Arithmetic on i128 values can silently overflow; use checked/saturating/wrapping variants."),
-    ("missing-ttl-bump", "warning", "Storage reads without extend_ttl can expire prematurely."),
-    ("broad-mock-all-auths", "warning", "Test functions using mock_all_auths() bypass auth checks entirely."),
-    ("ignored-token-transfer-result", "warning", "Token transfer operations can fail; their results must be handled."),
-    ("missing-positive-amount-validation", "warning", "Signed amount parameters should be validated against zero."),
-    ("unchecked-timestamp-arithmetic", "warning", "Timestamp arithmetic can overflow and cause silent failures."),
+pub const RULES: &[RuleMeta] = &[
+    RuleMeta {
+        id: "missing-require-auth",
+        severity: "warning",
+        description: "Entry points that accept an Address parameter must validate the caller with require_auth().",
+        confidence: "medium",
+        limitations: &[
+            "Cannot inspect code generated by macros or macro_rules!",
+            "Auth validation in private helper functions without recognized auth stems is missed",
+            "Does not perform cross-contract or cross-file call graph analysis",
+        ],
+    },
+    RuleMeta {
+        id: "unchecked-i128-arithmetic",
+        severity: "warning",
+        description: "Arithmetic on i128 values can silently overflow; use checked/saturating/wrapping variants.",
+        confidence: "medium",
+        limitations: &[
+            "Only checks i128 bindings declared as function parameters; does not track local let bindings or struct fields",
+            "Does not inspect arithmetic inside macro expansions",
+        ],
+    },
+    RuleMeta {
+        id: "missing-ttl-bump",
+        severity: "warning",
+        description: "Storage reads without extend_ttl can expire prematurely.",
+        confidence: "low",
+        limitations: &[
+            "Heuristic token match on body source; does not track storage key equivalence between read and extend_ttl",
+            "Does not detect TTL bumps performed in helper functions or separate transactions",
+            "Does not check instance storage (.instance().get(...))",
+        ],
+    },
+    RuleMeta {
+        id: "broad-mock-all-auths",
+        severity: "warning",
+        description: "Test functions using mock_all_auths() bypass auth checks entirely.",
+        confidence: "high",
+        limitations: &[
+            "Cannot detect calls generated through external test macros or helper functions outside test modules",
+        ],
+    },
+    RuleMeta {
+        id: "ignored-token-transfer-result",
+        severity: "warning",
+        description: "Token transfer operations can fail; their results must be handled.",
+        confidence: "medium",
+        limitations: &[
+            "Syntactic heuristic matching transfer/transfer_from; does not perform type resolution for non-token types",
+            "Assigning result to an unused variable (let _ = ...) bypasses detection",
+        ],
+    },
+    RuleMeta {
+        id: "missing-positive-amount-validation",
+        severity: "warning",
+        description: "Signed amount parameters should be validated against zero.",
+        confidence: "low",
+        limitations: &[
+            "Only inspects parameters containing 'amount' in their identifier name",
+            "Token search on body source does not evaluate execution flow or branching",
+            "Validation performed in helper functions is not recognized",
+        ],
+    },
+    RuleMeta {
+        id: "unchecked-timestamp-arithmetic",
+        severity: "warning",
+        description: "Timestamp arithmetic can overflow and cause silent failures.",
+        confidence: "low",
+        limitations: &[
+            "Crude substring match on 'timestamp'; flags any arithmetic in a function containing 'timestamp' even on unrelated counters",
+            "Does not perform semantic type checking on timestamp variables",
+        ],
+    },
 ];
 
 fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     match format {
         AuditOutputFormat::Text => {
-            println!("{:<40} {:<10} DESCRIPTION", "RULE", "SEVERITY");
+            println!("{:<36} {:<10} {:<12} DESCRIPTION", "RULE", "SEVERITY", "CONFIDENCE");
             println!("{}", "-".repeat(100));
-            for (rule, severity, desc) in RULES {
-                println!("{rule:<40} {severity:<10} {desc}");
+            for rule in RULES {
+                println!("{:<36} {:<10} {:<12} {}", rule.id, rule.severity, rule.confidence, rule.description);
+                for lim in rule.limitations {
+                    println!("    * limitation: {lim}");
+                }
             }
             println!("note: {FINDING_NATURE}");
             Ok(())
@@ -538,11 +649,13 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
         AuditOutputFormat::Json => {
             let rules: Vec<_> = RULES
                 .iter()
-                .map(|(id, severity, description)| {
+                .map(|rule| {
                     serde_json::json!({
-                        "id": id,
-                        "severity": severity,
-                        "description": description,
+                        "id": rule.id,
+                        "severity": rule.severity,
+                        "confidence": rule.confidence,
+                        "description": rule.description,
+                        "limitations": rule.limitations,
                     })
                 })
                 .collect();
@@ -561,14 +674,18 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
         AuditOutputFormat::Sarif => {
             let rules: Vec<_> = RULES
                 .iter()
-                .map(|(id, severity, description)| {
+                .map(|rule| {
                     serde_json::json!({
-                        "id": id,
-                        "shortDescription": { "text": id.replace('-', " ") },
-                        "fullDescription": { "text": description },
+                        "id": rule.id,
+                        "shortDescription": { "text": rule.id.replace('-', " ") },
+                        "fullDescription": { "text": rule.description },
                         "defaultConfiguration": {
-                            "level": sarif_level(severity)
+                            "level": sarif_level(rule.severity)
                         },
+                        "properties": {
+                            "confidence": rule.confidence,
+                            "limitations": rule.limitations,
+                        }
                     })
                 })
                 .collect();
@@ -913,10 +1030,8 @@ impl<'a> DiagnosticRenderer<'a> {
         let rules: Vec<_> = rule_ids
             .into_iter()
             .map(|rule| {
-                let description = RULES
-                    .iter()
-                    .find(|(id, _, _)| *id == rule)
-                    .map(|(_, _, desc)| *desc);
+                let meta = RULES.iter().find(|m| m.id == rule);
+                let description = meta.map(|m| m.description);
                 // The metadata level mirrors the level this scan gives the
                 // rule's findings: a config override takes effect, and with
                 // nothing configured the `RULES` default applies — both walk
@@ -927,12 +1042,7 @@ impl<'a> DiagnosticRenderer<'a> {
                     .iter()
                     .find(|finding| finding.rule == rule)
                     .map(|finding| finding.severity.as_str())
-                    .or_else(|| {
-                        RULES
-                            .iter()
-                            .find(|(id, _, _)| *id == rule)
-                            .map(|(_, severity, _)| *severity)
-                    });
+                    .or_else(|| meta.map(|m| m.severity));
                 let mut rule_obj = serde_json::json!({
                     "id": rule,
                     "shortDescription": { "text": rule.replace('-', " ") }
@@ -943,6 +1053,12 @@ impl<'a> DiagnosticRenderer<'a> {
                 if let Some(severity) = effective_severity {
                     rule_obj["defaultConfiguration"] =
                         serde_json::json!({ "level": sarif_level(severity) });
+                }
+                if let Some(m) = meta {
+                    rule_obj["properties"] = serde_json::json!({
+                        "confidence": m.confidence,
+                        "limitations": m.limitations,
+                    });
                 }
                 rule_obj
             })
@@ -2962,5 +3078,26 @@ mod tests {
         assert!(validate_width_str("abc").is_err());
         assert!(validate_width_str("10000").is_err());
         assert!(validate_width_str("80").is_ok());
+    }
+
+    #[test]
+    fn test_rule_registry_confidence_and_limitations() {
+        let valid_confidence = ["high", "medium", "low", "not assessed"];
+        for rule in RULES {
+            assert!(
+                valid_confidence.contains(&rule.confidence),
+                "rule {} has invalid confidence level '{}'",
+                rule.id,
+                rule.confidence
+            );
+            assert!(
+                !rule.limitations.is_empty(),
+                "rule {} must have at least one limitation or 'none known'",
+                rule.id
+            );
+            for lim in rule.limitations {
+                assert!(!lim.trim().is_empty(), "rule {} has empty limitation string", rule.id);
+            }
+        }
     }
 }
