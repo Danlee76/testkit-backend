@@ -1723,3 +1723,298 @@ impl Vault {
         "missing-require-auth should fire when only an unrelated helper is called"
     );
 }
+
+#[test]
+fn audit_schema_outputs_valid_json_schema() {
+    let output = run(&["audit", "schema"]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.is_empty(), "schema should not output to stderr: {stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let schema: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("schema output should be valid JSON");
+    assert_eq!(schema["$schema"], "https://json-schema.org/draft/2020-12/schema");
+    assert_eq!(schema["title"], "Soroban Testkit Audit Report");
+    assert_eq!(schema["properties"]["tool"]["const"], "soroban-testkit");
+    assert_eq!(schema["properties"]["version"]["const"], 1);
+    // Verify schema structure matches expected report format
+    assert!(schema["properties"]["findings"].is_object());
+    assert!(schema["properties"]["summary"].is_object());
+    assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("tool")));
+    assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("version")));
+    assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("findings")));
+    assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("summary")));
+}
+
+// ---- Paired safe/unsafe fixtures for each audit rule ----
+
+// === missing-require-auth ===
+
+#[test]
+fn audit_missing_require_auth_finds_unsafe_pattern() {
+    // UNSAFE: Address parameter without require_auth
+    let unsafe_source = br#"
+#[contractimpl]
+impl Vault {
+    pub fn withdraw(env: Env, from: Address, amount: i128) {
+        env.storage().instance().set(&from, &(amount * 2i128));
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], unsafe_source);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "missing-require-auth")
+        .collect();
+    assert!(!findings.is_empty(), "unsafe pattern should trigger finding");
+}
+
+#[test]
+fn audit_missing_require_auth_allows_safe_pattern() {
+    // SAFE: Address parameter with require_auth
+    let safe_source = br#"
+#[contractimpl]
+impl Vault {
+    pub fn withdraw(env: Env, from: Address, amount: i128) {
+        from.require_auth();
+        env.storage().instance().set(&from, &(amount * 2i128));
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], safe_source);
+    assert!(output.status.success(), "safe pattern should not trigger finding");
+}
+
+// === unchecked-i128-arithmetic ===
+
+#[test]
+fn audit_unchecked_arithmetic_finds_unsafe_pattern() {
+    // UNSAFE: Direct i128 arithmetic
+    let unsafe_source = br#"
+fn process_balance(balance: i128, amount: i128) -> i128 {
+    balance + amount
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], unsafe_source);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "unchecked-i128-arithmetic")
+        .collect();
+    assert!(!findings.is_empty(), "unsafe pattern should trigger finding");
+}
+
+#[test]
+fn audit_unchecked_arithmetic_allows_safe_pattern() {
+    // SAFE: Checked arithmetic
+    let safe_source = br#"
+fn process_balance(balance: i128, amount: i128) -> Option<i128> {
+    balance.checked_add(amount)
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], safe_source);
+    assert!(output.status.success(), "safe pattern should not trigger finding");
+}
+
+// === missing-ttl-bump ===
+
+#[test]
+fn audit_missing_ttl_bump_finds_unsafe_pattern() {
+    // UNSAFE: Storage read without TTL extension
+    let unsafe_source = br#"
+#[contractimpl]
+impl Vault {
+    pub fn get_balance(env: Env) -> i128 {
+        env.storage().instance().get(&"balance").unwrap_or(0i128)
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], unsafe_source);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "missing-ttl-bump")
+        .collect();
+    assert!(!findings.is_empty(), "unsafe pattern should trigger finding");
+}
+
+#[test]
+fn audit_missing_ttl_bump_allows_safe_pattern() {
+    // SAFE: Storage read with TTL extension
+    let safe_source = br#"
+#[contractimpl]
+impl Vault {
+    pub fn get_balance(env: Env) -> i128 {
+        env.storage().instance().get(&"balance").unwrap_or(0i128);
+        env.storage().instance().extend_ttl(&"balance", 100, 200);
+        0i128
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], safe_source);
+    assert!(output.status.success(), "safe pattern should not trigger finding");
+}
+
+// === ignored-token-transfer-result ===
+
+#[test]
+fn audit_ignored_transfer_finds_unsafe_pattern() {
+    // UNSAFE: Ignoring transfer result
+    let unsafe_source = br#"
+use soroban_token_contract::TokenClient;
+
+#[contractimpl]
+impl Vault {
+    pub fn transfer(env: Env, token: Address, to: Address, amount: i128) {
+        let client = TokenClient::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &to, &amount);
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], unsafe_source);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "ignored-token-transfer-result")
+        .collect();
+    assert!(!findings.is_empty(), "unsafe pattern should trigger finding");
+}
+
+#[test]
+fn audit_ignored_transfer_allows_safe_pattern() {
+    // SAFE: Handling transfer result
+    let safe_source = br#"
+use soroban_token_contract::TokenClient;
+
+#[contractimpl]
+impl Vault {
+    pub fn transfer(env: Env, token: Address, to: Address, amount: i128) -> Result<(), soroban_sdk::Error> {
+        let client = TokenClient::new(&env, &token);
+        Ok(client.transfer(&env.current_contract_address(), &to, &amount)?)
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], safe_source);
+    assert!(output.status.success(), "safe pattern should not trigger finding");
+}
+
+// === missing-positive-amount-validation ===
+
+#[test]
+fn audit_missing_amount_validation_finds_unsafe_pattern() {
+    // UNSAFE: Amount without positive check
+    let unsafe_source = br#"
+#[contractimpl]
+impl Vault {
+    pub fn deposit(env: Env, amount: i128) {
+        let balance: i128 = env.storage().instance().get(&"balance").unwrap_or(0);
+        env.storage().instance().set(&"balance", &(balance + amount));
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], unsafe_source);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "missing-positive-amount-validation")
+        .collect();
+    assert!(!findings.is_empty(), "unsafe pattern should trigger finding");
+}
+
+#[test]
+fn audit_missing_amount_validation_allows_safe_pattern() {
+    // SAFE: Amount with positive check
+    let safe_source = br#"
+#[contractimpl]
+impl Vault {
+    pub fn deposit(env: Env, amount: i128) {
+        assert!(amount > 0, "Amount must be positive");
+        let balance: i128 = env.storage().instance().get(&"balance").unwrap_or(0);
+        env.storage().instance().set(&"balance", &(balance + amount));
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], safe_source);
+    assert!(output.status.success(), "safe pattern should not trigger finding");
+}
+
+// === unchecked-timestamp-arithmetic ===
+
+#[test]
+fn audit_unchecked_timestamp_finds_unsafe_pattern() {
+    // UNSAFE: Timestamp arithmetic without bounds checking
+    let unsafe_source = br#"
+fn deadline_from_now(seconds: u64, start: u64) -> u64 {
+    start + seconds
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], unsafe_source);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "unchecked-timestamp-arithmetic")
+        .collect();
+    assert!(!findings.is_empty(), "unsafe pattern should trigger finding");
+}
+
+#[test]
+fn audit_unchecked_timestamp_allows_safe_pattern() {
+    // SAFE: Checked timestamp arithmetic
+    let safe_source = br#"
+fn deadline_from_now(seconds: u64, start: u64) -> Option<u64> {
+    start.checked_add(seconds)
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], safe_source);
+    assert!(output.status.success(), "safe pattern should not trigger finding");
+}
+
+// === broad-mock-all-auths ===
+
+const MOCK_ALL_AUTHS_SAFE: &str = r#"
+#[test]
+fn test_with_specific_auth() {
+    let env = Env::default();
+    let admin = env.addresses().get(0).unwrap();
+    let user = env.addresses().get(1).unwrap();
+    
+    env.mock_auths(&[
+        MockAuth {
+            contract: &admin,
+            invocations: &[MockAuthInvocation {
+                function: "admin_only",
+                args: (&user,),
+                auth: Some(&user),
+            }],
+        },
+    ]);
+    
+    contract.admin_only(&user);
+}
+"#;
+
+const MOCK_ALL_AUTHS_UNSAFE: &str = r#"
+#[test]
+fn test_with_all_auths() {
+    let env = Env::default();
+    let admin = env.addresses().get(0).unwrap();
+    let user = env.addresses().get(1).unwrap();
+    
+    env.mock_all_auths();
+    
+    contract.admin_only(&user);
+}
+"#;

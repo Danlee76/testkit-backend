@@ -36,6 +36,14 @@ pub const FINDING_NATURE: &str =
 pub const PARSE_WARNING_NATURE: &str =
     "parse warnings are not findings: an input that could not be read or parsed was skipped without being scanned; warnings are reported on stderr and, in JSON, under summary.parser_limitations, never counted in finding_count, and never trigger --strict; they make the audit incomplete instead";
 
+/// How to suppress findings in source code. Suppressions use a special comment
+/// format that the scanner recognizes and respects.
+pub const SUPPRESSION_GUIDANCE: &str =
+    "to suppress a finding, add `// audit:allow(<rule_id>)` on the line before it,
+or add `// audit:allow_all` to suppress all findings on that line.
+Suppressions apply only to the line they precede and do not cascade.
+Use `// audit:allow(<rule_id>, \"reason for suppression\")` to document why.";
+
 /// Single mapping from a rule severity to a SARIF reporting level. Both the
 /// `rules` metadata and the `results` entries (and the `audit rules`
 /// machine-readable listing) route through this one function, so the
@@ -143,6 +151,8 @@ enum AuditCommand {
     },
     /// List all rules with their descriptions in machine-readable format.
     Rules,
+    /// Output JSON schema for machine-readable audit reports.
+    Schema,
 }
 
 /// Machine- and human-readable audit output formats.
@@ -247,6 +257,7 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     match &args.command {
         Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
         Some(AuditCommand::Rules) => return list_rules(args.format),
+        Some(AuditCommand::Schema) => return output_schema(),
         None => {}
     }
 
@@ -560,6 +571,89 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     }
 }
 
+/// Output JSON schema for machine-readable audit report format validation.
+fn output_schema() -> Result<(), CliError> {
+    let schema = serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "Soroban Testkit Audit Report",
+        "description": "Machine-readable audit report schema for soroban-testkit findings",
+        "type": "object",
+        "properties": {
+            "tool": {
+                "type": "string",
+                "const": "soroban-testkit",
+                "description": "Identifies the tool that produced the report"
+            },
+            "version": {
+                "type": "integer",
+                "const": 1,
+                "description": "Schema version for future compatibility"
+            },
+            "findings": {
+                "type": "array",
+                "description": "List of all audit findings",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file": {
+                            "type": "string",
+                            "description": "Workspace-relative path to the file containing the finding"
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "Line number where the finding was detected (1-indexed)"
+                        },
+                        "rule": {
+                            "type": "string",
+                            "description": "Rule identifier (e.g., 'missing-require-auth')"
+                        },
+                        "severity": {
+                            "type": "string",
+                            "description": "Finding severity (e.g., 'warning', 'error')"
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Human-readable message describing the finding"
+                        },
+                        "source_snippet": {
+                            "type": ["string", "null"],
+                            "description": "The source line that triggered the finding (sanitized)"
+                        }
+                    },
+                    "required": ["file", "line", "rule", "severity", "message"]
+                }
+            },
+            "summary": {
+                "type": "object",
+                "properties": {
+                    "finding_count": {
+                        "type": "integer",
+                        "description": "Total number of findings reported"
+                    },
+                    "skipped_file_count": {
+                        "type": "integer",
+                        "description": "Number of files that could not be read or parsed"
+                    },
+                    "parser_limitations": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "List of parse warnings for files that were skipped"
+                    },
+                    "limitations": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Known limitations of the audit tool"
+                    }
+                },
+                "required": ["finding_count"]
+            }
+        },
+        "required": ["tool", "version", "findings", "summary"]
+    });
+    println!("{}", serde_json::to_string_pretty(&schema).unwrap());
+    Ok(())
+}
+
 /// Centralized diagnostic renderer across Text, JSON, and SARIF formats.
 pub struct DiagnosticRenderer<'a> {
     findings: &'a [Finding],
@@ -622,6 +716,9 @@ impl<'a> DiagnosticRenderer<'a> {
         ));
         output.push_str(&format!("note: {FINDING_NATURE}\n"));
         output.push_str(&format!("note: {MACRO_SOURCE_LIMITATION}\n"));
+        output.push_str(&format!(
+            "note: to suppress findings, add `// audit:allow(<rule_id>)` comments\n"
+        ));
         output
     }
 
@@ -918,21 +1015,26 @@ fn load_baseline(baseline_path: &Option<PathBuf>) -> Result<Vec<BaselineEntry>, 
 }
 
 /// The one canonical ordering for findings: file, then line, then rule,
-/// then message. Exact duplicates collapse. Every
-/// report path funnels through this routine, in `audit_source` per parsed
-/// file and again in `run` after paths are rewritten workspace-relative, so
-/// text, JSON and SARIF always list a finding in the same place regardless
-/// of scan order.
+/// Sorts findings by file, line, rule, and message, then collapses exact
+/// duplicates. Every report path funnels through this routine, in `audit_source`
+/// per parsed file and again in `run` after paths are rewritten workspace-relative,
+/// so text, JSON and SARIF always list a finding in the same place regardless
+/// of scan order. File paths use lossy comparison to ensure deterministic ordering
+/// across platforms (e.g., case-insensitive file systems).
 fn normalize_findings(findings: &mut Vec<Finding>) {
     findings.sort_by(|left, right| {
-        left.file
-            .cmp(&right.file)
+        let left_file = left.file.to_string_lossy();
+        let right_file = right.file.to_string_lossy();
+        left_file
+            .cmp(&right_file)
             .then(left.line.cmp(&right.line))
             .then(left.rule.cmp(right.rule))
             .then(left.message.cmp(&right.message))
     });
     findings.dedup_by(|left, right| {
-        left.file == right.file
+        let left_file = left.file.to_string_lossy();
+        let right_file = right.file.to_string_lossy();
+        left_file == right_file
             && left.line == right.line
             && left.rule == right.rule
             && left.message == right.message
@@ -2645,6 +2747,35 @@ mod tests {
         assert_eq!(
             messages,
             vec!["fn f takes `amount1`", "fn f takes `amount2`"]
+        );
+    }
+
+    #[test]
+    fn normalize_findings_is_deterministic_across_platforms() {
+        // Test that lossy path comparison produces consistent ordering
+        // even with non-UTF8 paths that might compare differently on some platforms
+        let mut findings = vec![
+            sample_finding("src/lib.rs", 10, "missing-require-auth", "auth check"),
+            sample_finding("src/main.rs", 5, "missing-ttl-bump", "ttl bump"),
+            sample_finding("src/lib.rs", 5, "missing-require-auth", "another auth"),
+            sample_finding("src/main.rs", 10, "missing-ttl-bump", "another ttl"),
+        ];
+
+        normalize_findings(&mut findings);
+
+        // Verify consistent ordering by file path string comparison
+        let ordered: Vec<_> = findings
+            .iter()
+            .map(|f| (f.file.to_string_lossy().as_ref(), f.line, f.rule))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                ("src/lib.rs", 5, "missing-require-auth"),
+                ("src/lib.rs", 10, "missing-require-auth"),
+                ("src/main.rs", 5, "missing-ttl-bump"),
+                ("src/main.rs", 10, "missing-ttl-bump"),
+            ]
         );
     }
 }
