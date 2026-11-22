@@ -135,6 +135,19 @@ pub struct AuditArgs {
     /// the current directory. Paths inside it are relative to the workspace.
     #[arg(long, global = true)]
     baseline: Option<PathBuf>,
+    /// Print only the audit summary, omitting individual finding details.
+    /// Only supported with text output.
+    #[arg(long, global = true)]
+    pub summary_only: bool,
+    /// Suppress ANSI color escape sequences in text output.
+    /// Precedence: `--no-color` flag, then `NO_COLOR` environment variable,
+    /// then automatic terminal detection (or `CLICOLOR_FORCE`).
+    #[arg(long, global = true)]
+    pub no_color: bool,
+    /// Wrap human-readable finding messages to the specified maximum character width.
+    /// Allowed values: integers between 20 and 1000. When omitted, messages are not wrapped.
+    #[arg(long, value_name = "WIDTH", allow_hyphen_values = true, global = true)]
+    pub width: Option<String>,
     /// List all audit rules without running an audit.
     #[arg(long, global = true)]
     pub list_rules: bool,
@@ -185,6 +198,8 @@ pub enum AuditOutputFormat {
 pub struct AuditConfig {
     #[serde(default)]
     pub rules: HashMap<String, RuleConfig>,
+    #[serde(default)]
+    pub width: Option<toml::Value>,
     #[serde(default, deserialize_with = "deserialize_exclude")]
     pub exclude: Vec<PathBuf>,
 }
@@ -255,16 +270,42 @@ impl Finding {
 /// capable of missing real bugs or flagging non-bugs. The absence of a
 /// finding here is never a security guarantee.
 ///
-/// 1. Entry points taking an `Address` parameter that never call
-///    `require_auth` anywhere in the function body.
-/// 2. Arithmetic (`+ - * /`) on an explicitly `i128`-typed binding, done
-///    outside a `checked_`/`saturating_`/`wrapping_` call.
-/// 3. A `.persistent()`/`.temporary()` storage read with no
-///    `.extend_ttl(` call anywhere in the same function.
-/// 4. Broad use of `mock_all_auths` in test functions.
-/// 5. Token transfer calls whose return value is explicitly or implicitly ignored.
-/// 6. Signed `amount` parameters with no comparison against zero.
-/// 7. Unchecked timestamp arithmetic operations that could overflow.
+/// # Rule Confidence & Known Limitations
+///
+/// Confidence scale:
+/// - `high`: direct syntactic match for specific APIs with minimal false positives.
+/// - `medium`: AST-based pattern matching within single-function scope; limited by
+///   lack of cross-function, cross-crate, or macro expansion analysis.
+/// - `low`: token/string heuristics based on identifiers or substring matches; prone
+///   to false positives and negatives due to lack of type and execution flow analysis.
+/// - `not assessed`: rule has not been formally evaluated.
+///
+/// 1. `missing-require-auth` [medium]: Entry points taking an `Address` parameter
+///    that never call `require_auth` in the function body.
+///    Limitations: Cannot inspect macro-generated code; auth in private helpers
+///    without recognized auth stems is missed; no cross-file call graph analysis.
+/// 2. `unchecked-i128-arithmetic` [medium]: Arithmetic (`+ - * /`) on an explicitly
+///    `i128`-typed binding, done outside a `checked_`/`saturating_`/`wrapping_` call.
+///    Limitations: Only tracks parameter bindings; ignores local `let` bindings
+///    and struct fields; does not inspect macro expansions.
+/// 3. `missing-ttl-bump` [low]: Storage reads with no `.extend_ttl(` call in the same function.
+///    Limitations: Heuristic token matching; does not verify key equivalence; does
+///    not detect TTL bumps in helper functions or separate transactions; ignores
+///    instance storage.
+/// 4. `broad-mock-all-auths` [high]: Test functions using `mock_all_auths()` bypassing auth.
+///    Limitations: Cannot detect calls generated through external test macros or
+///    helper functions outside test modules.
+/// 5. `ignored-token-transfer-result` [medium]: Token transfer operations whose return
+///    value is not handled.
+///    Limitations: Syntactic heuristic matching transfer methods without type resolution;
+///    `let _ = ...` bypasses detection.
+/// 6. `missing-positive-amount-validation` [low]: Signed amount parameters with no comparison
+///    against zero.
+///    Limitations: Only inspects parameters named `*amount*`; does not evaluate
+///    branching/control flow; helper validation missed.
+/// 7. `unchecked-timestamp-arithmetic` [low]: Unchecked timestamp arithmetic operations.
+///    Limitations: Substring match on `timestamp`; flags unrelated arithmetic in the
+///    same function; no semantic type checking.
 ///
 /// # Scan roots and exclusions
 ///
@@ -288,6 +329,16 @@ impl Finding {
 /// shared function (`sarif_level`), so text, JSON and SARIF can never
 /// disagree about the same finding.
 pub fn run(args: AuditArgs) -> Result<(), CliError> {
+    if args.summary_only && args.format != AuditOutputFormat::Text {
+        return Err(CliError(
+            "--summary-only is only supported for text output; omit --summary-only or use --format text".into(),
+        ));
+    }
+
+    match &args.command {
+        Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
+        Some(AuditCommand::Rules) => return list_rules(args.format),
+        None => {}
     if args.list_rules
         || matches!(
             &args.command,
@@ -449,7 +500,15 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     // is guaranteed to follow.
     normalize_findings(&mut findings);
 
+    let width = resolve_width(&args.width, &config)?;
     let parser_limitations: Vec<String> = parse_warnings.iter().map(ToString::to_string).collect();
+    let use_color = should_color(args.no_color);
+    let rendered_report = if args.summary_only {
+        DiagnosticRenderer::new(&findings).render_text_summary_colored(use_color)
+    } else if args.format == AuditOutputFormat::Text {
+        DiagnosticRenderer::new(&findings).render_text_colored_with_width(use_color, width)
+    } else {
+        render_findings_with_limitations(
     print!(
         "{}",
         render_findings_with_limitations_and_scanned(
@@ -459,7 +518,8 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
             skipped_files,
             scanned_files,
         )?
-    );
+    };
+    print!("{rendered_report}");
 
     // Findings (heuristic pattern matches over parsed source) were just
     // rendered above; these are parse warnings (inputs that were never
@@ -993,6 +1053,110 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
         explanation: "unchecked-timestamp-arithmetic: Timestamp arithmetic can overflow and cause silent failures.\n\
              This rule detects + - * / operations on timestamp values without overflow protection.\n\
              Fix: Use checked arithmetic or ensure your timestamps are bounded to valid ranges.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time"
+        }
+        _ => return Err(CliError(format!("unknown rule: {}", rule))),
+    };
+
+    let meta = RULES.iter().find(|m| m.id == rule);
+    println!("{explanation}");
+    if let Some(m) = meta {
+        println!("\nConfidence: {}", m.confidence);
+        println!("Known limitations:");
+        for lim in m.limitations {
+            println!("- {lim}");
+        }
+    }
+    println!("\nnote: {FINDING_NATURE}");
+    Ok(())
+}
+
+/// Static metadata for an audit rule, including confidence and verified limitations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuleMeta {
+    pub id: &'static str,
+    pub severity: &'static str,
+    pub description: &'static str,
+    pub confidence: &'static str,
+    pub limitations: &'static [&'static str],
+}
+
+/// Static metadata for all audit rules.
+pub const RULES: &[RuleMeta] = &[
+    RuleMeta {
+        id: "missing-require-auth",
+        severity: "warning",
+        description: "Entry points that accept an Address parameter must validate the caller with require_auth().",
+        confidence: "medium",
+        limitations: &[
+            "Cannot inspect code generated by macros or macro_rules!",
+            "Auth validation in private helper functions without recognized auth stems is missed",
+            "Does not perform cross-contract or cross-file call graph analysis",
+        ],
+    },
+    RuleMeta {
+        id: "unchecked-i128-arithmetic",
+        severity: "warning",
+        description: "Arithmetic on i128 values can silently overflow; use checked/saturating/wrapping variants.",
+        confidence: "medium",
+        limitations: &[
+            "Only checks i128 bindings declared as function parameters; does not track local let bindings or struct fields",
+            "Does not inspect arithmetic inside macro expansions",
+        ],
+    },
+    RuleMeta {
+        id: "missing-ttl-bump",
+        severity: "warning",
+        description: "Storage reads without extend_ttl can expire prematurely.",
+        confidence: "low",
+        limitations: &[
+            "Heuristic token match on body source; does not track storage key equivalence between read and extend_ttl",
+            "Does not detect TTL bumps performed in helper functions or separate transactions",
+            "Does not check instance storage (.instance().get(...))",
+        ],
+    },
+    RuleMeta {
+        id: "broad-mock-all-auths",
+        severity: "warning",
+        description: "Test functions using mock_all_auths() bypass auth checks entirely.",
+        confidence: "high",
+        limitations: &[
+            "Cannot detect calls generated through external test macros or helper functions outside test modules",
+        ],
+    },
+    RuleMeta {
+        id: "ignored-token-transfer-result",
+        severity: "warning",
+        description: "Token transfer operations can fail; their results must be handled.",
+        confidence: "medium",
+        limitations: &[
+            "Syntactic heuristic matching transfer/transfer_from; does not perform type resolution for non-token types",
+            "Assigning result to an unused variable (let _ = ...) bypasses detection",
+        ],
+    },
+    RuleMeta {
+        id: "missing-positive-amount-validation",
+        severity: "warning",
+        description: "Signed amount parameters should be validated against zero.",
+        confidence: "low",
+        limitations: &[
+            "Only inspects parameters containing 'amount' in their identifier name",
+            "Token search on body source does not evaluate execution flow or branching",
+            "Validation performed in helper functions is not recognized",
+        ],
+    },
+    RuleMeta {
+        id: "unchecked-timestamp-arithmetic",
+        severity: "warning",
+        description: "Timestamp arithmetic can overflow and cause silent failures.",
+        confidence: "low",
+        limitations: &[
+            "Crude substring match on 'timestamp'; flags any arithmetic in a function containing 'timestamp' even on unrelated counters",
+            "Does not perform semantic type checking on timestamp variables",
+        ],
+    },
+];
+
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time",
         remediation: "Use checked arithmetic (.checked_add, .checked_sub) on ledger timestamps and validate bounds to prevent timestamp overflow or underflow.",
     },
@@ -1014,8 +1178,13 @@ fn explain_rule(rule: &str) -> Result<(), CliError> {
 fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     match format {
         AuditOutputFormat::Text => {
-            println!("{:<40} {:<10} DESCRIPTION", "RULE", "SEVERITY");
+            println!("{:<36} {:<10} {:<12} DESCRIPTION", "RULE", "SEVERITY", "CONFIDENCE");
             println!("{}", "-".repeat(100));
+            for rule in RULES {
+                println!("{:<36} {:<10} {:<12} {}", rule.id, rule.severity, rule.confidence, rule.description);
+                for lim in rule.limitations {
+                    println!("    * limitation: {lim}");
+                }
             for rule in RULE_REGISTRY {
                 println!("{:<40} {:<10} {}", rule.id, rule.severity, rule.description);
             }
@@ -1029,6 +1198,9 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
                     serde_json::json!({
                         "id": rule.id,
                         "severity": rule.severity,
+                        "confidence": rule.confidence,
+                        "description": rule.description,
+                        "limitations": rule.limitations,
                         "description": rule.description,
                         "remediation": rule.remediation,
                     })
@@ -1057,6 +1229,10 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
                         "defaultConfiguration": {
                             "level": sarif_level(rule.severity)
                         },
+                        "properties": {
+                            "confidence": rule.confidence,
+                            "limitations": rule.limitations,
+                        }
                     })
                 })
                 .collect();
@@ -1075,6 +1251,149 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     }
 }
 
+/// Count visible character width of a string, ignoring ANSI escape sequences.
+/// Wide characters are counted as 1 character width.
+pub fn visible_width(s: &str) -> usize {
+    let mut count = 0;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Wraps the human-readable message part of a finding at word boundaries,
+/// leaving the location prefix intact on line 1, and indenting continuation
+/// lines with 4 spaces. Unbreakable tokens longer than the width are not split.
+pub fn wrap_finding_message(
+    prefix: &str,
+    message: &str,
+    width: Option<usize>,
+) -> String {
+    let Some(max_width) = width else {
+        return format!("{prefix}{message}\n");
+    };
+
+    let words: Vec<&str> = message.split_whitespace().collect();
+    if words.is_empty() {
+        return format!("{prefix}\n");
+    }
+
+    let prefix_vis = visible_width(prefix);
+    let indent = "    ";
+    let indent_vis = 4;
+
+    let mut result = String::new();
+    let mut current_line = String::new();
+    let mut current_vis = 0;
+
+    let first_word = words[0];
+    let first_word_vis = visible_width(first_word);
+
+    if prefix_vis + first_word_vis <= max_width {
+        current_line.push_str(prefix);
+        current_line.push_str(first_word);
+        current_vis = prefix_vis + first_word_vis;
+    } else {
+        result.push_str(prefix.trim_end());
+        result.push('\n');
+        current_line.push_str(indent);
+        current_line.push_str(first_word);
+        current_vis = indent_vis + first_word_vis;
+    }
+
+    for &word in &words[1..] {
+        let w_vis = visible_width(word);
+        if current_vis + 1 + w_vis > max_width {
+            result.push_str(&current_line);
+            result.push('\n');
+            current_line.clear();
+            current_line.push_str(indent);
+            current_line.push_str(word);
+            current_vis = indent_vis + w_vis;
+        } else {
+            current_line.push(' ');
+            current_line.push_str(word);
+            current_vis += 1 + w_vis;
+        }
+    }
+
+    if !current_line.is_empty() {
+        result.push_str(&current_line);
+        result.push('\n');
+    }
+
+    result
+}
+
+fn validate_width_str(val: &str) -> Result<usize, CliError> {
+    match val.parse::<isize>() {
+        Ok(n) if n >= 20 && n <= 1000 => Ok(n as usize),
+        _ => Err(CliError(format!(
+            "invalid width `{val}`: width must be an integer between 20 and 1000 characters; specify a value in that range"
+        ))),
+    }
+}
+
+fn resolve_width(cli_width: &Option<String>, config: &AuditConfig) -> Result<Option<usize>, CliError> {
+    if let Some(w) = cli_width {
+        return validate_width_str(w).map(Some);
+    }
+    if let Some(val) = &config.width {
+        match val {
+            toml::Value::Integer(n) => {
+                if *n >= 20 && *n <= 1000 {
+                    return Ok(Some(*n as usize));
+                } else {
+                    return Err(CliError(format!(
+                        "invalid width `{n}`: width must be an integer between 20 and 1000 characters; specify a value in that range"
+                    )));
+                }
+            }
+            toml::Value::String(s) => {
+                return validate_width_str(s).map(Some);
+            }
+            other => {
+                return Err(CliError(format!(
+                    "invalid width `{other}`: width must be an integer between 20 and 1000 characters; specify a value in that range"
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Determines whether ANSI color codes should be emitted for text output.
+///
+/// Precedence:
+/// 1. The `--no-color` command line flag (if `true`, color is off).
+/// 2. The `NO_COLOR` environment variable (if set and non-empty, color is off).
+/// 3. Automatic detection: `CLICOLOR_FORCE` environment variable (if set and != "0",
+///    color is forced on), otherwise terminal detection (`std::io::stdout().is_terminal()`).
+pub fn should_color(no_color_flag: bool) -> bool {
+    if no_color_flag {
+        return false;
+    }
+    if let Ok(val) = std::env::var("NO_COLOR") {
+        if !val.is_empty() {
+            return false;
+        }
+    }
+    if let Ok(force) = std::env::var("CLICOLOR_FORCE") {
+        if force != "0" {
+            return true;
+        }
+    }
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
 /// Counts of findings for a single rule within a severity level.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleFindingCount {
@@ -1203,6 +1522,42 @@ impl<'a> DiagnosticRenderer<'a> {
         }
     }
 
+    /// Render only the summary line and heuristics disclaimer notes.
+    pub fn render_text_summary(&self) -> String {
+        self.render_text_summary_colored(false)
+    }
+
+    /// Render only the summary line and heuristics disclaimer notes with optional ANSI color.
+    pub fn render_text_summary_colored(&self, color: bool) -> String {
+        if self.findings.is_empty() {
+            if color {
+                format!(
+                    "\x1b[1;32maudit: no findings\x1b[0m\n\x1b[1;36mnote:\x1b[0m {MACRO_SOURCE_LIMITATION}\n\x1b[1;36mnote:\x1b[0m {FINDING_NATURE}\n"
+                )
+            } else {
+                format!(
+                    "audit: no findings\nnote: {MACRO_SOURCE_LIMITATION}\nnote: {FINDING_NATURE}\n"
+                )
+            }
+        } else if color {
+            format!(
+                "\x1b[1m{} finding(s).\x1b[0m soroban-testkit audit is a linter with seven heuristics, not a \
+                 security product — a missing finding is not a security guarantee.\n\
+                 \x1b[1;36mnote:\x1b[0m {FINDING_NATURE}\n\
+                 \x1b[1;36mnote:\x1b[0m {MACRO_SOURCE_LIMITATION}\n",
+                self.findings.len()
+            )
+        } else {
+            format!(
+                "{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
+                 security product — a missing finding is not a security guarantee.\n\
+                 note: {FINDING_NATURE}\n\
+                 note: {MACRO_SOURCE_LIMITATION}\n",
+                self.findings.len()
+            )
+        }
+    }
+
     /// Render compiler-style human-readable text diagnostics.
     ///
     /// Every finding carries the offending source line (`-->`), with ANSI
@@ -1210,14 +1565,47 @@ impl<'a> DiagnosticRenderer<'a> {
     /// copied snippet can never inject terminal output. Each finding is a
     /// heuristic signal, spelled out in the closing note.
     pub fn render_text(&self) -> String {
+        self.render_text_colored(false)
+    }
+
+    /// Render compiler-style human-readable text diagnostics with optional ANSI color.
+    pub fn render_text_colored(&self, color: bool) -> String {
+        self.render_text_colored_with_width(color, None)
+    }
+
+    /// Render compiler-style human-readable text diagnostics with optional ANSI color and configurable width.
+    pub fn render_text_colored_with_width(&self, color: bool, width: Option<usize>) -> String {
         if self.findings.is_empty() {
-            return format!(
-                "audit: no findings\nnote: {MACRO_SOURCE_LIMITATION}\nnote: {FINDING_NATURE}\n"
-            );
+            return self.render_text_summary_colored(color);
         }
 
         let mut output = String::new();
         for finding in self.findings {
+            let prefix = if color {
+                let sev_str = match finding.severity.as_str() {
+                    "error" => "\x1b[1;31m[error]\x1b[0m",
+                    "warning" => "\x1b[1;33m[warning]\x1b[0m",
+                    _ => &format!("\x1b[1;34m[{}]\x1b[0m", finding.severity),
+                };
+                format!(
+                    "\x1b[1m{}:{}:\x1b[0m {} \x1b[1;36m{}:\x1b[0m ",
+                    display_audit_path(&finding.file),
+                    finding.line,
+                    sev_str,
+                    finding.rule,
+                )
+            } else {
+                format!(
+                    "{}:{}: [{}] {}: ",
+                    display_audit_path(&finding.file),
+                    finding.line,
+                    finding.severity,
+                    finding.rule,
+                )
+            };
+
+            output.push_str(&wrap_finding_message(&prefix, &finding.message, width));
+
             let loc = match finding.end_line {
                 Some(end) if end > finding.line => {
                     format!("{}:{}:-{}:", display_audit_path(&finding.file), finding.line, end)
@@ -1232,7 +1620,11 @@ impl<'a> DiagnosticRenderer<'a> {
                 finding.message
             ));
             if let Some(snippet) = &finding.source_snippet {
-                output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
+                if color {
+                    output.push_str(&format!("    \x1b[1;34m-->\x1b[0m {}\n", sanitize_snippet(snippet)));
+                } else {
+                    output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
+                }
             }
             if let Some(rule) = find_rule(finding.rule) {
                 if !rule.remediation.is_empty() {
@@ -1242,6 +1634,8 @@ impl<'a> DiagnosticRenderer<'a> {
                 }
             }
         }
+        output.push('\n');
+        output.push_str(&self.render_text_summary_colored(color));
         output.push_str(&format!(
             "\n{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
              security product — a missing finding is not a security guarantee.\n",
@@ -1328,6 +1722,8 @@ impl<'a> DiagnosticRenderer<'a> {
         let rules: Vec<_> = rule_ids
             .into_iter()
             .map(|rule| {
+                let meta = RULES.iter().find(|m| m.id == rule);
+                let description = meta.map(|m| m.description);
                 let description = find_rule(rule).map(|r| r.description);
                 // The metadata level mirrors the level this scan gives the
                 // rule's findings: a config override takes effect, and with
@@ -1339,6 +1735,7 @@ impl<'a> DiagnosticRenderer<'a> {
                     .iter()
                     .find(|finding| finding.rule == rule)
                     .map(|finding| finding.severity.as_str())
+                    .or_else(|| meta.map(|m| m.severity));
                     .or_else(|| find_rule(rule).map(|r| r.severity));
                 let mut rule_obj = serde_json::json!({
                     "id": rule,
@@ -1350,6 +1747,12 @@ impl<'a> DiagnosticRenderer<'a> {
                 if let Some(severity) = effective_severity {
                     rule_obj["defaultConfiguration"] =
                         serde_json::json!({ "level": sarif_level(severity) });
+                }
+                if let Some(m) = meta {
+                    rule_obj["properties"] = serde_json::json!({
+                        "confidence": m.confidence,
+                        "limitations": m.limitations,
+                    });
                 }
                 rule_obj
             })
@@ -3679,5 +4082,110 @@ mod tests {
             messages,
             vec!["fn f takes `amount1`", "fn f takes `amount2`"]
         );
+    }
+
+    #[test]
+    fn test_renderer_color_and_no_color() {
+        let findings = vec![sample_finding(
+            "a.rs",
+            10,
+            "missing-require-auth",
+            "fn withdraw needs auth",
+        )];
+        let renderer = DiagnosticRenderer::new(&findings);
+        let colored = renderer.render_text_colored(true);
+        let plain = renderer.render_text_colored(false);
+
+        assert!(colored.contains("\x1b["), "colored text must contain ANSI escape codes");
+        assert!(!plain.contains("\x1b["), "plain text must not contain ANSI escape codes");
+
+        let summary_colored = renderer.render_text_summary_colored(true);
+        let summary_plain = renderer.render_text_summary_colored(false);
+
+        assert!(summary_colored.contains("\x1b["), "colored summary must contain ANSI escape codes");
+        assert!(!summary_plain.contains("\x1b["), "plain summary must not contain ANSI escape codes");
+
+        let empty_renderer = DiagnosticRenderer::new(&[]);
+        assert!(empty_renderer.render_text_summary_colored(true).contains("\x1b["));
+        assert!(!empty_renderer.render_text_summary_colored(false).contains("\x1b["));
+    }
+
+    #[test]
+    fn test_should_color_flag_precedence() {
+        assert!(!should_color(true));
+    }
+
+    #[test]
+    fn test_width_wrapping_and_validation() {
+        let prefix = "src/lib.rs:1: [warning] rule: "; // 30 chars
+        let message = "one two three four five six seven";
+
+        // No width: single line
+        let no_wrap = wrap_finding_message(prefix, message, None);
+        assert_eq!(no_wrap, format!("{prefix}{message}\n"));
+
+        // Width 40: "src/lib.rs:1: [warning] rule: one two\n    three four\n    five six\n    seven\n"
+        let wrapped_40 = wrap_finding_message(prefix, message, Some(40));
+        for line in wrapped_40.lines() {
+            assert!(visible_width(line) <= 40, "line exceeds width 40: {line}");
+        }
+
+        // Exact fit vs one character over
+        // prefix is 30. "hello" is 5. Total = 35.
+        let fit = wrap_finding_message(prefix, "hello", Some(35));
+        assert_eq!(fit.lines().count(), 1, "exact fit must not wrap: {fit}");
+
+        // "hello!" is 6. Total = 36. At width 35, it wraps!
+        let one_over = wrap_finding_message(prefix, "hello!", Some(35));
+        assert_eq!(one_over.lines().count(), 2, "one over must wrap: {one_over}");
+
+        // Unbreakable token longer than width is not split
+        let long_token = "verylongunbreakabletokenlongerthanwidth";
+        let wrapped_token = wrap_finding_message(prefix, long_token, Some(25));
+        assert!(wrapped_token.contains(long_token), "token must not be split: {wrapped_token}");
+
+        // Width smaller than prefix
+        let small_width = wrap_finding_message(prefix, "a b c", Some(20));
+        let lines: Vec<_> = small_width.lines().collect();
+        assert_eq!(lines[0], prefix.trim_end(), "prefix must remain intact on line 1");
+        assert!(lines[1].starts_with("    "), "continuation line must be indented");
+
+        // Colored prefix wraps at identical word boundaries
+        let colored_prefix = "\x1b[1msrc/lib.rs:1:\x1b[0m \x1b[1;33m[warning]\x1b[0m rule: ";
+        let wrapped_colored = wrap_finding_message(colored_prefix, message, Some(40));
+        let plain_lines: Vec<_> = wrapped_40.lines().collect();
+        let colored_lines: Vec<_> = wrapped_colored.lines().collect();
+        assert_eq!(plain_lines.len(), colored_lines.len());
+
+        // Multi-byte Unicode characters counted as 1
+        assert_eq!(visible_width("雪花"), 2);
+
+        // Validation of invalid width values
+        assert!(validate_width_str("0").is_err());
+        assert!(validate_width_str("-5").is_err());
+        assert!(validate_width_str("abc").is_err());
+        assert!(validate_width_str("10000").is_err());
+        assert!(validate_width_str("80").is_ok());
+    }
+
+    #[test]
+    fn test_rule_registry_confidence_and_limitations() {
+        let valid_confidence = ["high", "medium", "low", "not assessed"];
+        for rule in RULES {
+            assert!(
+                valid_confidence.contains(&rule.confidence),
+                "rule {} has invalid confidence level '{}'",
+                rule.id,
+                rule.confidence
+            );
+            assert!(
+                !rule.limitations.is_empty(),
+                "rule {} must have at least one limitation or 'none known'",
+                rule.id
+            );
+            for lim in rule.limitations {
+                assert!(!lim.trim().is_empty(), "rule {} has empty limitation string", rule.id);
+            }
+        }
     }
 }

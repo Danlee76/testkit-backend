@@ -104,6 +104,15 @@ soroban-testkit limits --contract target/wasm32v1-none/release/my_contract.wasm 
 # signed amount parameters with no positive-value validation.
 soroban-testkit audit ./src --strict
 
+# Print only the audit summary without individual finding details.
+soroban-testkit audit ./src --summary-only
+
+# Disable ANSI color escape codes (also honors NO_COLOR env var).
+soroban-testkit audit ./src --no-color
+
+# Wrap text findings to a specified character width (e.g. 80 columns).
+soroban-testkit audit ./src --width 80
+
 # Stable machine-readable reports for automation and GitHub code scanning.
 soroban-testkit audit ./src --format json
 soroban-testkit audit ./src --format sarif > audit.sarif
@@ -213,6 +222,34 @@ unexamined. A clean report does not certify generated code. The limitation
 is included in text, JSON (`summary.limitations`) and SARIF
 (`runs[].properties.limitations`) results. Inspect expanded source
 separately when generated code matters.
+
+### Rule Confidence & Known Limitations
+
+`soroban-testkit audit` is a heuristic linter, not a formal verification or security auditing tool. Rules have varying precision depending on their analysis technique.
+
+#### Confidence Scale
+- **High**: Direct syntactic match for a specific API call or unambiguous pattern. Minimal false positives within evaluated AST.
+- **Medium**: AST-based pattern matching over types and expressions within a single function. Limited by lack of cross-function, cross-crate, or macro expansion analysis.
+- **Low**: String or token pattern heuristic (substring search, identifier naming convention). Prone to false positives and negatives due to lack of type and execution flow analysis.
+- **Not Assessed**: The rule's precision and edge cases have not been formally evaluated.
+
+#### Rule Registry
+| Rule | Severity | Confidence | Primary Known Limitations |
+| --- | --- | --- | --- |
+| `missing-require-auth` | warning | medium | Cannot inspect macro expansions; auth validation in private helper functions without recognized auth stems is missed; no cross-file call graph analysis. |
+| `unchecked-i128-arithmetic` | warning | medium | Only checks `i128` bindings declared as function parameters; does not track local `let` bindings or struct fields; cannot inspect macros. |
+| `missing-ttl-bump` | warning | low | Heuristic token match on body source; does not track key equivalence between read and extend_ttl; misses TTL bumps in helper functions; ignores instance storage. |
+| `broad-mock-all-auths` | warning | high | Cannot detect calls generated through external test macros or helper functions outside test modules. |
+| `ignored-token-transfer-result` | warning | medium | Syntactic heuristic matching transfer methods without type resolution; binding to an unused variable (`let _ = ...`) bypasses detection. |
+| `missing-positive-amount-validation` | warning | low | Only inspects parameters named `*amount*`; does not evaluate branching or execution flow; helper validation missed. |
+| `unchecked-timestamp-arithmetic` | warning | low | Substring match on `timestamp`; flags any arithmetic in a function mentioning timestamp even on unrelated counters; no semantic type checking. |
+
+To inspect metadata, confidence, and limitations for any rule from the CLI, run:
+```sh
+soroban-testkit audit explain <rule>
+soroban-testkit audit rules
+soroban-testkit audit rules --format json
+```
 
 ## Status
 
