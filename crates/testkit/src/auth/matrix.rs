@@ -7,6 +7,9 @@ type InvokeFn<'a> = Box<dyn Fn(&Address) -> Result<(), soroban_sdk::Error> + 'a>
 struct EntryPointSpec<'a> {
     name: String,
     allowed: Vec<Address>,
+    // Optional per-cell error expectations. This lets callers assert the
+    // contract returned the right authorization error, not merely any error.
+    expected_errors: Vec<(Address, String)>,
     invoke: InvokeFn<'a>,
 }
 
@@ -79,6 +82,55 @@ impl<'a> AuthMatrix<'a> {
         self.entry_points.push(EntryPointSpec {
             name: name.to_string(),
             allowed: allowed.to_vec(),
+            expected_errors: Vec::new(),
+            invoke: Box::new(invoke),
+        });
+        self
+    }
+
+    /// Validate that a contract actor set is fully represented by the matrix.
+    ///
+    /// This is useful for contracts with several participant categories, such
+    /// as escrow streams (payer, recipient, operator) and recurring contracts
+    /// (owner, beneficiary, scheduler). Every supplied actor must be listed in
+    /// at least one entry point so it participates in the cross-product.
+    pub fn validate_against(&self, actors: &[Address]) -> Result<(), TestkitError> {
+        let known = self.known_actors();
+        let missing: Vec<String> = actors
+            .iter()
+            .filter(|actor| !known.contains(actor))
+            .map(|actor| format!("{actor:?}"))
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(TestkitError::AssertionFailed(format!(
+                "auth matrix is missing {} actor(s): {}",
+                missing.len(),
+                missing.join(", "),
+            )))
+        }
+    }
+
+    /// Register an entry point with expected error text for selected caller cells.
+    ///
+    /// The expected text is matched against the debug and display forms of the
+    /// returned Soroban error. This is useful when an escrow stream and a
+    /// recurring contract intentionally use different authorization errors.
+    pub fn entry_point_with_expected_errors(
+        mut self,
+        name: &str,
+        allowed: &[Address],
+        expected_errors: &[(Address, &str)],
+        invoke: impl Fn(&Address) -> Result<(), soroban_sdk::Error> + 'a,
+    ) -> Self {
+        self.entry_points.push(EntryPointSpec {
+            name: name.to_string(),
+            allowed: allowed.to_vec(),
+            expected_errors: expected_errors
+                .iter()
+                .map(|(address, error)| (address.clone(), (*error).to_string()))
+                .collect(),
             invoke: Box::new(invoke),
         });
         self
@@ -189,10 +241,31 @@ impl<'a> AuthMatrix<'a> {
                 // Reset auth state before invoking this actor case so that
                 // previously mocked or recorded auths do not leak into it.
                 self.reset_auth();
-                let actual = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    (ep.invoke)(addr).is_ok()
-                }))
-                .unwrap_or(false);
+                // Isolate every cell: a panic must not prevent later
+                // callers from being checked.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (ep.invoke)(addr)
+                }));
+                let actual = matches!(&outcome, Ok(Ok(())));
+                let error_text = match &outcome {
+                    Ok(Err(error)) => Some(format!("{error:?} / {error}")),
+                    Err(_) => Some("invocation panicked".to_string()),
+                    _ => None,
+                };
+                let expected_error = ep
+                    .expected_errors
+                    .iter()
+                    .find(|(actor, _)| actor == addr)
+                    .map(|(_, text)| text.as_str());
+                let error_matches = expected_error
+                    .map(|expected| error_text.as_deref().is_some_and(|actual| actual.contains(expected)))
+                    .unwrap_or(true);
+                let cell_matches = if expected {
+                    actual && expected_error.is_none()
+                } else {
+                    !actual && error_matches
+                };
+
                 // Reset auth state immediately after invocation to keep the
                 // slate clean for the next actor case.
                 self.reset_auth();
@@ -201,18 +274,18 @@ impl<'a> AuthMatrix<'a> {
                     "    {addr:?}: expected={} actual={}{}\n",
                     if expected { "pass" } else { "reject" },
                     if actual { "pass" } else { "reject" },
-                    if expected == actual {
-                        ""
-                    } else {
-                        "  <-- MISMATCH"
-                    },
+                    if cell_matches { "" } else { "  <-- MISMATCH" },
                 ));
-                if expected != actual {
+                if !cell_matches {
                     violations.push(format!(
-                        "entry point {:?}: caller {addr:?} expected to {} but {}",
+                        "entry point {:?}: caller {addr:?} expected {} but observed {}",
                         ep.name,
-                        if expected { "succeed" } else { "be rejected" },
-                        if actual { "succeeded" } else { "was rejected" },
+                        if expected {
+                            "success".to_string()
+                        } else {
+                            format!("error containing {:?}", expected_error.unwrap_or("an error"))
+                        },
+                        error_text.unwrap_or_else(|| "success".to_string()),
                     ));
                 }
             }
@@ -557,4 +630,50 @@ mod tests {
         let env = TestEnv::new();
         env.assert_requires_auth(|| {});
     }
+    #[test]
+    fn a_panicking_cell_does_not_skip_remaining_cells() {
+        let env = TestEnv::new();
+        let first = env.address();
+        let second = env.address();
+        let calls = std::cell::Cell::new(0u32);
+        let matrix = AuthMatrix::new(&env).entry_point(
+            "panic_then_continue",
+            &[first.clone(), second.clone()],
+            |caller| {
+                calls.set(calls.get() + 1);
+                if *caller == first {
+                    panic!("simulated contract panic");
+                }
+                Ok(())
+            },
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            matrix.assert_enforced();
+        }));
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 2, "all matrix cells must be attempted");
+    }
+
+    #[test]
+    fn expected_error_text_is_checked_per_caller_cell() {
+        let env = TestEnv::new();
+        let allowed = env.address();
+        let denied = env.address();
+        AuthMatrix::new(&env)
+            .entry_point_with_expected_errors(
+                "role_guard",
+                std::slice::from_ref(&allowed),
+                &[(denied.clone(), "Contract")],
+                move |caller| {
+                    if *caller == allowed {
+                        Ok(())
+                    } else {
+                        Err(soroban_sdk::Error::from_contract_error(1))
+                    }
+                },
+            )
+            .assert_enforced();
+    }
+
 }
