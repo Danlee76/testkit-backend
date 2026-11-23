@@ -3169,6 +3169,196 @@ fn audit_text_output_keeps_prefix() {
     assert!(text.contains("src/lib.rs:3:"), "must keep src/lib.rs:3: prefix: {text}");
 }
 
+#[test]
+fn audit_baseline_suppresses_matching_findings_and_reports_new_ones() {
+    let fixture = AuditFixture::new("baseline-filter");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+#[contractimpl]
+impl Contract {
+    pub fn withdraw(env: Env, from: Address) {
+        env.storage().instance().set(&from, &1i128);
+    }
+
+    pub fn deposit(env: Env, to: Address) {
+        env.storage().instance().set(&to, &1i128);
+    }
+}
+"#,
+    );
+    fixture.write(
+        "baseline.json",
+        r#"[
+  {
+    "file": "./crates/vault/src/lib.rs",
+    "line": 4,
+    "rule": "missing-require-auth"
+  }
+]"#,
+    );
+
+    let output = fixture.scan(&["--baseline", "baseline.json", "--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1, "{report}");
+    assert_eq!(report["findings"][0]["line"], 8);
+    assert_eq!(report["findings"][0]["rule"], "missing-require-auth");
+}
+
+#[test]
+fn audit_baseline_suppresses_stdin_findings() {
+    let fixture = AuditFixture::new("baseline-stdin");
+    let baseline = fixture.write(
+        "baseline.json",
+        r#"[{"file":"<stdin>","line":4,"rule":"missing-require-auth"}]"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"))
+        .args([
+            "audit",
+            "-",
+            "--baseline",
+            baseline.to_str().unwrap(),
+            "--format",
+            "json",
+            "--strict",
+        ])
+        .current_dir(&fixture.0)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            std::io::Write::write_all(
+                child.stdin.as_mut().unwrap(),
+                UNAUTHORIZED_ENTRY_POINT.as_bytes(),
+            )?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 0, "{report}");
+}
+
+#[test]
+fn audit_baseline_rejects_invalid_entry_fields_actionably() {
+    let fixture = AuditFixture::new("baseline-invalid-entry");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        "baseline.json",
+        r#"[{"file":"crates/vault/src/lib.rs","line":0,"rule":"missing-require-auth"}]"#,
+    );
+
+    let output = fixture.scan(&["--baseline", "baseline.json"]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("baseline.json"), "{stderr}");
+    assert!(stderr.contains("line"), "{stderr}");
+}
+
+#[test]
+fn audit_stdin_reports_findings_in_all_formats_and_respects_strict() {
+    for format in ["text", "json", "sarif"] {
+        let output = run_with_stdin(
+            &["audit", "-", "--format", format, "--strict"],
+            UNAUTHORIZED_ENTRY_POINT.as_bytes(),
+        );
+        assert!(!output.status.success(), "{format}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        match format {
+            "text" => {
+                assert!(stdout.contains("<stdin>:"), "{stdout}");
+                assert!(stdout.contains("missing-require-auth"), "{stdout}");
+            }
+            "json" => {
+                let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(report["summary"]["files_scanned"], 1);
+                assert_eq!(report["summary"]["finding_count"], 1);
+                assert_eq!(report["findings"][0]["file"], "<stdin>");
+                assert_eq!(report["findings"][0]["rule"], "missing-require-auth");
+            }
+            "sarif" => {
+                let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                let results = report["runs"][0]["results"].as_array().unwrap();
+                assert_eq!(results.len(), 1);
+                assert_eq!(
+                    results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+                    "<stdin>"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn audit_stdin_reports_invalid_utf8_actionably() {
+    let output = run_with_stdin(&["audit", "-"], &[0xff, 0xfe, 0xfd]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stdin"), "{stderr}");
+    assert!(stderr.contains("UTF-8"), "{stderr}");
+}
+
+#[test]
+fn audit_rule_catalog_subcommands_and_flag_emit_identical_json_and_sarif() {
+    for format in ["json", "sarif"] {
+        let rules_out = run(&["audit", "rules", "--format", format]);
+        let list_rules_out = run(&["audit", "list-rules", "--format", format]);
+        let flag_out = run(&["audit", "--list-rules", "--format", format]);
+        assert!(rules_out.status.success(), "{format}: {rules_out:?}");
+        assert!(list_rules_out.status.success(), "{format}: {list_rules_out:?}");
+        assert!(flag_out.status.success(), "{format}: {flag_out:?}");
+        assert_eq!(rules_out.stdout, list_rules_out.stdout);
+        assert_eq!(rules_out.stdout, flag_out.stdout);
+    }
+
+    let unknown = run(&["audit", "explain", "does-not-exist"]);
+    assert!(!unknown.status.success(), "{unknown:?}");
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(stderr.contains("does-not-exist"), "{stderr}");
+    assert!(stderr.contains("missing-require-auth"), "{stderr}");
+}
+
+#[test]
+fn audit_preserves_workspace_relative_paths_across_formats_and_cwd() {
+    let fixture = AuditFixture::new("workspace-rel-paths");
+    fixture.write(
+        "crates/vault/Cargo.toml",
+        "[package]\nname = 'vault'\nversion = '0.1.0'\n",
+    );
+    let file = fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let from_subdir = run_from(
+        &fixture.0.join("crates/vault/src"),
+        &["audit", ".", "--format", "json"],
+    );
+    let from_root = run_from(
+        &fixture.0,
+        &["audit", "./crates/vault/src/lib.rs", "--format", "json"],
+    );
+    let from_outside = run(&["audit", file.to_str().unwrap(), "--format", "json"]);
+
+    for output in [&from_subdir, &from_root, &from_outside] {
+        assert!(output.status.success(), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["findings"][0]["file"], "crates/vault/src/lib.rs");
+    }
+
+    let sarif_out = run_from(
+        &fixture.0.join("crates/vault"),
+        &["audit", "src/lib.rs", "--format", "sarif"],
+    );
+    assert!(sarif_out.status.success(), "{sarif_out:?}");
+    let sarif: serde_json::Value = serde_json::from_slice(&sarif_out.stdout).unwrap();
+    assert_eq!(
+        sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]
+            ["uri"],
+        "crates/vault/src/lib.rs"
+    );
+}
+
 
 
 
