@@ -156,13 +156,6 @@ impl<'a> AuthMatrix<'a> {
         self
     }
 
-    /// Attach a human-readable role name to an actor.
-    pub fn role(mut self, actor: &Address, name: &str) -> Self {
-        self.roles.retain(|(address, _)| address != actor);
-        self.roles.push((actor.clone(), name.to_string()));
-        self
-    }
-
     /// Validate that every supplied contract actor is represented in the matrix.
     pub fn validate_against(&self, actors: &[Address]) -> Result<(), TestkitError> {
         let known = self.known_actors();
