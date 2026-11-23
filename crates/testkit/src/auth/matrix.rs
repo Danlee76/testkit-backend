@@ -606,4 +606,50 @@ mod tests {
         let env = TestEnv::new();
         env.assert_requires_auth(|| {});
     }
+    #[test]
+    fn a_panicking_cell_does_not_skip_remaining_cells() {
+        let env = TestEnv::new();
+        let first = env.address();
+        let second = env.address();
+        let calls = std::cell::Cell::new(0u32);
+        let matrix = AuthMatrix::new(&env).entry_point(
+            "panic_then_continue",
+            &[first.clone(), second.clone()],
+            |caller| {
+                calls.set(calls.get() + 1);
+                if *caller == first {
+                    panic!("simulated contract panic");
+                }
+                Ok(())
+            },
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            matrix.assert_enforced();
+        }));
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 2, "all matrix cells must be attempted");
+    }
+
+    #[test]
+    fn expected_error_text_is_checked_per_caller_cell() {
+        let env = TestEnv::new();
+        let allowed = env.address();
+        let denied = env.address();
+        AuthMatrix::new(&env)
+            .entry_point_with_expected_errors(
+                "role_guard",
+                std::slice::from_ref(&allowed),
+                &[(denied.clone(), "not authorized")],
+                move |caller| {
+                    if *caller == allowed {
+                        Ok(())
+                    } else {
+                        Err(soroban_sdk::Error::from_contract_error(1))
+                    }
+                },
+            )
+            .assert_enforced();
+    }
+
 }
