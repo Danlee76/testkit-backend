@@ -1049,9 +1049,13 @@ fn audit_explain_rules_document_the_heuristic_nature_of_findings() {
         "missing-require-auth",
         "unchecked-i128-arithmetic",
         "missing-ttl-bump",
+        "storage-write-missing-ttl",
         "broad-mock-all-auths",
+        "ignored-contract-call-result",
         "ignored-token-transfer-result",
         "missing-positive-amount-validation",
+        "unchecked-amount-division",
+        "unchecked-narrowing-conversion",
         "unchecked-timestamp-arithmetic",
     ] {
         let output = run(&["audit", "explain", rule]);
@@ -1884,15 +1888,19 @@ fn audit_color_no_color_flag_removes_ansi_codes() {
 fn audit_list_rules_subcommand_and_flag_list_all_registered_rules() {
     let expected_rules = [
         "broad-mock-all-auths",
+        "ignored-contract-call-result",
         "ignored-token-transfer-result",
         "missing-positive-amount-validation",
         "missing-require-auth",
         "missing-ttl-bump",
+        "storage-write-missing-ttl",
+        "unchecked-amount-division",
         "unchecked-i128-arithmetic",
+        "unchecked-narrowing-conversion",
         "unchecked-timestamp-arithmetic",
     ];
     // Exact count check to prevent silent rule additions/removals without test updates
-    assert_eq!(expected_rules.len(), 7);
+    assert_eq!(expected_rules.len(), 11);
 
     for invocation in [&["audit", "list-rules"][..], &["audit", "--list-rules"][..]] {
         let output = run(invocation);
@@ -1932,11 +1940,15 @@ fn audit_list_rules_subcommand_and_flag_list_all_registered_rules() {
 fn audit_list_rules_structured_formats() {
     let expected_rules = [
         "broad-mock-all-auths",
+        "ignored-contract-call-result",
         "ignored-token-transfer-result",
         "missing-positive-amount-validation",
         "missing-require-auth",
         "missing-ttl-bump",
+        "storage-write-missing-ttl",
+        "unchecked-amount-division",
         "unchecked-i128-arithmetic",
+        "unchecked-narrowing-conversion",
         "unchecked-timestamp-arithmetic",
     ];
 
@@ -1945,9 +1957,9 @@ fn audit_list_rules_structured_formats() {
     assert!(json_output.status.success(), "{json_output:?}");
     let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
     assert_eq!(report["tool"], "soroban-testkit");
-    assert_eq!(report["summary"]["rule_count"], 7);
+    assert_eq!(report["summary"]["rule_count"], 11);
     let rules = report["rules"].as_array().expect("rules array");
-    assert_eq!(rules.len(), 7);
+    assert_eq!(rules.len(), 11);
     for (i, expected_id) in expected_rules.iter().enumerate() {
         assert_eq!(rules[i]["id"], *expected_id);
         assert!(!rules[i]["description"].as_str().unwrap().is_empty());
@@ -1961,7 +1973,7 @@ fn audit_list_rules_structured_formats() {
     let sarif_rules = sarif["runs"][0]["tool"]["driver"]["rules"]
         .as_array()
         .expect("sarif rules array");
-    assert_eq!(sarif_rules.len(), 7);
+    assert_eq!(sarif_rules.len(), 11);
     for (i, expected_id) in expected_rules.iter().enumerate() {
         assert_eq!(sarif_rules[i]["id"], *expected_id);
     }
@@ -3367,6 +3379,128 @@ fn audit_preserves_workspace_relative_paths_across_formats_and_cwd() {
             ["uri"],
         "crates/vault/src/lib.rs"
     );
+}
+
+#[test]
+fn audit_flags_unchecked_amount_division_and_allows_checked_div() {
+    let fixture = AuditFixture::new("amount-division");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+        pub fn payout(amount: u64, shares: u64) -> u64 {
+            amount / shares
+        }
+        pub fn safe_payout(amount: u64, shares: u64) -> Option<u64> {
+            amount.checked_div(shares)
+        }
+        "#,
+    );
+    let output = fixture.scan(&["--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let div_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "unchecked-amount-division")
+        .collect();
+    assert_eq!(div_findings.len(), 1, "{report}");
+    assert!(div_findings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("checked_div"));
+}
+
+#[test]
+fn audit_flags_unchecked_narrowing_conversion_and_allows_try_into() {
+    let fixture = AuditFixture::new("narrowing-conversion");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+        pub fn truncate(amount: u128) -> u64 {
+            amount as u64
+        }
+        pub fn safe_convert(amount: u128) -> Result<u64, core::num::TryFromIntError> {
+            amount.try_into()
+        }
+        "#,
+    );
+    let output = fixture.scan(&["--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let cast_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "unchecked-narrowing-conversion")
+        .collect();
+    assert_eq!(cast_findings.len(), 1, "{report}");
+    assert!(cast_findings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("try_into"));
+}
+
+#[test]
+fn audit_flags_ignored_contract_call_result_and_allows_propagated() {
+    let fixture = AuditFixture::new("ignored-contract-call");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+        pub fn bad_call(client: VaultClient) {
+            client.try_deposit(&10);
+        }
+        pub fn good_call(client: VaultClient) -> Result<(), ()> {
+            client.try_deposit(&10)?;
+            Ok(())
+        }
+        "#,
+    );
+    let output = fixture.scan(&["--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let call_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "ignored-contract-call-result")
+        .collect();
+    assert_eq!(call_findings.len(), 1, "{report}");
+    assert!(call_findings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("try_deposit"));
+}
+
+#[test]
+fn audit_flags_storage_write_missing_ttl_and_allows_neighboring_extend_ttl() {
+    let fixture = AuditFixture::new("storage-write-ttl");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+        pub fn write_without_ttl(env: Env, key: Symbol, val: i128) {
+            env.storage().persistent().set(&key, &val);
+        }
+        pub fn write_with_ttl(env: Env, key: Symbol, val: i128) {
+            env.storage().persistent().set(&key, &val);
+            env.storage().persistent().extend_ttl(&key, 100, 1000);
+        }
+        "#,
+    );
+    let output = fixture.scan(&["--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let ttl_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "storage-write-missing-ttl")
+        .collect();
+    assert_eq!(ttl_findings.len(), 1, "{report}");
+    assert!(ttl_findings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("extend_ttl"));
 }
 
 
