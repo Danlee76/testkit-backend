@@ -30,6 +30,12 @@ section, so a merge can never land without a place to record the change.
 
 ### Added
 
+- `AuthMatrix::report` runs the matrix in report-only mode: it returns a
+  `MatrixReport` of per-cell `CellResult`s (entry point, caller, role,
+  allowed, expected error, observed `CellOutcome`) instead of panicking.
+  `MatrixReport::into_result` yields the same `TestkitError` that
+  `assert_enforced` panics with.
+
 - `audit --format json` lists inputs the scanner could not read or parse under
   `summary.parser_limitations`, separate from `findings`. `finding_count` is
   unchanged, and the stderr parse warnings are still printed.
@@ -116,6 +122,12 @@ section, so a merge can never land without a place to record the change.
 
 ### Changed
 
+- `AuthMatrix` failure reports state `allowed=`, `expected=` and `observed=`
+  for every failed cell, including the returned error or the panic message,
+  instead of "invocation panicked" or "expected success but observed success".
+- `AuthMatrix` documents its output ordering: cells, violations and grid
+  sections follow entry-point registration order, then known-actor
+  first-seen order.
 - A failed `soroban-testkit coverage` run now names any output files still on
   disk and states that they were not validated. Nothing is deleted on failure.
 - `AuthMatrix` failure reports now state the definition of a "known actor",
@@ -138,6 +150,12 @@ section, so a merge can never land without a place to record the change.
 
 ### Fixed
 
+- `AuthMatrix` isolates recorded authorizations between cells: a cell no
+  longer observes the `Env::auths()` recorded by the previous cell, and none
+  remain after the run.
+- `AuthMatrix` grid sections for same-named entry points each list their own
+  `denied=` addresses instead of repeating the first section's.
+- `auth/matrix.rs` compiles again after a bad merge left conflict residue.
 - Exclude `vendor/` alongside `target/` from recursive `audit` scans while
   honoring explicitly selected scan roots (#427).
 - Apply audit rules consistently to raw Rust identifiers, including types,
