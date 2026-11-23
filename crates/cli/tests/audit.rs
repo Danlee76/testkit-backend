@@ -3169,6 +3169,94 @@ fn audit_text_output_keeps_prefix() {
     assert!(text.contains("src/lib.rs:3:"), "must keep src/lib.rs:3: prefix: {text}");
 }
 
+#[test]
+fn audit_baseline_suppresses_matching_findings_and_reports_new_ones() {
+    let fixture = AuditFixture::new("baseline-filter");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+#[contractimpl]
+impl Contract {
+    pub fn withdraw(env: Env, from: Address) {
+        env.storage().instance().set(&from, &1i128);
+    }
+
+    pub fn deposit(env: Env, to: Address) {
+        env.storage().instance().set(&to, &1i128);
+    }
+}
+"#,
+    );
+    fixture.write(
+        "baseline.json",
+        r#"[
+  {
+    "file": "./crates/vault/src/lib.rs",
+    "line": 4,
+    "rule": "missing-require-auth"
+  }
+]"#,
+    );
+
+    let output = fixture.scan(&["--baseline", "baseline.json", "--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1, "{report}");
+    assert_eq!(report["findings"][0]["line"], 8);
+    assert_eq!(report["findings"][0]["rule"], "missing-require-auth");
+}
+
+#[test]
+fn audit_baseline_suppresses_stdin_findings() {
+    let fixture = AuditFixture::new("baseline-stdin");
+    let baseline = fixture.write(
+        "baseline.json",
+        r#"[{"file":"<stdin>","line":4,"rule":"missing-require-auth"}]"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"))
+        .args([
+            "audit",
+            "-",
+            "--baseline",
+            baseline.to_str().unwrap(),
+            "--format",
+            "json",
+            "--strict",
+        ])
+        .current_dir(&fixture.0)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            std::io::Write::write_all(
+                child.stdin.as_mut().unwrap(),
+                UNAUTHORIZED_ENTRY_POINT.as_bytes(),
+            )?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 0, "{report}");
+}
+
+#[test]
+fn audit_baseline_rejects_invalid_entry_fields_actionably() {
+    let fixture = AuditFixture::new("baseline-invalid-entry");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    fixture.write(
+        "baseline.json",
+        r#"[{"file":"crates/vault/src/lib.rs","line":0,"rule":"missing-require-auth"}]"#,
+    );
+
+    let output = fixture.scan(&["--baseline", "baseline.json"]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("baseline.json"), "{stderr}");
+    assert!(stderr.contains("line"), "{stderr}");
+}
+
 
 
 

@@ -132,8 +132,9 @@ pub struct AuditArgs {
     #[arg(long, value_enum, default_value_t = AuditOutputFormat::Text, global = true)]
     format: AuditOutputFormat,
     /// Path to a baseline file containing findings to ignore, relative to
-    /// the current directory. Paths inside it are relative to the workspace.
-    #[arg(long, global = true)]
+    /// the current directory. Expects a JSON array of `{"file", "line", "rule"}`
+    /// objects with workspace-relative paths (or `<stdin>`).
+    #[arg(long, value_name = "FILE", global = true)]
     baseline: Option<PathBuf>,
     /// Print only the audit summary, omitting individual finding details.
     /// Only supported with text output.
@@ -156,15 +157,11 @@ pub struct AuditArgs {
     /// patterns are specified).
     #[arg(long = "include", value_name = "GLOB", action = clap::ArgAction::Append, global = true)]
     pub include: Vec<String>,
-    /// Exclude glob patterns to filter scanned files. Can be specified multiple times.
-    /// Files matching any exclude pattern are skipped. Exclude patterns take precedence
-    /// over include patterns.
-    #[arg(long = "exclude", value_name = "GLOB", action = clap::ArgAction::Append, global = true)]
+    /// Exclude glob patterns or directory paths relative to the workspace root
+    /// from recursive scans. Repeatable. Exclude patterns take precedence over
+    /// include patterns.
+    #[arg(long = "exclude", value_name = "GLOB_OR_DIR", action = clap::ArgAction::Append, global = true)]
     pub exclude: Vec<String>,
-    /// Exclude directory path(s) relative to the workspace root from recursive scans.
-    /// Repeatable. Exact relative directory paths only (glob patterns are not supported).
-    #[arg(long = "exclude", value_name = "DIR", action = clap::ArgAction::Append, global = true)]
-    pub exclude: Vec<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -335,10 +332,6 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         ));
     }
 
-    match &args.command {
-        Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
-        Some(AuditCommand::Rules) => return list_rules(args.format),
-        None => {}
     if args.list_rules
         || matches!(
             &args.command,
@@ -354,22 +347,64 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     for pat in &args.include {
         validate_glob(pat)?;
     }
+    let mut exclude_globs = Vec::new();
+    let mut exclude_dirs = Vec::new();
     for pat in &args.exclude {
-        validate_glob(pat)?;
+        if pat.contains(['*', '?', '[', '{']) {
+            validate_glob(pat)?;
+            exclude_globs.push(pat.clone());
+        } else {
+            validate_glob(pat)?;
+            exclude_globs.push(pat.clone());
+            exclude_dirs.push(PathBuf::from(pat));
+        }
     }
 
     let stdin = args.path == Path::new("-");
     let mut parse_warnings = Vec::new();
     let mut scanned_files = 0usize;
     let mut skipped_files = 0usize;
+    let source_dir = if stdin {
+        canonical_path(&std::env::current_dir()?)?
+    } else {
+        fs::metadata(&args.path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                CliError(format!(
+                    "path {} does not exist; pass a contract crate directory, a single .rs file, \
+                     or `-` to read Rust source from stdin",
+                    args.path.display()
+                ))
+            } else {
+                CliError(format!(
+                    "failed to access scan path {}: {err}; check path permissions and re-run",
+                    args.path.display()
+                ))
+            }
+        })?;
+        let root = canonical_path(&args.path)?;
+        if root.is_dir() {
+            root
+        } else {
+            root.parent().unwrap_or(&root).to_path_buf()
+        }
+    };
+    let workspace = find_workspace_root(&source_dir);
+    let config = load_config(&source_dir, &workspace)?;
+
+    let mut raw_exclusions = config.exclude.clone();
+    raw_exclusions.extend(exclude_dirs);
+    let exclusions = normalize_and_validate_exclusions(&raw_exclusions, &workspace)?;
+
     let sources = if stdin {
         Vec::new()
     } else {
-        collect_rust_sources_filtered(
+        collect_rust_sources_filtered_with_exclusions(
             &args.path,
+            &workspace,
+            &exclusions,
             &mut parse_warnings,
             &args.include,
-            &args.exclude,
+            &exclude_globs,
         )?
     };
 
@@ -413,53 +448,8 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
         }
         return Ok(());
     }
-    let source_dir = if stdin {
-        canonical_path(&std::env::current_dir()?)?
-    } else {
-        fs::metadata(&args.path).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                CliError(format!(
-                    "path {} does not exist; pass a contract crate directory, a single .rs file, \
-                     or `-` to read Rust source from stdin",
-                    args.path.display()
-                ))
-            } else {
-                CliError(format!(
-                    "failed to access scan path {}: {err}; check path permissions and re-run",
-                    args.path.display()
-                ))
-            }
-        })?;
-        let root = canonical_path(&args.path)?;
-        if root.is_dir() {
-            root
-        } else {
-            root.parent().unwrap_or(&root).to_path_buf()
-        }
-    };
-    let workspace = find_workspace_root(&source_dir);
-    let config = load_config(&source_dir, &workspace)?;
-
-    let mut raw_exclusions = config.exclude.clone();
-    raw_exclusions.extend(args.exclude.clone());
-    let exclusions = normalize_and_validate_exclusions(&raw_exclusions, &workspace)?;
-
-    let sources = if stdin {
-        Vec::new()
-    } else {
-        collect_rust_sources_with_exclusions(
-            &args.path,
-            &workspace,
-            &exclusions,
-            &mut parse_warnings,
-        )?
-    };
     let mut baseline = load_baseline(&args.baseline)?;
-    for entry in &mut baseline {
-        entry.file = workspace_relative_path(&workspace.join(&entry.file), &workspace)
-            .to_string_lossy()
-            .into_owned();
-    }
+    normalize_baseline_entries(&mut baseline, &workspace)?;
     let mut findings = Vec::new();
 
     if stdin {
@@ -508,9 +498,6 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     } else if args.format == AuditOutputFormat::Text {
         DiagnosticRenderer::new(&findings).render_text_colored_with_width(use_color, width)
     } else {
-        render_findings_with_limitations(
-    print!(
-        "{}",
         render_findings_with_limitations_and_scanned(
             &findings,
             args.format,
@@ -880,26 +867,18 @@ fn collect_rust_sources(
     root: &Path,
     warnings: &mut Vec<CliError>,
 ) -> Result<Vec<PathBuf>, CliError> {
-    collect_rust_sources_filtered(root, warnings, &[], &[])
+    collect_rust_sources_filtered_with_exclusions(root, root, &[], warnings, &[], &[])
 }
 
-fn collect_rust_sources_filtered(
+fn collect_rust_sources_filtered_with_exclusions(
     root: &Path,
+    workspace: &Path,
+    exclusions: &[PathBuf],
     warnings: &mut Vec<CliError>,
     include_patterns: &[String],
     exclude_patterns: &[String],
 ) -> Result<Vec<PathBuf>, CliError> {
     let metadata = fs::metadata(root).map_err(|err| {
-    collect_rust_sources_with_exclusions(root, root, &[], warnings)
-}
-
-fn collect_rust_sources_with_exclusions(
-    root: &Path,
-    workspace: &Path,
-    exclusions: &[PathBuf],
-    warnings: &mut Vec<CliError>,
-) -> Result<Vec<PathBuf>, CliError> {
-    fs::metadata(root).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             CliError(format!(
                 "path {} does not exist; pass a contract crate directory, a single .rs file, \
@@ -956,10 +935,11 @@ fn collect_rust_sources_with_exclusions(
         };
         let is_rust = entry.path().extension().is_some_and(|ext| ext == "rs");
         if entry.file_type().is_file() && is_rust {
-            let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
-            let rel_str = rel.to_string_lossy();
-            if matches_filter(&rel_str, include_patterns, exclude_patterns) {
-                sources.push(entry.path().to_path_buf());
+            let rel_root = entry.path().strip_prefix(root).unwrap_or(entry.path());
+            let rel_str = rel_root.to_string_lossy();
+            if !matches_filter(&rel_str, include_patterns, exclude_patterns) {
+                continue;
+            }
             if entry.depth() == 0 && is_root_file {
                 sources.push(entry.path().to_path_buf());
             } else {
@@ -1053,23 +1033,10 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
         explanation: "unchecked-timestamp-arithmetic: Timestamp arithmetic can overflow and cause silent failures.\n\
              This rule detects + - * / operations on timestamp values without overflow protection.\n\
              Fix: Use checked arithmetic or ensure your timestamps are bounded to valid ranges.\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time"
-        }
-        _ => return Err(CliError(format!("unknown rule: {}", rule))),
-    };
-
-    let meta = RULES.iter().find(|m| m.id == rule);
-    println!("{explanation}");
-    if let Some(m) = meta {
-        println!("\nConfidence: {}", m.confidence);
-        println!("Known limitations:");
-        for lim in m.limitations {
-            println!("- {lim}");
-        }
-    }
-    println!("\nnote: {FINDING_NATURE}");
-    Ok(())
-}
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time",
+        remediation: "Use checked arithmetic (.checked_add, .checked_sub) on ledger timestamps and validate bounds to prevent timestamp overflow or underflow.",
+    },
+];
 
 /// Static metadata for an audit rule, including confidence and verified limitations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1157,21 +1124,25 @@ pub const RULES: &[RuleMeta] = &[
     },
 ];
 
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time",
-        remediation: "Use checked arithmetic (.checked_add, .checked_sub) on ledger timestamps and validate bounds to prevent timestamp overflow or underflow.",
-    },
-];
-
 pub fn find_rule(id: &str) -> Option<&'static RuleDefinition> {
     RULE_REGISTRY.iter().find(|r| r.id == id)
 }
 
 fn explain_rule(rule: &str) -> Result<(), CliError> {
     let def = find_rule(rule).ok_or_else(|| CliError(format!("unknown rule: {rule}")))?;
+    let meta = RULES.iter().find(|m| m.id == rule);
     // Every message above describes a syntactic pattern, not a proven
     // defect: state the heuristic nature right next to the rule so the
     // distinction between "flagged" and "broken" is never left to guesswork.
-    println!("{}\n\nnote: {FINDING_NATURE}", def.explanation);
+    println!("{}", def.explanation);
+    if let Some(m) = meta {
+        println!("\nConfidence: {}", m.confidence);
+        println!("Known limitations:");
+        for lim in m.limitations {
+            println!("- {lim}");
+        }
+    }
+    println!("\nnote: {FINDING_NATURE}");
     Ok(())
 }
 
@@ -1180,13 +1151,15 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
         AuditOutputFormat::Text => {
             println!("{:<36} {:<10} {:<12} DESCRIPTION", "RULE", "SEVERITY", "CONFIDENCE");
             println!("{}", "-".repeat(100));
-            for rule in RULES {
-                println!("{:<36} {:<10} {:<12} {}", rule.id, rule.severity, rule.confidence, rule.description);
-                for lim in rule.limitations {
-                    println!("    * limitation: {lim}");
-                }
             for rule in RULE_REGISTRY {
-                println!("{:<40} {:<10} {}", rule.id, rule.severity, rule.description);
+                let meta = RULES.iter().find(|m| m.id == rule.id);
+                let confidence = meta.map_or("not assessed", |m| m.confidence);
+                println!("{:<36} {:<10} {:<12} {}", rule.id, rule.severity, confidence, rule.description);
+                if let Some(m) = meta {
+                    for lim in m.limitations {
+                        println!("    * limitation: {lim}");
+                    }
+                }
             }
             println!("note: {FINDING_NATURE}");
             Ok(())
@@ -1195,13 +1168,15 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
             let rules: Vec<_> = RULE_REGISTRY
                 .iter()
                 .map(|rule| {
+                    let meta = RULES.iter().find(|m| m.id == rule.id);
+                    let confidence = meta.map_or("not assessed", |m| m.confidence);
+                    let limitations: &[&str] = meta.map_or(&[], |m| m.limitations);
                     serde_json::json!({
                         "id": rule.id,
                         "severity": rule.severity,
-                        "confidence": rule.confidence,
+                        "confidence": confidence,
                         "description": rule.description,
-                        "limitations": rule.limitations,
-                        "description": rule.description,
+                        "limitations": limitations,
                         "remediation": rule.remediation,
                     })
                 })
@@ -1222,6 +1197,9 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
             let rules: Vec<_> = RULE_REGISTRY
                 .iter()
                 .map(|rule| {
+                    let meta = RULES.iter().find(|m| m.id == rule.id);
+                    let confidence = meta.map_or("not assessed", |m| m.confidence);
+                    let limitations: &[&str] = meta.map_or(&[], |m| m.limitations);
                     serde_json::json!({
                         "id": rule.id,
                         "shortDescription": { "text": rule.id.replace('-', " ") },
@@ -1230,8 +1208,8 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
                             "level": sarif_level(rule.severity)
                         },
                         "properties": {
-                            "confidence": rule.confidence,
-                            "limitations": rule.limitations,
+                            "confidence": confidence,
+                            "limitations": limitations,
                         }
                     })
                 })
@@ -1723,8 +1701,9 @@ impl<'a> DiagnosticRenderer<'a> {
             .into_iter()
             .map(|rule| {
                 let meta = RULES.iter().find(|m| m.id == rule);
-                let description = meta.map(|m| m.description);
-                let description = find_rule(rule).map(|r| r.description);
+                let description = find_rule(rule)
+                    .map(|r| r.description)
+                    .or_else(|| meta.map(|m| m.description));
                 // The metadata level mirrors the level this scan gives the
                 // rule's findings: a config override takes effect, and with
                 // nothing configured the `RULE_REGISTRY` default applies — both walk
@@ -1735,8 +1714,8 @@ impl<'a> DiagnosticRenderer<'a> {
                     .iter()
                     .find(|finding| finding.rule == rule)
                     .map(|finding| finding.severity.as_str())
+                    .or_else(|| find_rule(rule).map(|r| r.severity))
                     .or_else(|| meta.map(|m| m.severity));
-                    .or_else(|| find_rule(rule).map(|r| r.severity));
                 let mut rule_obj = serde_json::json!({
                     "id": rule,
                     "shortDescription": { "text": rule.replace('-', " ") }
@@ -2318,14 +2297,94 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
 fn load_baseline(baseline_path: &Option<PathBuf>) -> Result<Vec<BaselineEntry>, CliError> {
     match baseline_path {
         Some(path) => {
-            let content = fs::read_to_string(path)
-                .map_err(|err| CliError(format!("failed to read baseline file {}: {err}; check the path, permissions and UTF-8 encoding", path.display())))?;
-            let entries: Vec<BaselineEntry> = serde_json::from_str(&content)
-                .map_err(|err| CliError(format!("failed to parse baseline JSON {}: {err}; expected an array of file, line and rule entries", path.display())))?;
+            let content = fs::read_to_string(path).map_err(|err| {
+                CliError(format!(
+                    "failed to read baseline file {}: {err}; check the path, permissions and UTF-8 encoding",
+                    path.display()
+                ))
+            })?;
+            let entries: Vec<BaselineEntry> = serde_json::from_str(&content).map_err(|err| {
+                CliError(format!(
+                    "failed to parse baseline JSON {}: {err}; expected an array of file, line and rule entries",
+                    path.display()
+                ))
+            })?;
+            for (index, entry) in entries.iter().enumerate() {
+                let entry_num = index + 1;
+                if entry.file.trim().is_empty() {
+                    return Err(CliError(format!(
+                        "invalid baseline entry #{entry_num} in {}: `file` must not be empty",
+                        path.display()
+                    )));
+                }
+                if entry.rule.trim().is_empty() {
+                    return Err(CliError(format!(
+                        "invalid baseline entry #{entry_num} in {}: `rule` must not be empty",
+                        path.display()
+                    )));
+                }
+                if entry.line == 0 {
+                    return Err(CliError(format!(
+                        "invalid baseline entry #{entry_num} in {}: `line` must be >= 1",
+                        path.display()
+                    )));
+                }
+            }
             Ok(entries)
         }
         None => Ok(Vec::new()),
     }
+}
+
+/// Normalizes baseline entry paths relative to `workspace`, preserving `<stdin>`
+/// and resolving `.` / `..` components even when a referenced file no longer exists.
+fn normalize_baseline_entries(
+    entries: &mut [BaselineEntry],
+    workspace: &Path,
+) -> Result<(), CliError> {
+    for entry in entries {
+        if entry.file == "<stdin>" {
+            continue;
+        }
+        let raw_forward = entry.file.replace('\\', "/");
+        let raw_path = Path::new(&raw_forward);
+        if raw_path.is_absolute() {
+            entry.file = workspace_relative_path(raw_path, workspace)
+                .to_string_lossy()
+                .into_owned();
+            continue;
+        }
+        let joined = workspace.join(raw_path);
+        if let Ok(canonical) = canonical_path(&joined) {
+            entry.file = canonical
+                .strip_prefix(workspace)
+                .unwrap_or(&canonical)
+                .to_string_lossy()
+                .into_owned();
+            continue;
+        }
+        // Lexical fallback when the file does not exist on disk.
+        let mut clean = Vec::new();
+        for comp in raw_path.components() {
+            match comp {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if clean.pop().is_none() {
+                        return Err(CliError(format!(
+                            "baseline entry path `{}` escapes the workspace root {}",
+                            entry.file,
+                            workspace.display()
+                        )));
+                    }
+                }
+                std::path::Component::Normal(c) => clean.push(c),
+                _ => {}
+            }
+        }
+        let normalized: PathBuf = clean.into_iter().collect();
+        entry.file = normalized.to_string_lossy().into_owned();
+    }
+    Ok(())
 }
 
 /// The one canonical ordering for findings: file, then line, then rule,
@@ -4187,5 +4246,74 @@ mod tests {
                 assert!(!lim.trim().is_empty(), "rule {} has empty limitation string", rule.id);
             }
         }
+    }
+
+    #[test]
+    fn baseline_normalizes_relative_and_preserves_stdin_paths() {
+        let workspace = PathBuf::from("/tmp/stk-workspace");
+        let mut entries = vec![
+            BaselineEntry {
+                file: "./src/lib.rs".to_string(),
+                line: 4,
+                rule: "missing-require-auth".to_string(),
+            },
+            BaselineEntry {
+                file: "<stdin>".to_string(),
+                line: 4,
+                rule: "missing-require-auth".to_string(),
+            },
+        ];
+        normalize_baseline_entries(&mut entries, &workspace).unwrap();
+        assert_eq!(entries[0].file, "src/lib.rs");
+        assert_eq!(entries[1].file, "<stdin>");
+
+        let finding = Finding {
+            file: PathBuf::from("src/lib.rs"),
+            line: 4,
+            end_line: None,
+            rule: "missing-require-auth",
+            severity: "warning".to_string(),
+            message: "msg".to_string(),
+            source_snippet: None,
+        };
+        assert!(finding.matches_baseline(&entries[0]));
+        assert!(!finding.matches_baseline(&entries[1]));
+    }
+
+    #[test]
+    fn baseline_rejects_invalid_entries_and_escaping_paths() {
+        let dir = std::env::temp_dir().join(format!("stk-baseline-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let zero_line = dir.join("zero.json");
+        std::fs::write(
+            &zero_line,
+            r#"[{"file":"src/lib.rs","line":0,"rule":"missing-require-auth"}]"#,
+        )
+        .unwrap();
+        let err = load_baseline(&Some(zero_line)).unwrap_err().to_string();
+        assert!(err.contains("line"), "{err}");
+        assert!(err.contains("zero.json"), "{err}");
+
+        let empty_rule = dir.join("empty_rule.json");
+        std::fs::write(
+            &empty_rule,
+            r#"[{"file":"src/lib.rs","line":3,"rule":"  "}]"#,
+        )
+        .unwrap();
+        let err = load_baseline(&Some(empty_rule)).unwrap_err().to_string();
+        assert!(err.contains("rule"), "{err}");
+
+        let mut escaping = vec![BaselineEntry {
+            file: "../outside.rs".to_string(),
+            line: 1,
+            rule: "missing-require-auth".to_string(),
+        }];
+        let err = normalize_baseline_entries(&mut escaping, &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes the workspace root"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
