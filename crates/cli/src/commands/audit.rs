@@ -309,6 +309,10 @@ impl Finding {
 /// 9. `unchecked-narrowing-conversion` [medium]: Integer `as` casts that can truncate.
 ///    Limitations: Tracks parameter and annotated local types; when source type is
 ///    unknown, casts to `< 128`-bit integer types are flagged as potentially narrowing.
+/// 10. `ignored-contract-call-result` [medium]: Contract calls (`try_*`,
+///     `try_invoke_contract`) whose `Result` return value is discarded.
+///     Limitations: Syntactic heuristic matching `try_*` contract call patterns;
+///     excludes `try_transfer`/`try_transfer_from` (covered by `ignored-token-transfer-result`).
 ///
 /// # Scan roots and exclusions
 ///
@@ -980,6 +984,16 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
         remediation: "Replace broad mock_all_auths() with granular mock_auths(&[...]) or targeted caller authorizations so unintended missing auth checks are not masked.",
     },
     RuleDefinition {
+        id: "ignored-contract-call-result",
+        severity: "warning",
+        description: "Contract calls returning Result can fail; their results must be handled.",
+        explanation: "ignored-contract-call-result: Cross-contract and try_invoke_contract calls return a Result that must be handled.\n\
+             This rule detects `try_*` contract calls and `try_invoke_contract` calls whose Result is discarded via `;` or `let _ = ...`.\n\
+             Fix: Propagate the Result with `?`, match on it, or bind and inspect the outcome.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/getting-started/storing-data",
+        remediation: "Propagate the Result with `?`, match on it, or unwrap/handle the error explicitly so failed contract calls cannot fail silently.",
+    },
+    RuleDefinition {
         id: "ignored-token-transfer-result",
         severity: "warning",
         description: "Token transfer operations can fail; their results must be handled.",
@@ -1112,6 +1126,17 @@ pub const RULES: &[RuleMeta] = &[
         confidence: "high",
         limitations: &[
             "Cannot detect calls generated through external test macros or helper functions outside test modules",
+        ],
+    },
+    RuleMeta {
+        id: "ignored-contract-call-result",
+        severity: "warning",
+        description: "Contract calls returning Result can fail; their results must be handled.",
+        confidence: "medium",
+        limitations: &[
+            "Matches `try_*` contract client methods and `try_invoke_contract` syntactically without full type resolution",
+            "Excludes `try_transfer` and `try_transfer_from`, which are reported by `ignored-token-transfer-result`",
+            "Does not track whether a bound variable is subsequently inspected",
         ],
     },
     RuleMeta {
@@ -2008,6 +2033,7 @@ fn config_error_context(content: &str, err: &toml::de::Error) -> String {
 
 pub const VALID_RULES: &[&str] = &[
     "broad-mock-all-auths",
+    "ignored-contract-call-result",
     "ignored-token-transfer-result",
     "missing-positive-amount-validation",
     "missing-require-auth",
@@ -2919,6 +2945,7 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
             self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
             self.audit_amount_division(&node.sig, &node.block, fn_range);
             self.audit_narrowing_conversions(&node.sig, &node.block, fn_range);
+            self.audit_ignored_contract_call_results(&node.sig, &node.block, fn_range);
             self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
         }
         self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
@@ -2938,6 +2965,7 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
             self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
             self.audit_amount_division(&node.sig, &node.block, fn_range);
             self.audit_narrowing_conversions(&node.sig, &node.block, fn_range);
+            self.audit_ignored_contract_call_results(&node.sig, &node.block, fn_range);
             self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
         }
         self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
@@ -3184,6 +3212,28 @@ impl FunctionVisitor<'_> {
         visitor.visit_block(body);
     }
 
+    fn audit_ignored_contract_call_results(
+        &mut self,
+        sig: &Signature,
+        body: &syn::Block,
+        fn_range: (usize, usize),
+    ) {
+        if !self.is_enabled("ignored-contract-call-result") {
+            return;
+        }
+
+        let mut visitor = IgnoredContractCallVisitor {
+            path: self.path.clone(),
+            fn_name: sig.ident.to_string(),
+            fn_range,
+            findings: self.findings,
+            config: self.config,
+            suppressions: self.suppressions,
+            source: self.source,
+        };
+        visitor.visit_block(body);
+    }
+
     fn audit_ignored_transfer_results(
         &mut self,
         sig: &Signature,
@@ -3342,6 +3392,114 @@ fn line_of(node: impl quote::ToTokens) -> usize {
         .next()
         .map(|token| token.span().start().line)
         .unwrap_or(0)
+}
+
+struct IgnoredContractCallVisitor<'a> {
+    path: PathBuf,
+    fn_name: String,
+    fn_range: (usize, usize),
+    findings: &'a mut Vec<Finding>,
+    config: &'a AuditConfig,
+    suppressions: &'a [Suppression],
+    source: &'a SourceLines,
+}
+
+impl<'ast> Visit<'ast> for IgnoredContractCallVisitor<'_> {
+    fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
+        let ignored = match node {
+            syn::Stmt::Expr(expr, Some(_)) => {
+                contract_call_method_name(expr).map(|m| (expr, m))
+            }
+            syn::Stmt::Local(local) if pattern_is_wildcard(&local.pat) => local
+                .init
+                .as_ref()
+                .and_then(|init| contract_call_method_name(&init.expr).map(|m| (&*init.expr, m))),
+            _ => None,
+        };
+
+        if let Some((expr, method)) = ignored {
+            let line = line_of(expr);
+            let (_, end) = item_line_range(expr);
+            FindingEmitter {
+                path: &self.path,
+                fn_range: self.fn_range,
+                findings: self.findings,
+                config: self.config,
+                suppressions: self.suppressions,
+                source: self.source,
+            }
+            .emit(
+                "ignored-contract-call-result",
+                line,
+                Some(end),
+                format!(
+                    "fn {} ignores the Result returned by contract call `{method}`; propagate with `?`, match, or handle the error",
+                    self.fn_name
+                ),
+            );
+        }
+
+        visit::visit_stmt(self, node);
+    }
+}
+
+const NON_CONTRACT_TRY_METHODS: &[&str] = &[
+    "try_transfer",
+    "try_transfer_from",
+    "try_into",
+    "try_from",
+    "try_fold",
+    "try_for_each",
+    "try_reduce",
+    "try_borrow",
+    "try_borrow_mut",
+    "try_lock",
+    "try_read",
+    "try_write",
+    "try_recv",
+    "try_send",
+    "try_reserve",
+    "try_reserve_exact",
+    "try_clone",
+    "try_exists",
+];
+
+fn contract_call_method_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::MethodCall(call) => {
+            let method = call.method.unraw().to_string();
+            if matches!(
+                method.as_str(),
+                "try_invoke_contract" | "try_invoke_contract_check_auth"
+            ) {
+                return Some(method);
+            }
+            if method.starts_with("try_") && !NON_CONTRACT_TRY_METHODS.contains(&method.as_str()) {
+                return Some(method);
+            }
+            if matches!(method.as_str(), "ok" | "err") {
+                return contract_call_method_name(&call.receiver);
+            }
+            None
+        }
+        Expr::Call(call) => match &*call.func {
+            Expr::Path(path) => path.path.segments.last().and_then(|seg| {
+                let name = seg.ident.unraw().to_string();
+                if matches!(
+                    name.as_str(),
+                    "try_invoke_contract" | "try_invoke_contract_check_auth"
+                ) {
+                    Some(name)
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        },
+        Expr::Paren(paren) => contract_call_method_name(&paren.expr),
+        Expr::Group(group) => contract_call_method_name(&group.expr),
+        _ => None,
+    }
 }
 
 struct IgnoredTransferVisitor<'a> {
@@ -5113,5 +5271,62 @@ mod tests {
         assert!(!checked
             .iter()
             .any(|f| f.rule == "unchecked-narrowing-conversion"));
+    }
+
+    #[test]
+    fn ignored_contract_call_result_detects_positive_negative_and_edge_cases() {
+        // Positive: bare semicolon-terminated try_invoke_contract and client.try_*
+        let bare = audit_source_for_test(
+            "pub fn call_it(env: Env, id: Address) { env.try_invoke_contract(&id, &sym, args); }",
+        );
+        assert!(
+            bare.iter()
+                .any(|f| f.rule == "ignored-contract-call-result"),
+            "expected ignored-contract-call-result finding: {bare:?}"
+        );
+
+        let wildcard = audit_source_for_test(
+            "pub fn swap_it(client: PoolClient) { let _ = client.try_swap(&100); }",
+        );
+        assert!(wildcard
+            .iter()
+            .any(|f| f.rule == "ignored-contract-call-result"));
+
+        let ok_discarded = audit_source_for_test(
+            "pub fn swap_ok(client: PoolClient) { client.try_swap(&100).ok(); }",
+        );
+        assert!(ok_discarded
+            .iter()
+            .any(|f| f.rule == "ignored-contract-call-result"));
+
+        // Negative: propagated with ?, bound to variable, returned as tail expr, or std try_into
+        let propagated = audit_source_for_test(
+            "pub fn swap_prop(client: PoolClient) -> Result<(), ()> { client.try_swap(&100)?; Ok(()) }",
+        );
+        assert!(!propagated
+            .iter()
+            .any(|f| f.rule == "ignored-contract-call-result"));
+
+        let bound = audit_source_for_test(
+            "pub fn swap_bound(client: PoolClient) { let res = client.try_swap(&100); res.unwrap(); }",
+        );
+        assert!(!bound
+            .iter()
+            .any(|f| f.rule == "ignored-contract-call-result"));
+
+        let tail_return = audit_source_for_test(
+            "pub fn swap_ret(client: PoolClient) -> Result<(), ()> { client.try_swap(&100) }",
+        );
+        assert!(!tail_return
+            .iter()
+            .any(|f| f.rule == "ignored-contract-call-result"));
+
+        // Edge: try_transfer is handled by ignored-token-transfer-result, not double-reported
+        let transfer = audit_source_for_test(
+            "pub fn pay(token: TokenClient) { token.try_transfer(&a, &b, &1); }",
+        );
+        assert!(!transfer
+            .iter()
+            .any(|f| f.rule == "ignored-contract-call-result"));
     }
 }

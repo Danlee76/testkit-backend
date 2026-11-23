@@ -1049,6 +1049,7 @@ fn audit_explain_rules_document_the_heuristic_nature_of_findings() {
         "unchecked-i128-arithmetic",
         "missing-ttl-bump",
         "broad-mock-all-auths",
+        "ignored-contract-call-result",
         "ignored-token-transfer-result",
         "missing-positive-amount-validation",
         "unchecked-amount-division",
@@ -1883,6 +1884,7 @@ fn audit_color_no_color_flag_removes_ansi_codes() {
 fn audit_list_rules_subcommand_and_flag_list_all_registered_rules() {
     let expected_rules = [
         "broad-mock-all-auths",
+        "ignored-contract-call-result",
         "ignored-token-transfer-result",
         "missing-positive-amount-validation",
         "missing-require-auth",
@@ -1893,7 +1895,7 @@ fn audit_list_rules_subcommand_and_flag_list_all_registered_rules() {
         "unchecked-timestamp-arithmetic",
     ];
     // Exact count check to prevent silent rule additions/removals without test updates
-    assert_eq!(expected_rules.len(), 9);
+    assert_eq!(expected_rules.len(), 10);
 
     for invocation in [&["audit", "list-rules"][..], &["audit", "--list-rules"][..]] {
         let output = run(invocation);
@@ -1933,6 +1935,7 @@ fn audit_list_rules_subcommand_and_flag_list_all_registered_rules() {
 fn audit_list_rules_structured_formats() {
     let expected_rules = [
         "broad-mock-all-auths",
+        "ignored-contract-call-result",
         "ignored-token-transfer-result",
         "missing-positive-amount-validation",
         "missing-require-auth",
@@ -1948,9 +1951,9 @@ fn audit_list_rules_structured_formats() {
     assert!(json_output.status.success(), "{json_output:?}");
     let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
     assert_eq!(report["tool"], "soroban-testkit");
-    assert_eq!(report["summary"]["rule_count"], 9);
+    assert_eq!(report["summary"]["rule_count"], 10);
     let rules = report["rules"].as_array().expect("rules array");
-    assert_eq!(rules.len(), 9);
+    assert_eq!(rules.len(), 10);
     for (i, expected_id) in expected_rules.iter().enumerate() {
         assert_eq!(rules[i]["id"], *expected_id);
         assert!(!rules[i]["description"].as_str().unwrap().is_empty());
@@ -1964,7 +1967,7 @@ fn audit_list_rules_structured_formats() {
     let sarif_rules = sarif["runs"][0]["tool"]["driver"]["rules"]
         .as_array()
         .expect("sarif rules array");
-    assert_eq!(sarif_rules.len(), 9);
+    assert_eq!(sarif_rules.len(), 10);
     for (i, expected_id) in expected_rules.iter().enumerate() {
         assert_eq!(sarif_rules[i]["id"], *expected_id);
     }
@@ -3423,6 +3426,37 @@ fn audit_flags_unchecked_narrowing_conversion_and_allows_try_into() {
         .as_str()
         .unwrap()
         .contains("try_into"));
+}
+
+#[test]
+fn audit_flags_ignored_contract_call_result_and_allows_propagated() {
+    let fixture = AuditFixture::new("ignored-contract-call");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+        pub fn bad_call(client: VaultClient) {
+            client.try_deposit(&10);
+        }
+        pub fn good_call(client: VaultClient) -> Result<(), ()> {
+            client.try_deposit(&10)?;
+            Ok(())
+        }
+        "#,
+    );
+    let output = fixture.scan(&["--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let call_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "ignored-contract-call-result")
+        .collect();
+    assert_eq!(call_findings.len(), 1, "{report}");
+    assert!(call_findings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("try_deposit"));
 }
 
 
