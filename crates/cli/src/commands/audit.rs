@@ -453,10 +453,7 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     let mut findings = Vec::new();
 
     if stdin {
-        let mut source = String::new();
-        std::io::stdin()
-            .read_to_string(&mut source)
-            .map_err(|err| CliError(format!("failed to read stdin: {err}")))?;
+        let source = read_stdin_source(std::io::stdin())?;
         match audit_source(
             Path::new("<stdin>"),
             &source,
@@ -2411,6 +2408,16 @@ fn normalize_findings(findings: &mut Vec<Finding>) {
     });
 }
 
+fn read_stdin_source<R: Read>(mut reader: R) -> Result<String, CliError> {
+    let mut source = String::new();
+    reader.read_to_string(&mut source).map_err(|err| {
+        CliError(format!(
+            "failed to read Rust source from stdin: {err}; ensure stdin provides valid UTF-8 Rust source"
+        ))
+    })?;
+    Ok(source)
+}
+
 fn audit_file(
     path: &Path,
     findings: &mut Vec<Finding>,
@@ -4315,5 +4322,20 @@ mod tests {
         assert!(err.contains("escapes the workspace root"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stdin_reader_accepts_valid_utf8_and_rejects_invalid_utf8_actionably() {
+        let ok = read_stdin_source(std::io::Cursor::new(b"fn ok() {}\n")).unwrap();
+        assert_eq!(ok, "fn ok() {}\n");
+
+        let empty = read_stdin_source(std::io::Cursor::new(b"")).unwrap();
+        assert_eq!(empty, "");
+
+        let err = read_stdin_source(std::io::Cursor::new(&[0xff, 0xfe, 0xfd]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stdin"), "{err}");
+        assert!(err.contains("UTF-8"), "{err}");
     }
 }

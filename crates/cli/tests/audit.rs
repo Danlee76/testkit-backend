@@ -3257,6 +3257,50 @@ fn audit_baseline_rejects_invalid_entry_fields_actionably() {
     assert!(stderr.contains("line"), "{stderr}");
 }
 
+#[test]
+fn audit_stdin_reports_findings_in_all_formats_and_respects_strict() {
+    for format in ["text", "json", "sarif"] {
+        let output = run_with_stdin(
+            &["audit", "-", "--format", format, "--strict"],
+            UNAUTHORIZED_ENTRY_POINT.as_bytes(),
+        );
+        assert!(!output.status.success(), "{format}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        match format {
+            "text" => {
+                assert!(stdout.contains("<stdin>:"), "{stdout}");
+                assert!(stdout.contains("missing-require-auth"), "{stdout}");
+            }
+            "json" => {
+                let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(report["summary"]["files_scanned"], 1);
+                assert_eq!(report["summary"]["finding_count"], 1);
+                assert_eq!(report["findings"][0]["file"], "<stdin>");
+                assert_eq!(report["findings"][0]["rule"], "missing-require-auth");
+            }
+            "sarif" => {
+                let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                let results = report["runs"][0]["results"].as_array().unwrap();
+                assert_eq!(results.len(), 1);
+                assert_eq!(
+                    results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+                    "<stdin>"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn audit_stdin_reports_invalid_utf8_actionably() {
+    let output = run_with_stdin(&["audit", "-"], &[0xff, 0xfe, 0xfd]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stdin"), "{stderr}");
+    assert!(stderr.contains("UTF-8"), "{stderr}");
+}
+
 
 
 
