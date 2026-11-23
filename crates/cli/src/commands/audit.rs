@@ -1893,10 +1893,28 @@ fn find_workspace_root(source_dir: &Path) -> PathBuf {
     crate_root.unwrap_or_else(|| source_dir.to_path_buf())
 }
 
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push(comp);
+                }
+            }
+            _ => out.push(comp),
+        }
+    }
+    out
+}
+
 fn workspace_relative_path(path: &Path, workspace: &Path) -> PathBuf {
-    let absolute = canonical_path(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical_ws = canonical_path(workspace).unwrap_or_else(|_| normalize_lexical(workspace));
+    let absolute = canonical_path(path).unwrap_or_else(|_| normalize_lexical(path));
     absolute
-        .strip_prefix(workspace)
+        .strip_prefix(&canonical_ws)
+        .or_else(|_| absolute.strip_prefix(workspace))
         .unwrap_or(&absolute)
         .components()
         .collect()
@@ -4396,5 +4414,27 @@ mod tests {
         let err = explain_rule("nonexistent-rule").unwrap_err().to_string();
         assert!(err.contains("nonexistent-rule"), "{err}");
         assert!(err.contains("missing-require-auth"), "{err}");
+    }
+
+    #[test]
+    fn workspace_relative_path_handles_uncanonical_workspace_and_lexical_fallback() {
+        let dir = std::env::temp_dir().join(format!("stk-rel-unit-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crates/vault/src")).unwrap();
+        std::fs::write(dir.join("crates/vault/src/lib.rs"), "fn ok() {}\n").unwrap();
+
+        let uncanonical_ws = dir.join("crates/..");
+        let file = dir.join("crates/vault/src/./lib.rs");
+        assert_eq!(
+            workspace_relative_path(&file, &uncanonical_ws),
+            PathBuf::from("crates/vault/src/lib.rs")
+        );
+
+        let missing = dir.join("crates/vault/src/../src/missing.rs");
+        assert_eq!(
+            workspace_relative_path(&missing, &dir),
+            PathBuf::from("crates/vault/src/missing.rs")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

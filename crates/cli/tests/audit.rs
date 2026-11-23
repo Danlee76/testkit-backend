@@ -3321,6 +3321,44 @@ fn audit_rule_catalog_subcommands_and_flag_emit_identical_json_and_sarif() {
     assert!(stderr.contains("missing-require-auth"), "{stderr}");
 }
 
+#[test]
+fn audit_preserves_workspace_relative_paths_across_formats_and_cwd() {
+    let fixture = AuditFixture::new("workspace-rel-paths");
+    fixture.write(
+        "crates/vault/Cargo.toml",
+        "[package]\nname = 'vault'\nversion = '0.1.0'\n",
+    );
+    let file = fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+
+    let from_subdir = run_from(
+        &fixture.0.join("crates/vault/src"),
+        &["audit", ".", "--format", "json"],
+    );
+    let from_root = run_from(
+        &fixture.0,
+        &["audit", "./crates/vault/src/lib.rs", "--format", "json"],
+    );
+    let from_outside = run(&["audit", file.to_str().unwrap(), "--format", "json"]);
+
+    for output in [&from_subdir, &from_root, &from_outside] {
+        assert!(output.status.success(), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["findings"][0]["file"], "crates/vault/src/lib.rs");
+    }
+
+    let sarif_out = run_from(
+        &fixture.0.join("crates/vault"),
+        &["audit", "src/lib.rs", "--format", "sarif"],
+    );
+    assert!(sarif_out.status.success(), "{sarif_out:?}");
+    let sarif: serde_json::Value = serde_json::from_slice(&sarif_out.stdout).unwrap();
+    assert_eq!(
+        sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]
+            ["uri"],
+        "crates/vault/src/lib.rs"
+    );
+}
+
 
 
 
