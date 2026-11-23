@@ -41,8 +41,9 @@ pub struct AuthMatrix<'a> {
 }
 
 fn csv_escape(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', """"))
-}
+    let quote = char::from(34);
+    let escaped = value.replace(quote, &format!("{quote}{quote}"));
+    format!("{quote}{escaped}{quote}")
 }
 
 impl<'a> AuthMatrix<'a> {
