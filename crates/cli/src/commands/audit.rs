@@ -1393,6 +1393,7 @@ pub fn should_color(no_color_flag: bool) -> bool {
     }
     use std::io::IsTerminal;
     std::io::stdout().is_terminal()
+}
 /// Counts of findings for a single rule within a severity level.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleFindingCount {
@@ -3660,7 +3661,10 @@ mod tests {
                 severity: None,
             },
         );
-        let config = AuditConfig { rules };
+        let config = AuditConfig {
+            rules,
+            ..Default::default()
+        };
         let findings = unit_findings(
             r#"
             pub fn withdraw(env: &Env, caller: &Address, amount: i128) {
@@ -3685,7 +3689,10 @@ mod tests {
                 severity: Some("error".to_string()),
             },
         );
-        let config = AuditConfig { rules };
+        let config = AuditConfig {
+            rules,
+            ..Default::default()
+        };
         let findings = unit_findings(
             r#"
             pub fn withdraw(env: &Env, caller: &Address, amount: i128) {

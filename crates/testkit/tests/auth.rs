@@ -220,7 +220,7 @@ fn owner_actors_enforced_catches_missing_auth_on_guarded_entry_point() {
 fn owner_actors_allowed_slice_is_only_owner() {
     let env = TestEnv::new();
     let fx = OwnerActors::new(&env);
-    assert_eq!(fx.allowed(), &[fx.owner.clone()]);
+    assert_eq!(fx.allowed(), std::slice::from_ref(&fx.owner));
     assert!(!fx.allowed().contains(&fx.attacker));
 }
 

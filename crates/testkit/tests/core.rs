@@ -280,21 +280,21 @@ fn fixture_builder_constructs_configured_environment() {
 
 #[test]
 fn fixture_builder_rejects_invalid_configurations() {
-    use soroban_testkit::core::FixtureBuilder;
+    use soroban_testkit::core::{FixtureBuilder, TestEnv};
 
     // Zero close interval is invalid
-    let err_interval = FixtureBuilder::new()
+    let err_interval = FixtureBuilder::<TestEnv>::new()
         .close_interval(0)
         .try_build();
     assert!(err_interval.is_err());
-    assert!(err_interval.unwrap_err().is_misuse());
+    assert!(err_interval.err().unwrap().is_misuse());
 
     // Empty or whitespace label is invalid
-    let err_label = FixtureBuilder::new()
+    let err_label = FixtureBuilder::<TestEnv>::new()
         .with_account_label("   ")
         .try_build();
     assert!(err_label.is_err());
-    assert!(err_label.unwrap_err().is_misuse());
+    assert!(err_label.err().unwrap().is_misuse());
 }
 
 // ── Issue #394: Explicit reset semantics for seeded generators ──

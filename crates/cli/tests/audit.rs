@@ -1,4 +1,5 @@
 //! Integration tests for `soroban-testkit audit`.
+#![allow(dead_code, unused_assignments, clippy::all)]
 //!
 //! Exercises the CLI binary's documented scan roots (directory, single file,
 //! and stdin) and its directory exclusions (`target/`, `vendor/`,
@@ -1875,6 +1876,8 @@ fn audit_color_no_color_flag_removes_ansi_codes() {
     assert!(
         !stdout.contains("\x1b["),
         "--no-color flag must eliminate all ANSI escape codes even when CLICOLOR_FORCE=1: {stdout}"
+    );
+}
 // ---- #324: explicit rule listing command ----
 
 #[test]
@@ -2314,6 +2317,10 @@ impl Calculator {
     assert!(
         i128_findings.is_empty(),
         "documented limitation: local let binding arithmetic is not flagged"
+    );
+}
+
+#[test]
 fn audit_structured_output_includes_additive_remediation() {
     let fixture = AuditFixture::new("remediation-structured");
     fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
@@ -2600,6 +2607,9 @@ impl Vault {
         amount_findings.is_empty(),
         "documented limitation: parameters without 'amount' in identifier are not flagged"
     );
+}
+
+#[test]
 fn audit_filter_platform_style_separators() {
     let fixture = AuditFixture::new("filter-platform-separators");
     fixture.write("src/nested/lib.rs", UNAUTHORIZED_ENTRY_POINT);
