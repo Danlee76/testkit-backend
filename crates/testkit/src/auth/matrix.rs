@@ -88,6 +88,30 @@ impl<'a> AuthMatrix<'a> {
         self
     }
 
+    /// Validate that a contract actor set is fully represented by the matrix.
+    ///
+    /// This is useful for contracts with several participant categories, such
+    /// as escrow streams (payer, recipient, operator) and recurring contracts
+    /// (owner, beneficiary, scheduler). Every supplied actor must be listed in
+    /// at least one entry point so it participates in the cross-product.
+    pub fn validate_against(&self, actors: &[Address]) -> Result<(), TestkitError> {
+        let known = self.known_actors();
+        let missing: Vec<String> = actors
+            .iter()
+            .filter(|actor| !known.contains(actor))
+            .map(|actor| format!("{actor:?}"))
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(TestkitError::AssertionFailed(format!(
+                "auth matrix is missing {} actor(s): {}",
+                missing.len(),
+                missing.join(", "),
+            )))
+        }
+    }
+
     /// Register an entry point with expected error text for selected caller cells.
     ///
     /// The expected text is matched against the debug and display forms of the
