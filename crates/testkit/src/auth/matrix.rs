@@ -128,6 +128,7 @@ impl<'a> AuthMatrix<'a> {
         self.entry_points.push(EntryPointSpec {
             name: name.to_string(),
             allowed: allowed.to_vec(),
+            expected_errors: Vec::new(),
             invoke: Box::new(invoke),
         });
         self
