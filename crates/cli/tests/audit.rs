@@ -1051,6 +1051,7 @@ fn audit_explain_rules_document_the_heuristic_nature_of_findings() {
         "broad-mock-all-auths",
         "ignored-token-transfer-result",
         "missing-positive-amount-validation",
+        "unchecked-amount-division",
         "unchecked-timestamp-arithmetic",
     ] {
         let output = run(&["audit", "explain", rule]);
@@ -1885,11 +1886,12 @@ fn audit_list_rules_subcommand_and_flag_list_all_registered_rules() {
         "missing-positive-amount-validation",
         "missing-require-auth",
         "missing-ttl-bump",
+        "unchecked-amount-division",
         "unchecked-i128-arithmetic",
         "unchecked-timestamp-arithmetic",
     ];
     // Exact count check to prevent silent rule additions/removals without test updates
-    assert_eq!(expected_rules.len(), 7);
+    assert_eq!(expected_rules.len(), 8);
 
     for invocation in [&["audit", "list-rules"][..], &["audit", "--list-rules"][..]] {
         let output = run(invocation);
@@ -1933,6 +1935,7 @@ fn audit_list_rules_structured_formats() {
         "missing-positive-amount-validation",
         "missing-require-auth",
         "missing-ttl-bump",
+        "unchecked-amount-division",
         "unchecked-i128-arithmetic",
         "unchecked-timestamp-arithmetic",
     ];
@@ -1942,9 +1945,9 @@ fn audit_list_rules_structured_formats() {
     assert!(json_output.status.success(), "{json_output:?}");
     let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
     assert_eq!(report["tool"], "soroban-testkit");
-    assert_eq!(report["summary"]["rule_count"], 7);
+    assert_eq!(report["summary"]["rule_count"], 8);
     let rules = report["rules"].as_array().expect("rules array");
-    assert_eq!(rules.len(), 7);
+    assert_eq!(rules.len(), 8);
     for (i, expected_id) in expected_rules.iter().enumerate() {
         assert_eq!(rules[i]["id"], *expected_id);
         assert!(!rules[i]["description"].as_str().unwrap().is_empty());
@@ -1958,7 +1961,7 @@ fn audit_list_rules_structured_formats() {
     let sarif_rules = sarif["runs"][0]["tool"]["driver"]["rules"]
         .as_array()
         .expect("sarif rules array");
-    assert_eq!(sarif_rules.len(), 7);
+    assert_eq!(sarif_rules.len(), 8);
     for (i, expected_id) in expected_rules.iter().enumerate() {
         assert_eq!(sarif_rules[i]["id"], *expected_id);
     }
@@ -3357,6 +3360,36 @@ fn audit_preserves_workspace_relative_paths_across_formats_and_cwd() {
             ["uri"],
         "crates/vault/src/lib.rs"
     );
+}
+
+#[test]
+fn audit_flags_unchecked_amount_division_and_allows_checked_div() {
+    let fixture = AuditFixture::new("amount-division");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+        pub fn payout(amount: u64, shares: u64) -> u64 {
+            amount / shares
+        }
+        pub fn safe_payout(amount: u64, shares: u64) -> Option<u64> {
+            amount.checked_div(shares)
+        }
+        "#,
+    );
+    let output = fixture.scan(&["--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let div_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "unchecked-amount-division")
+        .collect();
+    assert_eq!(div_findings.len(), 1, "{report}");
+    assert!(div_findings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("checked_div"));
 }
 
 

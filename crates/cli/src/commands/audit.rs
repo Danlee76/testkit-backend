@@ -263,7 +263,7 @@ impl Finding {
 }
 
 /// Static checks over a contract crate. **Not a security product** — a
-/// linter with seven heuristics, each independently useful and each
+/// linter with built-in heuristics, each independently useful and each
 /// capable of missing real bugs or flagging non-bugs. The absence of a
 /// finding here is never a security guarantee.
 ///
@@ -303,6 +303,9 @@ impl Finding {
 /// 7. `unchecked-timestamp-arithmetic` [low]: Unchecked timestamp arithmetic operations.
 ///    Limitations: Substring match on `timestamp`; flags unrelated arithmetic in the
 ///    same function; no semantic type checking.
+/// 8. `unchecked-amount-division` [medium]: Unchecked `/` or `/=` in amount calculations.
+///    Limitations: Matches amount-related identifier stems syntactically; non-zero
+///    positive literal divisors are skipped; control-flow zero checks are not tracked.
 ///
 /// # Scan roots and exclusions
 ///
@@ -1014,6 +1017,16 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
         remediation: "Call env.storage().persistent().extend_ttl(...) or temporary().extend_ttl(...) for accessed keys to prevent state expiration before the next interaction.",
     },
     RuleDefinition {
+        id: "unchecked-amount-division",
+        severity: "warning",
+        description: "Unchecked division in amount calculations can panic on zero or overflow.",
+        explanation: "unchecked-amount-division: Division in amount calculations can panic on division by zero or signed overflow.\n\
+             This rule detects `/` and `/=` operations involving amount-related bindings outside checked_div().\n\
+             Fix: Use .checked_div(...) or validate the divisor is non-zero before dividing.\n\
+             Reference: https://doc.rust-lang.org/std/primitive.i128.html#method.checked_div",
+        remediation: "Use .checked_div(...) and handle None explicitly (or validate the divisor is non-zero) to prevent panics in amount calculations.",
+    },
+    RuleDefinition {
         id: "unchecked-i128-arithmetic",
         severity: "warning",
         description: "Arithmetic on i128 values can silently overflow; use checked/saturating/wrapping variants.",
@@ -1107,6 +1120,17 @@ pub const RULES: &[RuleMeta] = &[
             "Only inspects parameters containing 'amount' in their identifier name",
             "Token search on body source does not evaluate execution flow or branching",
             "Validation performed in helper functions is not recognized",
+        ],
+    },
+    RuleMeta {
+        id: "unchecked-amount-division",
+        severity: "warning",
+        description: "Unchecked division in amount calculations can panic on zero or overflow.",
+        confidence: "medium",
+        limitations: &[
+            "Matches amount-related identifier stems syntactically without full type inference",
+            "Non-zero positive integer literal divisors are not flagged for division-by-zero",
+            "Does not track prior control-flow guards (such as require!(divisor > 0))",
         ],
     },
     RuleMeta {
@@ -1964,6 +1988,7 @@ pub const VALID_RULES: &[&str] = &[
     "missing-positive-amount-validation",
     "missing-require-auth",
     "missing-ttl-bump",
+    "unchecked-amount-division",
     "unchecked-i128-arithmetic",
     "unchecked-timestamp-arithmetic",
 ];
@@ -2867,6 +2892,7 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         if !self.test_context {
             self.audit_function(&node.sig, &node.block, body_src.clone(), line, fn_range);
             self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
+            self.audit_amount_division(&node.sig, &node.block, fn_range);
             self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
         }
         self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
@@ -2884,6 +2910,7 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         if !self.test_context {
             self.audit_function(&node.sig, &node.block, body_src.clone(), line, fn_range);
             self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
+            self.audit_amount_division(&node.sig, &node.block, fn_range);
             self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
         }
         self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
@@ -3144,6 +3171,29 @@ impl FunctionVisitor<'_> {
             path: self.path.clone(),
             fn_name: sig.ident.to_string(),
             fn_range,
+            findings: self.findings,
+            config: self.config,
+            suppressions: self.suppressions,
+            source: self.source,
+        };
+        visitor.visit_block(body);
+    }
+
+    fn audit_amount_division(
+        &mut self,
+        sig: &Signature,
+        body: &syn::Block,
+        fn_range: (usize, usize),
+    ) {
+        if !self.is_enabled("unchecked-amount-division") {
+            return;
+        }
+
+        let mut visitor = AmountDivisionVisitor {
+            path: self.path.clone(),
+            fn_name: sig.ident.to_string(),
+            fn_range,
+            in_amount_local: false,
             findings: self.findings,
             config: self.config,
             suppressions: self.suppressions,
@@ -3417,6 +3467,175 @@ impl I128ArithmeticVisitor<'_> {
 
 fn type_is_i128(ty: &Type) -> bool {
     matches!(ty, Type::Path(p) if p.path.get_ident().is_some_and(|ident| ident.unraw() == "i128"))
+}
+
+struct FindingEmitter<'a> {
+    path: &'a Path,
+    fn_range: (usize, usize),
+    findings: &'a mut Vec<Finding>,
+    config: &'a AuditConfig,
+    suppressions: &'a [Suppression],
+    source: &'a SourceLines,
+}
+
+impl FindingEmitter<'_> {
+    fn emit(&mut self, rule: &'static str, line: usize, end_line: Option<usize>, message: String) {
+        if is_finding_suppressed(self.suppressions, rule, line, Some(self.fn_range)) {
+            return;
+        }
+        let severity = self
+            .config
+            .rules
+            .get(rule)
+            .and_then(|r| r.severity.as_deref())
+            .unwrap_or("warning");
+        self.findings.push(Finding {
+            file: self.path.to_path_buf(),
+            line,
+            end_line: end_line.filter(|&end| end > line),
+            rule,
+            severity: severity.to_string(),
+            message,
+            source_snippet: self.source.get(line).cloned(),
+        });
+    }
+}
+
+const AMOUNT_STEMS: &[&str] = &[
+    "amount",
+    "amt",
+    "balance",
+    "fee",
+    "price",
+    "rate",
+    "reward",
+    "payout",
+    "share",
+    "deposit",
+    "withdraw",
+    "collateral",
+    "principal",
+    "interest",
+    "supply",
+    "total",
+    "reserve",
+    "mint",
+    "burn",
+    "swap",
+    "liquidity",
+];
+
+fn ident_is_amount_related(ident: &str) -> bool {
+    let lower = ident.to_ascii_lowercase();
+    AMOUNT_STEMS.iter().any(|stem| lower.contains(stem))
+}
+
+fn pat_touches_amount(pat: &Pat) -> bool {
+    match pat {
+        Pat::Ident(ident) => ident_is_amount_related(&ident.ident.unraw().to_string()),
+        Pat::Type(typed) => pat_touches_amount(&typed.pat),
+        Pat::Tuple(tuple) => tuple.elems.iter().any(pat_touches_amount),
+        Pat::Reference(r) => pat_touches_amount(&r.pat),
+        _ => false,
+    }
+}
+
+fn expr_touches_amount(expr: &Expr) -> bool {
+    match expr {
+        Expr::Path(path) => path
+            .path
+            .segments
+            .iter()
+            .any(|seg| ident_is_amount_related(&seg.ident.unraw().to_string())),
+        Expr::Field(field) => {
+            expr_touches_amount(&field.base)
+                || match &field.member {
+                    syn::Member::Named(ident) => ident_is_amount_related(&ident.unraw().to_string()),
+                    syn::Member::Unnamed(_) => false,
+                }
+        }
+        Expr::MethodCall(call) => {
+            ident_is_amount_related(&call.method.unraw().to_string())
+                || expr_touches_amount(&call.receiver)
+                || call.args.iter().any(expr_touches_amount)
+        }
+        Expr::Call(call) => {
+            expr_touches_amount(&call.func) || call.args.iter().any(expr_touches_amount)
+        }
+        Expr::Binary(bin) => expr_touches_amount(&bin.left) || expr_touches_amount(&bin.right),
+        Expr::Unary(un) => expr_touches_amount(&un.expr),
+        Expr::Cast(cast) => expr_touches_amount(&cast.expr),
+        Expr::Reference(r) => expr_touches_amount(&r.expr),
+        Expr::Index(idx) => expr_touches_amount(&idx.expr) || expr_touches_amount(&idx.index),
+        Expr::Paren(p) => expr_touches_amount(&p.expr),
+        Expr::Group(g) => expr_touches_amount(&g.expr),
+        _ => false,
+    }
+}
+
+fn is_nonzero_positive_int_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(p) => is_nonzero_positive_int_literal(&p.expr),
+        Expr::Group(g) => is_nonzero_positive_int_literal(&g.expr),
+        Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(lit),
+            ..
+        }) => lit.base10_parse::<u128>().is_ok_and(|v| v > 0),
+        _ => false,
+    }
+}
+
+struct AmountDivisionVisitor<'a> {
+    path: PathBuf,
+    fn_name: String,
+    fn_range: (usize, usize),
+    in_amount_local: bool,
+    findings: &'a mut Vec<Finding>,
+    config: &'a AuditConfig,
+    suppressions: &'a [Suppression],
+    source: &'a SourceLines,
+}
+
+impl<'ast> Visit<'ast> for AmountDivisionVisitor<'_> {
+    fn visit_local(&mut self, node: &'ast Local) {
+        let prev = self.in_amount_local;
+        if pat_touches_amount(&node.pat) {
+            self.in_amount_local = true;
+        }
+        visit::visit_local(self, node);
+        self.in_amount_local = prev;
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        let is_div = matches!(node.op, BinOp::Div(_) | BinOp::DivAssign(_));
+        if is_div
+            && !is_nonzero_positive_int_literal(&node.right)
+            && (self.in_amount_local
+                || expr_touches_amount(&node.left)
+                || expr_touches_amount(&node.right))
+        {
+            let line = line_of(node);
+            let (_, end) = item_line_range(node);
+            FindingEmitter {
+                path: &self.path,
+                fn_range: self.fn_range,
+                findings: self.findings,
+                config: self.config,
+                suppressions: self.suppressions,
+                source: self.source,
+            }
+            .emit(
+                "unchecked-amount-division",
+                line,
+                Some(end),
+                format!(
+                    "fn {} performs unchecked division in amount calculation; use checked_div() to handle division by zero and overflow",
+                    self.fn_name
+                ),
+            );
+        }
+        visit::visit_expr_binary(self, node);
+    }
 }
 
 #[cfg(test)]
@@ -4436,5 +4655,56 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unchecked_amount_division_detects_positive_negative_and_edge_cases() {
+        // Positive: variable divisor in amount calculation
+        let findings = audit_source_for_test(
+            "pub fn share(amount: u64, total_shares: u64) -> u64 { amount / total_shares }",
+        );
+        assert!(
+            findings.iter().any(|f| f.rule == "unchecked-amount-division"),
+            "expected unchecked-amount-division finding: {findings:?}"
+        );
+
+        // Positive: compound division assignment and division by zero literal
+        let div_assign = audit_source_for_test(
+            "pub fn split(mut balance: u64, n: u64) -> u64 { balance /= n; balance }",
+        );
+        assert!(div_assign
+            .iter()
+            .any(|f| f.rule == "unchecked-amount-division"));
+
+        let div_zero = audit_source_for_test("pub fn zero(amount: u64) -> u64 { amount / 0 }");
+        assert!(div_zero
+            .iter()
+            .any(|f| f.rule == "unchecked-amount-division"));
+
+        // Positive: local binding named fee with non-amount operands
+        let local_fee =
+            audit_source_for_test("pub fn calc(x: u64, y: u64) -> u64 { let fee = x / y; fee }");
+        assert!(local_fee
+            .iter()
+            .any(|f| f.rule == "unchecked-amount-division"));
+
+        // Negative: checked_div, non-zero positive literal divisor, and non-amount division
+        let checked = audit_source_for_test(
+            "pub fn share(amount: u64, total_shares: u64) -> Option<u64> { amount.checked_div(total_shares) }",
+        );
+        assert!(!checked
+            .iter()
+            .any(|f| f.rule == "unchecked-amount-division"));
+
+        let nonzero_lit =
+            audit_source_for_test("pub fn half(amount: u64) -> u64 { amount / 2 }");
+        assert!(!nonzero_lit
+            .iter()
+            .any(|f| f.rule == "unchecked-amount-division"));
+
+        let unrelated = audit_source_for_test("pub fn ratio(a: u64, b: u64) -> u64 { a / b }");
+        assert!(!unrelated
+            .iter()
+            .any(|f| f.rule == "unchecked-amount-division"));
     }
 }
