@@ -7,6 +7,9 @@ type InvokeFn<'a> = Box<dyn Fn(&Address) -> Result<(), soroban_sdk::Error> + 'a>
 struct EntryPointSpec<'a> {
     name: String,
     allowed: Vec<Address>,
+    // Optional per-cell error expectations. This lets callers assert the
+    // contract returned the right authorization error, not merely any error.
+    expected_errors: Vec<(Address, String)>,
     invoke: InvokeFn<'a>,
 }
 
@@ -136,7 +139,39 @@ impl<'a> AuthMatrix<'a> {
         self
     }
 
+ feat/auth-matrix-reports-and-nested-auth-docs
     /// Register an entry point with expected error text for selected callers.
+
+    /// Validate that a contract actor set is fully represented by the matrix.
+    ///
+    /// This is useful for contracts with several participant categories, such
+    /// as escrow streams (payer, recipient, operator) and recurring contracts
+    /// (owner, beneficiary, scheduler). Every supplied actor must be listed in
+    /// at least one entry point so it participates in the cross-product.
+    pub fn validate_against(&self, actors: &[Address]) -> Result<(), TestkitError> {
+        let known = self.known_actors();
+        let missing: Vec<String> = actors
+            .iter()
+            .filter(|actor| !known.contains(actor))
+            .map(|actor| format!("{actor:?}"))
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(TestkitError::AssertionFailed(format!(
+                "auth matrix is missing {} actor(s): {}",
+                missing.len(),
+                missing.join(", "),
+            )))
+        }
+    }
+
+    /// Register an entry point with expected error text for selected caller cells.
+    ///
+    /// The expected text is matched against the debug and display forms of the
+    /// returned Soroban error. This is useful when an escrow stream and a
+    /// recurring contract intentionally use different authorization errors.
+ main
     pub fn entry_point_with_expected_errors(
         mut self,
         name: &str,
@@ -279,8 +314,13 @@ impl<'a> AuthMatrix<'a> {
             for addr in &known {
                 let expected = ep.allowed.contains(addr);
                 self.reset_auth();
+ feat/auth-matrix-reports-and-nested-auth-docs
                 // Each cell is isolated so a panicking invocation cannot skip
                 // the remaining actor/entry-point combinations.
+
+                // Isolate every cell: a panic must not prevent later
+                // callers from being checked.
+ main
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     (ep.invoke)(addr)
                 }));
@@ -290,15 +330,32 @@ impl<'a> AuthMatrix<'a> {
                     Err(_) => Some("invocation panicked".to_string()),
                     _ => None,
                 };
+ feat/auth-matrix-reports-and-nested-auth-docs
                 let expected_error = ep.expected_errors.iter()
+
+                let expected_error = ep
+                    .expected_errors
+                    .iter()
+ main
                     .find(|(actor, _)| actor == addr)
                     .map(|(_, text)| text.as_str());
                 let error_matches = expected_error
                     .map(|expected| error_text.as_deref().is_some_and(|actual| actual.contains(expected)))
                     .unwrap_or(true);
+ feat/auth-matrix-reports-and-nested-auth-docs
                 let cell_matches = if expected { actual && expected_error.is_none() } else {
                     !actual && error_matches
                 };
+
+                let cell_matches = if expected {
+                    actual && expected_error.is_none()
+                } else {
+                    !actual && error_matches
+                };
+
+                // Reset auth state immediately after invocation to keep the
+                // slate clean for the next actor case.
+ main
                 self.reset_auth();
 
                 grid.push_str(&format!(
@@ -312,7 +369,13 @@ impl<'a> AuthMatrix<'a> {
                     violations.push(format!(
                         "entry point {:?}: caller {addr:?} expected {} but observed {}",
                         ep.name,
+ feat/auth-matrix-reports-and-nested-auth-docs
                         if expected { "success".to_string() } else {
+
+                        if expected {
+                            "success".to_string()
+                        } else {
+ main
                             format!("error containing {:?}", expected_error.unwrap_or("an error"))
                         },
                         error_text.unwrap_or_else(|| "success".to_string()),
@@ -660,6 +723,7 @@ mod tests {
         env.assert_requires_auth(|| {});
     }
     #[test]
+ feat/auth-matrix-reports-and-nested-auth-docs
     fn reports_include_roles_denied_addresses_and_csv() {
         let env = TestEnv::new();
         let admin = env.address();
@@ -673,6 +737,51 @@ mod tests {
         assert!(csv.starts_with("entry_point,actor,role,allowed,expected_error"));
         assert!(csv.contains("admin"));
         assert!(csv.contains("false"));
+
+    fn a_panicking_cell_does_not_skip_remaining_cells() {
+        let env = TestEnv::new();
+        let first = env.address();
+        let second = env.address();
+        let calls = std::cell::Cell::new(0u32);
+        let matrix = AuthMatrix::new(&env).entry_point(
+            "panic_then_continue",
+            &[first.clone(), second.clone()],
+            |caller| {
+                calls.set(calls.get() + 1);
+                if *caller == first {
+                    panic!("simulated contract panic");
+                }
+                Ok(())
+            },
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            matrix.assert_enforced();
+        }));
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 2, "all matrix cells must be attempted");
+    }
+
+    #[test]
+    fn expected_error_text_is_checked_per_caller_cell() {
+        let env = TestEnv::new();
+        let allowed = env.address();
+        let denied = env.address();
+        AuthMatrix::new(&env)
+            .entry_point_with_expected_errors(
+                "role_guard",
+                std::slice::from_ref(&allowed),
+                &[(denied.clone(), "Contract")],
+                move |caller| {
+                    if *caller == allowed {
+                        Ok(())
+                    } else {
+                        Err(soroban_sdk::Error::from_contract_error(1))
+                    }
+                },
+            )
+            .assert_enforced();
+ main
     }
 
 }
