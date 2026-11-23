@@ -104,6 +104,15 @@ soroban-testkit limits --contract target/wasm32v1-none/release/my_contract.wasm 
 # signed amount parameters with no positive-value validation.
 soroban-testkit audit ./src --strict
 
+# Print only the audit summary without individual finding details.
+soroban-testkit audit ./src --summary-only
+
+# Disable ANSI color escape codes (also honors NO_COLOR env var).
+soroban-testkit audit ./src --no-color
+
+# Wrap text findings to a specified character width (e.g. 80 columns).
+soroban-testkit audit ./src --width 80
+
 # Stable machine-readable reports for automation and GitHub code scanning.
 soroban-testkit audit ./src --format json
 soroban-testkit audit ./src --format sarif > audit.sarif
@@ -152,8 +161,11 @@ reproduction instructions shell-quote paths containing spaces or quotes.
 `audit` accepts three scan roots: a crate directory (walked recursively for
 `.rs` files), a single `.rs` file, or `-` to read Rust source from stdin.
 While walking a directory it skips `target/`, `vendor/`, `node_modules/`,
-and hidden directories such as `.git/` and `.github/`, keeping build output
-and dependency trees out of recursive scans. A missing path is an actionable
+and hidden directories such as `.git/` and `.github/`, along with any
+directories passed via repeatable `--exclude <DIR>` flags or the `exclude = [...]`
+configuration key (exact relative directory paths; glob matching is not
+supported), keeping build output, generated source, and dependency trees out
+of recursive scans. A missing path is an actionable
 error rather than an empty "no findings" run. An explicitly selected excluded
 directory or single file is still scanned. Empty, whitespace-only, and
 comment-only Rust files are valid inputs with no findings. Raw identifiers
@@ -173,7 +185,12 @@ compares or prints is normalized first — symlinks and `.`/`..` components
 resolved — so one file always reports under a single spelling however its
 scan root was spelled on the command line. Findings are then reported in
 one deterministic order — file, then line, then rule, then message — so a
-report diff always reflects a real change rather than scan order. The
+report diff always reflects a real change rather than scan order. For
+multi-line findings, source ranges are reported additively: text output keeps
+the `file:line:` prefix and appends `:-<end_line>:` (e.g. `src/lib.rs:3:-8:`),
+JSON reports add an `end_line` field, and SARIF output sets `endLine` on the
+location region. Single-line findings report start positions as before. Line
+numbers are 1-based and end-inclusive. The
 nearest `.soroban-testkit.toml` or `soroban-testkit.toml` between the
 scanned source directory and that root supplies rule configuration; the
 dotted name takes precedence in the same directory. Single-file scans start
@@ -205,6 +222,34 @@ unexamined. A clean report does not certify generated code. The limitation
 is included in text, JSON (`summary.limitations`) and SARIF
 (`runs[].properties.limitations`) results. Inspect expanded source
 separately when generated code matters.
+
+### Rule Confidence & Known Limitations
+
+`soroban-testkit audit` is a heuristic linter, not a formal verification or security auditing tool. Rules have varying precision depending on their analysis technique.
+
+#### Confidence Scale
+- **High**: Direct syntactic match for a specific API call or unambiguous pattern. Minimal false positives within evaluated AST.
+- **Medium**: AST-based pattern matching over types and expressions within a single function. Limited by lack of cross-function, cross-crate, or macro expansion analysis.
+- **Low**: String or token pattern heuristic (substring search, identifier naming convention). Prone to false positives and negatives due to lack of type and execution flow analysis.
+- **Not Assessed**: The rule's precision and edge cases have not been formally evaluated.
+
+#### Rule Registry
+| Rule | Severity | Confidence | Primary Known Limitations |
+| --- | --- | --- | --- |
+| `missing-require-auth` | warning | medium | Cannot inspect macro expansions; auth validation in private helper functions without recognized auth stems is missed; no cross-file call graph analysis. |
+| `unchecked-i128-arithmetic` | warning | medium | Only checks `i128` bindings declared as function parameters; does not track local `let` bindings or struct fields; cannot inspect macros. |
+| `missing-ttl-bump` | warning | low | Heuristic token match on body source; does not track key equivalence between read and extend_ttl; misses TTL bumps in helper functions; ignores instance storage. |
+| `broad-mock-all-auths` | warning | high | Cannot detect calls generated through external test macros or helper functions outside test modules. |
+| `ignored-token-transfer-result` | warning | medium | Syntactic heuristic matching transfer methods without type resolution; binding to an unused variable (`let _ = ...`) bypasses detection. |
+| `missing-positive-amount-validation` | warning | low | Only inspects parameters named `*amount*`; does not evaluate branching or execution flow; helper validation missed. |
+| `unchecked-timestamp-arithmetic` | warning | low | Substring match on `timestamp`; flags any arithmetic in a function mentioning timestamp even on unrelated counters; no semantic type checking. |
+
+To inspect metadata, confidence, and limitations for any rule from the CLI, run:
+```sh
+soroban-testkit audit explain <rule>
+soroban-testkit audit rules
+soroban-testkit audit rules --format json
+```
 
 ## Status
 
@@ -252,3 +297,14 @@ add validation coverage for the batch payout auth model
 add a line-count and coverage comparison to validation
 
 add benchmark tracking for TestEnv construction
+
+## Nested sub-invoke authorization
+
+A top-level authorization assertion does not automatically authorize the contract calls it triggers. When an entry point invokes another contract, register the nested invocation in the mocked authorization tree as well:
+
+1. Add a `MockAuthInvoke` for the top-level call.
+2. Add each nested contract, function name, argument tuple, and its own `sub_invokes` list.
+3. Assert the complete tree for both the permitted and denied actor cells.
+4. Reset mocked authorizations between matrix cells so one successful invocation cannot satisfy a later nested call.
+
+For escrow streams and recurring contracts, keep the payer, recipient, operator, scheduler, and beneficiary addresses as named actors in the matrix. Then use `AuthMatrix::denied_addresses` to verify that every role excluded from a privileged entry point is still exercised. This catches a common false positive where the outer call is authorized while a nested transfer or schedule update is not.

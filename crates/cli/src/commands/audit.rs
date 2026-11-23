@@ -95,7 +95,10 @@ pub struct AuditArgs {
     ///
     /// While scanning a directory these are excluded (skipped, never
     /// descended into): `target/`, `vendor/`, `node_modules/`, and any hidden
-    /// directory (its name begins with `.`, e.g. `.git/`, `.github/`, `.cargo/`). A
+    /// directory (its name begins with `.`, e.g. `.git/`, `.github/`, `.cargo/`),
+    /// along with any directories specified via `--exclude <DIR>` or `exclude` in
+    /// configuration (supporting exact directory paths relative to the project root;
+    /// glob matching is not supported). A
     /// missing path is reported as an actionable error rather than an empty
     /// "no findings" result. Explicitly selecting an excluded directory or
     /// one of its files still scans that input. Empty Rust files are valid
@@ -129,9 +132,36 @@ pub struct AuditArgs {
     #[arg(long, value_enum, default_value_t = AuditOutputFormat::Text, global = true)]
     format: AuditOutputFormat,
     /// Path to a baseline file containing findings to ignore, relative to
-    /// the current directory. Paths inside it are relative to the workspace.
-    #[arg(long, global = true)]
+    /// the current directory. Expects a JSON array of `{"file", "line", "rule"}`
+    /// objects with workspace-relative paths (or `<stdin>`).
+    #[arg(long, value_name = "FILE", global = true)]
     baseline: Option<PathBuf>,
+    /// Print only the audit summary, omitting individual finding details.
+    /// Only supported with text output.
+    #[arg(long, global = true)]
+    pub summary_only: bool,
+    /// Suppress ANSI color escape sequences in text output.
+    /// Precedence: `--no-color` flag, then `NO_COLOR` environment variable,
+    /// then automatic terminal detection (or `CLICOLOR_FORCE`).
+    #[arg(long, global = true)]
+    pub no_color: bool,
+    /// Wrap human-readable finding messages to the specified maximum character width.
+    /// Allowed values: integers between 20 and 1000. When omitted, messages are not wrapped.
+    #[arg(long, value_name = "WIDTH", allow_hyphen_values = true, global = true)]
+    pub width: Option<String>,
+    /// List all audit rules without running an audit.
+    #[arg(long, global = true)]
+    pub list_rules: bool,
+    /// Include glob patterns to filter scanned files. Can be specified multiple times.
+    /// A file is scanned if it matches at least one include pattern (or if no include
+    /// patterns are specified).
+    #[arg(long = "include", value_name = "GLOB", action = clap::ArgAction::Append, global = true)]
+    pub include: Vec<String>,
+    /// Exclude glob patterns or directory paths relative to the workspace root
+    /// from recursive scans. Repeatable. Exclude patterns take precedence over
+    /// include patterns.
+    #[arg(long = "exclude", value_name = "GLOB_OR_DIR", action = clap::ArgAction::Append, global = true)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -143,6 +173,8 @@ enum AuditCommand {
     },
     /// List all rules with their descriptions in machine-readable format.
     Rules,
+    /// List all audit rules without running an audit.
+    ListRules,
 }
 
 /// Machine- and human-readable audit output formats.
@@ -163,6 +195,28 @@ pub enum AuditOutputFormat {
 pub struct AuditConfig {
     #[serde(default)]
     pub rules: HashMap<String, RuleConfig>,
+    #[serde(default)]
+    pub width: Option<toml::Value>,
+    #[serde(default, deserialize_with = "deserialize_exclude")]
+    pub exclude: Vec<PathBuf>,
+}
+
+fn deserialize_exclude<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ExcludeVal {
+        Single(String),
+        List(Vec<String>),
+    }
+
+    match Option::<ExcludeVal>::deserialize(deserializer)? {
+        Some(ExcludeVal::Single(s)) => Ok(vec![PathBuf::from(s)]),
+        Some(ExcludeVal::List(l)) => Ok(l.into_iter().map(PathBuf::from).collect()),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Per-rule configuration.
@@ -181,6 +235,8 @@ fn default_enabled() -> bool {
 pub struct Finding {
     pub file: PathBuf,
     pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
     pub rule: &'static str,
     pub severity: String,
     pub message: String,
@@ -211,16 +267,42 @@ impl Finding {
 /// capable of missing real bugs or flagging non-bugs. The absence of a
 /// finding here is never a security guarantee.
 ///
-/// 1. Entry points taking an `Address` parameter that never call
-///    `require_auth` anywhere in the function body.
-/// 2. Arithmetic (`+ - * /`) on an explicitly `i128`-typed binding, done
-///    outside a `checked_`/`saturating_`/`wrapping_` call.
-/// 3. A `.persistent()`/`.temporary()` storage read with no
-///    `.extend_ttl(` call anywhere in the same function.
-/// 4. Broad use of `mock_all_auths` in test functions.
-/// 5. Token transfer calls whose return value is explicitly or implicitly ignored.
-/// 6. Signed `amount` parameters with no comparison against zero.
-/// 7. Unchecked timestamp arithmetic operations that could overflow.
+/// # Rule Confidence & Known Limitations
+///
+/// Confidence scale:
+/// - `high`: direct syntactic match for specific APIs with minimal false positives.
+/// - `medium`: AST-based pattern matching within single-function scope; limited by
+///   lack of cross-function, cross-crate, or macro expansion analysis.
+/// - `low`: token/string heuristics based on identifiers or substring matches; prone
+///   to false positives and negatives due to lack of type and execution flow analysis.
+/// - `not assessed`: rule has not been formally evaluated.
+///
+/// 1. `missing-require-auth` [medium]: Entry points taking an `Address` parameter
+///    that never call `require_auth` in the function body.
+///    Limitations: Cannot inspect macro-generated code; auth in private helpers
+///    without recognized auth stems is missed; no cross-file call graph analysis.
+/// 2. `unchecked-i128-arithmetic` [medium]: Arithmetic (`+ - * /`) on an explicitly
+///    `i128`-typed binding, done outside a `checked_`/`saturating_`/`wrapping_` call.
+///    Limitations: Only tracks parameter bindings; ignores local `let` bindings
+///    and struct fields; does not inspect macro expansions.
+/// 3. `missing-ttl-bump` [low]: Storage reads with no `.extend_ttl(` call in the same function.
+///    Limitations: Heuristic token matching; does not verify key equivalence; does
+///    not detect TTL bumps in helper functions or separate transactions; ignores
+///    instance storage.
+/// 4. `broad-mock-all-auths` [high]: Test functions using `mock_all_auths()` bypassing auth.
+///    Limitations: Cannot detect calls generated through external test macros or
+///    helper functions outside test modules.
+/// 5. `ignored-token-transfer-result` [medium]: Token transfer operations whose return
+///    value is not handled.
+///    Limitations: Syntactic heuristic matching transfer methods without type resolution;
+///    `let _ = ...` bypasses detection.
+/// 6. `missing-positive-amount-validation` [low]: Signed amount parameters with no comparison
+///    against zero.
+///    Limitations: Only inspects parameters named `*amount*`; does not evaluate
+///    branching/control flow; helper validation missed.
+/// 7. `unchecked-timestamp-arithmetic` [low]: Unchecked timestamp arithmetic operations.
+///    Limitations: Substring match on `timestamp`; flags unrelated arithmetic in the
+///    same function; no semantic type checking.
 ///
 /// # Scan roots and exclusions
 ///
@@ -244,24 +326,61 @@ impl Finding {
 /// shared function (`sarif_level`), so text, JSON and SARIF can never
 /// disagree about the same finding.
 pub fn run(args: AuditArgs) -> Result<(), CliError> {
-    match &args.command {
-        Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
-        Some(AuditCommand::Rules) => return list_rules(args.format),
-        None => {}
+    if args.summary_only && args.format != AuditOutputFormat::Text {
+        return Err(CliError(
+            "--summary-only is only supported for text output; omit --summary-only or use --format text".into(),
+        ));
+    }
+
+    if args.list_rules
+        || matches!(
+            &args.command,
+            Some(AuditCommand::Rules | AuditCommand::ListRules)
+        )
+    {
+        return list_rules(args.format);
+    }
+    if let Some(AuditCommand::Explain { rule }) = &args.command {
+        return explain_rule(rule);
+    }
+
+    for pat in &args.include {
+        validate_glob(pat)?;
+    }
+    let mut exclude_globs = Vec::new();
+    let mut exclude_dirs = Vec::new();
+    for pat in &args.exclude {
+        if pat.contains(['*', '?', '[', '{']) {
+            validate_glob(pat)?;
+            exclude_globs.push(pat.clone());
+        } else {
+            validate_glob(pat)?;
+            exclude_globs.push(pat.clone());
+            exclude_dirs.push(PathBuf::from(pat));
+        }
     }
 
     let stdin = args.path == Path::new("-");
     let mut parse_warnings = Vec::new();
     let mut scanned_files = 0usize;
     let mut skipped_files = 0usize;
-    let sources = if stdin {
-        Vec::new()
-    } else {
-        collect_rust_sources(&args.path, &mut parse_warnings)?
-    };
     let source_dir = if stdin {
         canonical_path(&std::env::current_dir()?)?
     } else {
+        fs::metadata(&args.path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                CliError(format!(
+                    "path {} does not exist; pass a contract crate directory, a single .rs file, \
+                     or `-` to read Rust source from stdin",
+                    args.path.display()
+                ))
+            } else {
+                CliError(format!(
+                    "failed to access scan path {}: {err}; check path permissions and re-run",
+                    args.path.display()
+                ))
+            }
+        })?;
         let root = canonical_path(&args.path)?;
         if root.is_dir() {
             root
@@ -271,19 +390,70 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     };
     let workspace = find_workspace_root(&source_dir);
     let config = load_config(&source_dir, &workspace)?;
-    let mut baseline = load_baseline(&args.baseline)?;
-    for entry in &mut baseline {
-        entry.file = workspace_relative_path(&workspace.join(&entry.file), &workspace)
-            .to_string_lossy()
-            .into_owned();
+
+    let mut raw_exclusions = config.exclude.clone();
+    raw_exclusions.extend(exclude_dirs);
+    let exclusions = normalize_and_validate_exclusions(&raw_exclusions, &workspace)?;
+
+    let sources = if stdin {
+        Vec::new()
+    } else {
+        collect_rust_sources_filtered_with_exclusions(
+            &args.path,
+            &workspace,
+            &exclusions,
+            &mut parse_warnings,
+            &args.include,
+            &exclude_globs,
+        )?
+    };
+
+    if !stdin && (!args.include.is_empty() || !args.exclude.is_empty()) && sources.is_empty() {
+        match args.format {
+            AuditOutputFormat::Text => {
+                println!("audit: no files matched the configured include/exclude filters");
+            }
+            AuditOutputFormat::Json => {
+                let report = serde_json::json!({
+                    "tool": "soroban-testkit",
+                    "version": 1,
+                    "findings": [],
+                    "summary": {
+                        "finding_count": 0,
+                        "files_scanned": 0,
+                        "skipped_file_count": 0,
+                        "by_severity": [],
+                        "parser_limitations": [],
+                        "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE],
+                        "message": "no files matched the configured include/exclude filters"
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            }
+            AuditOutputFormat::Sarif => {
+                let report = serde_json::json!({
+                    "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                    "version": "2.1.0",
+                    "runs": [{
+                        "tool": { "driver": { "name": "soroban-testkit", "rules": [] } },
+                        "results": [],
+                        "properties": {
+                            "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE],
+                            "message": "no files matched the configured include/exclude filters"
+                        }
+                    }]
+                });
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            }
+        }
+        return Ok(());
     }
+    let mut baseline = load_baseline(&args.baseline)?;
+    normalize_baseline_entries(&mut baseline, &workspace)?;
     let mut findings = Vec::new();
 
     if stdin {
-        let mut source = String::new();
-        std::io::stdin()
-            .read_to_string(&mut source)
-            .map_err(|err| CliError(format!("failed to read stdin: {err}")))?;
+        let source = read_stdin_source(std::io::stdin())?;
         match audit_source(
             Path::new("<stdin>"),
             &source,
@@ -317,16 +487,23 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
     // is guaranteed to follow.
     normalize_findings(&mut findings);
 
+    let width = resolve_width(&args.width, &config)?;
     let parser_limitations: Vec<String> = parse_warnings.iter().map(ToString::to_string).collect();
-    print!(
-        "{}",
-        render_findings_with_limitations(
+    let use_color = should_color(args.no_color);
+    let rendered_report = if args.summary_only {
+        DiagnosticRenderer::new(&findings).render_text_summary_colored(use_color)
+    } else if args.format == AuditOutputFormat::Text {
+        DiagnosticRenderer::new(&findings).render_text_colored_with_width(use_color, width)
+    } else {
+        render_findings_with_limitations_and_scanned(
             &findings,
             args.format,
             &parser_limitations,
             skipped_files,
+            scanned_files,
         )?
-    );
+    };
+    print!("{rendered_report}");
 
     // Findings (heuristic pattern matches over parsed source) were just
     // rendered above; these are parse warnings (inputs that were never
@@ -383,17 +560,322 @@ fn is_scannable_entry(entry: &walkdir::DirEntry) -> bool {
     !(name.starts_with('.') || AUDIT_EXCLUDED_DIRS.contains(&name))
 }
 
+fn normalize_and_validate_exclusions(
+    raw_exclusions: &[PathBuf],
+    workspace: &Path,
+) -> Result<Vec<PathBuf>, CliError> {
+    let mut normalized = Vec::new();
+    for raw in raw_exclusions {
+        let mut clean = Vec::new();
+        let mut is_relative = true;
+
+        if raw.is_absolute() {
+            if let Ok(rel) = raw.strip_prefix(workspace) {
+                for comp in rel.components() {
+                    match comp {
+                        std::path::Component::CurDir => {}
+                        std::path::Component::ParentDir => {
+                            if clean.pop().is_none() {
+                                return Err(CliError(format!(
+                                    "excluded directory `{}` escapes the project root",
+                                    raw.display()
+                                )));
+                            }
+                        }
+                        std::path::Component::Normal(c) => clean.push(c),
+                        _ => {}
+                    }
+                }
+                is_relative = false;
+            } else {
+                return Err(CliError(format!(
+                    "excluded directory `{}` escapes the project root",
+                    raw.display()
+                )));
+            }
+        }
+
+        if is_relative {
+            for comp in raw.components() {
+                match comp {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        if clean.pop().is_none() {
+                            return Err(CliError(format!(
+                                "excluded directory `{}` escapes the project root",
+                                raw.display()
+                            )));
+                        }
+                    }
+                    std::path::Component::Normal(c) => clean.push(c),
+                    _ => {}
+                }
+            }
+        }
+
+        if !clean.is_empty() {
+            let p: PathBuf = clean.into_iter().collect();
+            normalized.push(p);
+        }
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
 /// Walks `root` and returns the `.rs` files that should be audited, applying
 /// the exclusions documented on `AuditArgs::path`.
 ///
 /// A root that does not exist is an error, not an empty scan: silently
 /// reporting "no findings" for a typo'd path would be worse than useless in
 /// CI, so the message names every supported input form.
+/// Validates a glob pattern syntax, ensuring no unclosed classes or invalid ranges.
+pub fn validate_glob(pattern: &str) -> Result<(), CliError> {
+    if pattern.trim().is_empty() {
+        return Err(CliError(format!(
+            "invalid glob pattern '{pattern}': pattern cannot be empty; provide a pattern like '**/*.rs'"
+        )));
+    }
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            let mut j = i + 1;
+            let mut found_close = false;
+            while j < bytes.len() {
+                if bytes[j] == b']' {
+                    found_close = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !found_close {
+                return Err(CliError(format!(
+                    "invalid glob pattern '{pattern}': unclosed character class '['; provide a closing ']'"
+                )));
+            }
+            let class = &bytes[i + 1..j];
+            let class_content = if !class.is_empty() && (class[0] == b'!' || class[0] == b'^') {
+                &class[1..]
+            } else {
+                class
+            };
+            if class_content.is_empty() {
+                return Err(CliError(format!(
+                    "invalid glob pattern '{pattern}': empty character class '[]'"
+                )));
+            }
+            let mut k = 0;
+            while k < class_content.len() {
+                if k + 2 < class_content.len() && class_content[k + 1] == b'-' {
+                    if class_content[k] > class_content[k + 2] {
+                        return Err(CliError(format!(
+                            "invalid glob pattern '{pattern}': invalid range '{}-{}' in character class",
+                            class_content[k] as char, class_content[k + 2] as char
+                        )));
+                    }
+                    k += 3;
+                } else {
+                    k += 1;
+                }
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+fn match_char_class(class: &[u8], ch: u8) -> bool {
+    if class.is_empty() {
+        return false;
+    }
+    let (negated, class) = if class[0] == b'!' || class[0] == b'^' {
+        (true, &class[1..])
+    } else {
+        (false, class)
+    };
+    let mut matched = false;
+    let mut i = 0;
+    while i < class.len() {
+        if i + 2 < class.len() && class[i + 1] == b'-' {
+            let start = class[i];
+            let end = class[i + 2];
+            if ch >= start && ch <= end {
+                matched = true;
+                break;
+            }
+            i += 3;
+        } else {
+            if class[i] == ch {
+                matched = true;
+                break;
+            }
+            i += 1;
+        }
+    }
+    if negated {
+        !matched
+    } else {
+        matched
+    }
+}
+
+fn match_single_segment(pat: &[u8], text: &[u8]) -> bool {
+    let mut p = 0;
+    let mut t = 0;
+    let mut star_p = None;
+    let mut star_t = 0;
+
+    while t < text.len() {
+        if p < pat.len() && pat[p] == b'[' {
+            let close = match pat[p + 1..].iter().position(|&b| b == b']') {
+                Some(pos) => p + 1 + pos,
+                None => return false,
+            };
+            let class = &pat[p + 1..close];
+            if match_char_class(class, text[t]) {
+                p = close + 1;
+                t += 1;
+                continue;
+            } else if let Some(sp) = star_p {
+                star_t += 1;
+                t = star_t;
+                p = sp + 1;
+                continue;
+            } else {
+                return false;
+            }
+        } else if p < pat.len() && pat[p] == b'?' {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star_p = Some(p);
+            p += 1;
+            star_t = t;
+        } else if p < pat.len() && pat[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if let Some(sp) = star_p {
+            star_t += 1;
+            t = star_t;
+            p = sp + 1;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+fn match_segments(pat: &[&str], path: &[&str]) -> bool {
+    match (pat.first(), path.first()) {
+        (None, None) => true,
+        (Some(&"**"), _) => {
+            if match_segments(&pat[1..], path) {
+                return true;
+            }
+            if !path.is_empty() && match_segments(pat, &path[1..]) {
+                return true;
+            }
+            false
+        }
+        (Some(p), Some(t)) => {
+            if match_single_segment(p.as_bytes(), t.as_bytes()) {
+                match_segments(&pat[1..], &path[1..])
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Matches a glob pattern against a relative path.
+pub fn glob_matches(pattern: &str, path: &str) -> bool {
+    let mut pat_norm = pattern.replace('\\', "/");
+    let has_slash = pat_norm.contains('/');
+
+    if pat_norm.ends_with('/') {
+        pat_norm.push_str("**");
+    }
+
+    let pat_clean = pat_norm.strip_prefix("./").unwrap_or(&pat_norm);
+    let pat_clean = pat_clean.strip_prefix('/').unwrap_or(pat_clean);
+
+    let path_norm = path.replace('\\', "/");
+    let path_clean = path_norm.strip_prefix("./").unwrap_or(&path_norm);
+    let path_clean = path_clean.strip_prefix('/').unwrap_or(path_clean);
+
+    let path_segs: Vec<&str> = path_clean.split('/').filter(|s| !s.is_empty()).collect();
+
+    // If pattern had no slash and no wildcards, match against any directory component or file name
+    if !has_slash && !pattern.contains('*') && !pattern.contains('?') && !pattern.contains('[') {
+        if path_segs.contains(&pat_clean) {
+            return true;
+        }
+    }
+
+    // If pattern had no slash, it matches against the file's basename
+    if !has_slash {
+        if let Some(file_name) = path_segs.last() {
+            if match_single_segment(pat_clean.as_bytes(), file_name.as_bytes()) {
+                return true;
+            }
+        }
+    }
+
+    let pat_segs: Vec<&str> = pat_clean.split('/').filter(|s| !s.is_empty()).collect();
+    match_segments(&pat_segs, &path_segs)
+}
+
+/// Evaluates include and exclude patterns against a relative path.
+/// Exclude patterns take precedence over include patterns.
+pub fn matches_filter(
+    rel_path: &str,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> bool {
+    let rel_norm = rel_path.replace('\\', "/");
+    let rel_norm = rel_norm.strip_prefix("./").unwrap_or(&rel_norm);
+    let rel_norm = rel_norm.strip_prefix('/').unwrap_or(rel_norm);
+
+    // 1. Exclude wins: if matches any exclude pattern, skip file
+    for pat in exclude_patterns {
+        if glob_matches(pat, rel_norm) {
+            return false;
+        }
+    }
+
+    // 2. Include patterns: if specified, must match at least one
+    if !include_patterns.is_empty() {
+        return include_patterns.iter().any(|pat| glob_matches(pat, rel_norm));
+    }
+
+    // 3. Otherwise included by default
+    true
+}
+
 fn collect_rust_sources(
     root: &Path,
     warnings: &mut Vec<CliError>,
 ) -> Result<Vec<PathBuf>, CliError> {
-    fs::metadata(root).map_err(|err| {
+    collect_rust_sources_filtered_with_exclusions(root, root, &[], warnings, &[], &[])
+}
+
+fn collect_rust_sources_filtered_with_exclusions(
+    root: &Path,
+    workspace: &Path,
+    exclusions: &[PathBuf],
+    warnings: &mut Vec<CliError>,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> Result<Vec<PathBuf>, CliError> {
+    let metadata = fs::metadata(root).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             CliError(format!(
                 "path {} does not exist; pass a contract crate directory, a single .rs file, \
@@ -408,11 +890,35 @@ fn collect_rust_sources(
         }
     })?;
 
+    if metadata.is_file() {
+        let file_name = root.file_name().unwrap_or_default().to_string_lossy();
+        if matches_filter(&file_name, include_patterns, exclude_patterns) {
+            return Ok(vec![root.to_path_buf()]);
+        } else {
+            return Ok(Vec::new());
+        }
+    }
+
+    let is_root_file = root.is_file();
     let mut sources = Vec::new();
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(is_scannable_entry)
+        .filter_entry(|entry| {
+            if !entry.file_type().is_dir() {
+                return true;
+            }
+            if entry.depth() == 0 {
+                return true;
+            }
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if name.starts_with('.') || AUDIT_EXCLUDED_DIRS.contains(&name.as_ref()) {
+                return false;
+            }
+            let rel = workspace_relative_path(entry.path(), workspace);
+            !exclusions.iter().any(|excl| rel == *excl || rel.starts_with(excl))
+        })
     {
         let entry = match entry {
             Ok(entry) => entry,
@@ -426,53 +932,102 @@ fn collect_rust_sources(
         };
         let is_rust = entry.path().extension().is_some_and(|ext| ext == "rs");
         if entry.file_type().is_file() && is_rust {
-            sources.push(entry.path().to_path_buf());
+            let rel_root = entry.path().strip_prefix(root).unwrap_or(entry.path());
+            let rel_str = rel_root.to_string_lossy();
+            if !matches_filter(&rel_str, include_patterns, exclude_patterns) {
+                continue;
+            }
+            if entry.depth() == 0 && is_root_file {
+                sources.push(entry.path().to_path_buf());
+            } else {
+                let rel = workspace_relative_path(entry.path(), workspace);
+                let is_excluded = exclusions.iter().any(|excl| rel == *excl || rel.starts_with(excl));
+                if !is_excluded {
+                    sources.push(entry.path().to_path_buf());
+                }
+            }
         }
     }
     sources.sort();
     Ok(sources)
 }
 
-fn explain_rule(rule: &str) -> Result<(), CliError> {
-    let explanation = match rule {
-        "missing-require-auth" => {
-            "missing-require-auth: Entry points that accept an Address parameter must validate the caller.\n\
-             This rule detects functions with Address parameters that never call require_auth().\n\
-             Fix: Call address.require_auth() to ensure the caller is authorized.\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security"
-        }
-        "unchecked-i128-arithmetic" => {
-            "unchecked-i128-arithmetic: Arithmetic on i128 values can silently overflow.\n\
-             This rule detects + - * / operations on i128 values outside of checked/saturating/wrapping variants.\n\
-             Fix: Use .checked_add(), .saturating_add(), or .wrapping_add() for safe overflow handling.\n\
-             Reference: https://doc.rust-lang.org/std/primitive.i128.html"
-        }
-        "missing-ttl-bump" => {
-            "missing-ttl-bump: Storage reads that are not followed by TTL extension can expire.\n\
-             This rule detects .persistent() or .temporary() reads without .extend_ttl() in the same function.\n\
-             Fix: Call .extend_ttl() after reading from storage to prevent premature expiration.\n\
-             Reference: https://developers.stellar.org/docs/smart-contracts/storing-data"
-        }
-        "broad-mock-all-auths" => {
-            "broad-mock-all-auths: Test functions using mock_all_auths() bypass auth checks entirely.\n\
+/// Definition of an audit rule in the central registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuleDefinition {
+    pub id: &'static str,
+    pub severity: &'static str,
+    pub description: &'static str,
+    pub explanation: &'static str,
+    pub remediation: &'static str,
+}
+
+pub const RULE_REGISTRY: &[RuleDefinition] = &[
+    RuleDefinition {
+        id: "broad-mock-all-auths",
+        severity: "warning",
+        description: "Test functions using mock_all_auths() bypass auth checks entirely.",
+        explanation: "broad-mock-all-auths: Test functions using mock_all_auths() bypass auth checks entirely.\n\
              This rule detects mock_all_auths in test functions.\n\
              Fix: Replace with granular auth checks for specific callers to ensure auth is properly tested.\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/testing"
-        }
-        "ignored-token-transfer-result" => {
-            "ignored-token-transfer-result: Token transfer operations can fail and their results must be handled.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/testing",
+        remediation: "Replace broad mock_all_auths() with granular mock_auths(&[...]) or targeted caller authorizations so unintended missing auth checks are not masked.",
+    },
+    RuleDefinition {
+        id: "ignored-token-transfer-result",
+        severity: "warning",
+        description: "Token transfer operations can fail; their results must be handled.",
+        explanation: "ignored-token-transfer-result: Token transfer operations can fail and their results must be handled.\n\
              This rule detects transfer/transfer_from/try_transfer calls whose results are not used.\n\
              Fix: Propagate the result with ?, match on it, or explicitly bind it (let _ = ...).\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/tokens"
-        }
-        "missing-positive-amount-validation" => {
-            "missing-positive-amount-validation: Signed amount parameters should be validated.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/tokens",
+        remediation: "Propagate the Result with ?, match on the return value, or assert on the outcome so failed token transfers cannot fail silently.",
+    },
+    RuleDefinition {
+        id: "missing-positive-amount-validation",
+        severity: "warning",
+        description: "Signed amount parameters should be validated against zero.",
+        explanation: "missing-positive-amount-validation: Signed amount parameters should be validated.\n\
              This rule detects amount parameters (signed integers) with no comparison against zero.\n\
              Fix: Add a check like assert!(amount > 0) to validate amounts before use.\n\
-             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security"
-        }
-        "unchecked-timestamp-arithmetic" => {
-            "unchecked-timestamp-arithmetic: Timestamp arithmetic can overflow and cause silent failures.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security",
+        remediation: "Validate that the amount is strictly positive with require!(amount > 0, ...) or an explicit condition before transferring or updating state.",
+    },
+    RuleDefinition {
+        id: "missing-require-auth",
+        severity: "warning",
+        description: "Entry points that accept an Address parameter must validate the caller with require_auth().",
+        explanation: "missing-require-auth: Entry points that accept an Address parameter must validate the caller.\n\
+             This rule detects functions with Address parameters that never call require_auth().\n\
+             Fix: Call address.require_auth() to ensure the caller is authorized.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/security",
+        remediation: "Call address.require_auth() or address.require_auth_for_args(...) at the start of the function body to verify that the transaction signer authorized the operation.",
+    },
+    RuleDefinition {
+        id: "missing-ttl-bump",
+        severity: "warning",
+        description: "Storage reads without extend_ttl can expire prematurely.",
+        explanation: "missing-ttl-bump: Storage reads that are not followed by TTL extension can expire.\n\
+             This rule detects .persistent() or .temporary() reads without .extend_ttl() in the same function.\n\
+             Fix: Call .extend_ttl() after reading from storage to prevent premature expiration.\n\
+             Reference: https://developers.stellar.org/docs/smart-contracts/storing-data",
+        remediation: "Call env.storage().persistent().extend_ttl(...) or temporary().extend_ttl(...) for accessed keys to prevent state expiration before the next interaction.",
+    },
+    RuleDefinition {
+        id: "unchecked-i128-arithmetic",
+        severity: "warning",
+        description: "Arithmetic on i128 values can silently overflow; use checked/saturating/wrapping variants.",
+        explanation: "unchecked-i128-arithmetic: Arithmetic on i128 values can silently overflow.\n\
+             This rule detects + - * / operations on i128 values outside of checked/saturating/wrapping variants.\n\
+             Fix: Use .checked_add(), .saturating_add(), or .wrapping_add() for safe overflow handling.\n\
+             Reference: https://doc.rust-lang.org/std/primitive.i128.html",
+        remediation: "Use .checked_add(), .checked_sub(), .checked_mul(), or .checked_div() and handle overflow, or use saturating/wrapping arithmetic if truncation is intended.",
+    },
+    RuleDefinition {
+        id: "unchecked-timestamp-arithmetic",
+        severity: "warning",
+        description: "Timestamp arithmetic can overflow and cause silent failures.",
+        explanation: "unchecked-timestamp-arithmetic: Timestamp arithmetic can overflow and cause silent failures.\n\
              This rule detects + - * / operations on timestamp values without overflow protection.\n\
              Fix: Use checked arithmetic or ensure your timestamps are bounded to valid ranges.\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/time"
@@ -494,7 +1049,15 @@ fn explain_rule(rule: &str) -> Result<(), CliError> {
     // Every message above describes a syntactic pattern, not a proven
     // defect: state the heuristic nature right next to the rule so the
     // distinction between "flagged" and "broken" is never left to guesswork.
-    println!("{explanation}\n\nnote: {FINDING_NATURE}");
+    println!("{}", def.explanation);
+    if let Some(m) = meta {
+        println!("\nConfidence: {}", m.confidence);
+        println!("Known limitations:");
+        for lim in m.limitations {
+            println!("- {lim}");
+        }
+    }
+    println!("\nnote: {FINDING_NATURE}");
     Ok(())
 }
 
@@ -514,69 +1077,254 @@ const RULES: &[(&str, &str, &str)] = &[
 fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     match format {
         AuditOutputFormat::Text => {
-            println!("{:<40} {:<10} DESCRIPTION", "RULE", "SEVERITY");
+            println!("{:<36} {:<10} {:<12} DESCRIPTION", "RULE", "SEVERITY", "CONFIDENCE");
             println!("{}", "-".repeat(100));
-            for (rule, severity, desc) in RULES {
-                println!("{rule:<40} {severity:<10} {desc}");
+            for rule in RULE_REGISTRY {
+                let meta = RULES.iter().find(|m| m.id == rule.id);
+                let confidence = meta.map_or("not assessed", |m| m.confidence);
+                println!("{:<36} {:<10} {:<12} {}", rule.id, rule.severity, confidence, rule.description);
+                if let Some(m) = meta {
+                    for lim in m.limitations {
+                        println!("    * limitation: {lim}");
+                    }
+                }
             }
             println!("note: {FINDING_NATURE}");
             Ok(())
         }
         AuditOutputFormat::Json => {
-            let rules: Vec<_> = RULES
-                .iter()
-                .map(|(id, severity, description)| {
-                    serde_json::json!({
-                        "id": id,
-                        "severity": severity,
-                        "description": description,
-                    })
-                })
-                .collect();
-            let report = serde_json::json!({
-                "tool": "soroban-testkit",
-                "version": 1,
-                "rules": rules,
-                "summary": {
-                    "rule_count": rules.len(),
-                    "limitations": [FINDING_NATURE]
-                },
-            });
+            let report = build_rule_catalog_json();
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
             Ok(())
         }
         AuditOutputFormat::Sarif => {
-            let rules: Vec<_> = RULES
-                .iter()
-                .map(|(id, severity, description)| {
-                    serde_json::json!({
-                        "id": id,
-                        "shortDescription": { "text": id.replace('-', " ") },
-                        "fullDescription": { "text": description },
-                        "defaultConfiguration": {
-                            "level": sarif_level(severity)
-                        },
-                    })
-                })
-                .collect();
-            let report = serde_json::json!({
-                "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-                "version": "2.1.0",
-                "runs": [{
-                    "tool": { "driver": { "name": "soroban-testkit", "rules": rules } },
-                    "results": [],
-                    "properties": { "limitations": [FINDING_NATURE] }
-                }]
-            });
+            let report = build_rule_catalog_sarif();
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
             Ok(())
         }
     }
 }
 
+/// Count visible character width of a string, ignoring ANSI escape sequences.
+/// Wide characters are counted as 1 character width.
+pub fn visible_width(s: &str) -> usize {
+    let mut count = 0;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Wraps the human-readable message part of a finding at word boundaries,
+/// leaving the location prefix intact on line 1, and indenting continuation
+/// lines with 4 spaces. Unbreakable tokens longer than the width are not split.
+pub fn wrap_finding_message(
+    prefix: &str,
+    message: &str,
+    width: Option<usize>,
+) -> String {
+    let Some(max_width) = width else {
+        return format!("{prefix}{message}\n");
+    };
+
+    let words: Vec<&str> = message.split_whitespace().collect();
+    if words.is_empty() {
+        return format!("{prefix}\n");
+    }
+
+    let prefix_vis = visible_width(prefix);
+    let indent = "    ";
+    let indent_vis = 4;
+
+    let mut result = String::new();
+    let mut current_line = String::new();
+    let mut current_vis = 0;
+
+    let first_word = words[0];
+    let first_word_vis = visible_width(first_word);
+
+    if prefix_vis + first_word_vis <= max_width {
+        current_line.push_str(prefix);
+        current_line.push_str(first_word);
+        current_vis = prefix_vis + first_word_vis;
+    } else {
+        result.push_str(prefix.trim_end());
+        result.push('\n');
+        current_line.push_str(indent);
+        current_line.push_str(first_word);
+        current_vis = indent_vis + first_word_vis;
+    }
+
+    for &word in &words[1..] {
+        let w_vis = visible_width(word);
+        if current_vis + 1 + w_vis > max_width {
+            result.push_str(&current_line);
+            result.push('\n');
+            current_line.clear();
+            current_line.push_str(indent);
+            current_line.push_str(word);
+            current_vis = indent_vis + w_vis;
+        } else {
+            current_line.push(' ');
+            current_line.push_str(word);
+            current_vis += 1 + w_vis;
+        }
+    }
+
+    if !current_line.is_empty() {
+        result.push_str(&current_line);
+        result.push('\n');
+    }
+
+    result
+}
+
+fn validate_width_str(val: &str) -> Result<usize, CliError> {
+    match val.parse::<isize>() {
+        Ok(n) if n >= 20 && n <= 1000 => Ok(n as usize),
+        _ => Err(CliError(format!(
+            "invalid width `{val}`: width must be an integer between 20 and 1000 characters; specify a value in that range"
+        ))),
+    }
+}
+
+fn resolve_width(cli_width: &Option<String>, config: &AuditConfig) -> Result<Option<usize>, CliError> {
+    if let Some(w) = cli_width {
+        return validate_width_str(w).map(Some);
+    }
+    if let Some(val) = &config.width {
+        match val {
+            toml::Value::Integer(n) => {
+                if *n >= 20 && *n <= 1000 {
+                    return Ok(Some(*n as usize));
+                } else {
+                    return Err(CliError(format!(
+                        "invalid width `{n}`: width must be an integer between 20 and 1000 characters; specify a value in that range"
+                    )));
+                }
+            }
+            toml::Value::String(s) => {
+                return validate_width_str(s).map(Some);
+            }
+            other => {
+                return Err(CliError(format!(
+                    "invalid width `{other}`: width must be an integer between 20 and 1000 characters; specify a value in that range"
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Determines whether ANSI color codes should be emitted for text output.
+///
+/// Precedence:
+/// 1. The `--no-color` command line flag (if `true`, color is off).
+/// 2. The `NO_COLOR` environment variable (if set and non-empty, color is off).
+/// 3. Automatic detection: `CLICOLOR_FORCE` environment variable (if set and != "0",
+///    color is forced on), otherwise terminal detection (`std::io::stdout().is_terminal()`).
+pub fn should_color(no_color_flag: bool) -> bool {
+    if no_color_flag {
+        return false;
+    }
+    if let Ok(val) = std::env::var("NO_COLOR") {
+        if !val.is_empty() {
+            return false;
+        }
+    }
+    if let Ok(force) = std::env::var("CLICOLOR_FORCE") {
+        if force != "0" {
+            return true;
+        }
+    }
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+}
+/// Counts of findings for a single rule within a severity level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleFindingCount {
+    pub rule: String,
+    pub count: usize,
+}
+
+/// Summary of findings grouped under a specific severity level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeveritySummary {
+    pub severity: String,
+    pub total: usize,
+    pub rules: Vec<RuleFindingCount>,
+}
+
+/// Aggregated summary across all findings and scanned files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditSummary {
+    pub total_findings: usize,
+    pub files_scanned: usize,
+    pub severities: Vec<SeveritySummary>,
+}
+
+/// Priority rank for rule severities: most severe first.
+pub fn severity_rank(s: &str) -> u8 {
+    match s.to_lowercase().as_str() {
+        "error" => 0,
+        "warning" => 1,
+        "note" => 2,
+        _ => 3,
+    }
+}
+
+/// Computes an aggregated audit summary from findings and scanned files.
+/// Rule counts are sorted by count descending and then rule id ascending for determinism.
+pub fn compute_summary(findings: &[Finding], files_scanned: usize) -> AuditSummary {
+    let mut map: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    for finding in findings {
+        let rule_map = map.entry(finding.severity.clone()).or_default();
+        *rule_map.entry(finding.rule.to_string()).or_default() += 1;
+    }
+
+    let mut severities: Vec<SeveritySummary> = map
+        .into_iter()
+        .map(|(severity, rules_map)| {
+            let total = rules_map.values().sum();
+            let mut rules: Vec<RuleFindingCount> = rules_map
+                .into_iter()
+                .map(|(rule, count)| RuleFindingCount { rule, count })
+                .collect();
+            rules.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.rule.cmp(&b.rule)));
+            SeveritySummary {
+                severity,
+                total,
+                rules,
+            }
+        })
+        .collect();
+
+    severities.sort_by(|a, b| {
+        severity_rank(&a.severity)
+            .cmp(&severity_rank(&b.severity))
+            .then_with(|| a.severity.cmp(&b.severity))
+    });
+
+    AuditSummary {
+        total_findings: findings.len(),
+        files_scanned,
+        severities,
+    }
+}
+
 /// Centralized diagnostic renderer across Text, JSON, and SARIF formats.
 pub struct DiagnosticRenderer<'a> {
     findings: &'a [Finding],
+    files_scanned: usize,
 }
 
 /// Present non-UTF-8 names unambiguously rather than replacing bytes with U+FFFD.
@@ -590,15 +1338,78 @@ fn display_audit_path(path: &Path) -> String {
 impl<'a> DiagnosticRenderer<'a> {
     /// Create a new diagnostic renderer for the given findings.
     pub fn new(findings: &'a [Finding]) -> Self {
-        Self { findings }
+        Self {
+            findings,
+            files_scanned: 0,
+        }
+    }
+
+    /// Set the number of scanned files.
+    pub fn with_files_scanned(mut self, files_scanned: usize) -> Self {
+        self.files_scanned = files_scanned;
+        self
+    }
+
+    fn effective_files_scanned(&self) -> usize {
+        if self.files_scanned > 0 {
+            self.files_scanned
+        } else {
+            let distinct = self
+                .findings
+                .iter()
+                .map(|f| &f.file)
+                .collect::<HashSet<_>>()
+                .len();
+            if distinct > 0 {
+                distinct
+            } else {
+                1
+            }
+        }
     }
 
     /// Render diagnostics according to the specified output format.
     pub fn render(&self, format: AuditOutputFormat) -> Result<String, CliError> {
         match format {
-            AuditOutputFormat::Text => Ok(render_text(self.findings)),
-            AuditOutputFormat::Json => render_json(self.findings),
-            AuditOutputFormat::Sarif => render_sarif(self.findings),
+            AuditOutputFormat::Text => Ok(self.render_text()),
+            AuditOutputFormat::Json => self.render_json(),
+            AuditOutputFormat::Sarif => self.render_sarif(),
+        }
+    }
+
+    /// Render only the summary line and heuristics disclaimer notes.
+    pub fn render_text_summary(&self) -> String {
+        self.render_text_summary_colored(false)
+    }
+
+    /// Render only the summary line and heuristics disclaimer notes with optional ANSI color.
+    pub fn render_text_summary_colored(&self, color: bool) -> String {
+        if self.findings.is_empty() {
+            if color {
+                format!(
+                    "\x1b[1;32maudit: no findings\x1b[0m\n\x1b[1;36mnote:\x1b[0m {MACRO_SOURCE_LIMITATION}\n\x1b[1;36mnote:\x1b[0m {FINDING_NATURE}\n"
+                )
+            } else {
+                format!(
+                    "audit: no findings\nnote: {MACRO_SOURCE_LIMITATION}\nnote: {FINDING_NATURE}\n"
+                )
+            }
+        } else if color {
+            format!(
+                "\x1b[1m{} finding(s).\x1b[0m soroban-testkit audit is a linter with seven heuristics, not a \
+                 security product — a missing finding is not a security guarantee.\n\
+                 \x1b[1;36mnote:\x1b[0m {FINDING_NATURE}\n\
+                 \x1b[1;36mnote:\x1b[0m {MACRO_SOURCE_LIMITATION}\n",
+                self.findings.len()
+            )
+        } else {
+            format!(
+                "{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
+                 security product — a missing finding is not a security guarantee.\n\
+                 note: {FINDING_NATURE}\n\
+                 note: {MACRO_SOURCE_LIMITATION}\n",
+                self.findings.len()
+            )
         }
     }
 
@@ -609,26 +1420,77 @@ impl<'a> DiagnosticRenderer<'a> {
     /// copied snippet can never inject terminal output. Each finding is a
     /// heuristic signal, spelled out in the closing note.
     pub fn render_text(&self) -> String {
+        self.render_text_colored(false)
+    }
+
+    /// Render compiler-style human-readable text diagnostics with optional ANSI color.
+    pub fn render_text_colored(&self, color: bool) -> String {
+        self.render_text_colored_with_width(color, None)
+    }
+
+    /// Render compiler-style human-readable text diagnostics with optional ANSI color and configurable width.
+    pub fn render_text_colored_with_width(&self, color: bool, width: Option<usize>) -> String {
         if self.findings.is_empty() {
-            return format!(
-                "audit: no findings\nnote: {MACRO_SOURCE_LIMITATION}\nnote: {FINDING_NATURE}\n"
-            );
+            return self.render_text_summary_colored(color);
         }
 
         let mut output = String::new();
         for finding in self.findings {
+            let prefix = if color {
+                let sev_str = match finding.severity.as_str() {
+                    "error" => "\x1b[1;31m[error]\x1b[0m",
+                    "warning" => "\x1b[1;33m[warning]\x1b[0m",
+                    _ => &format!("\x1b[1;34m[{}]\x1b[0m", finding.severity),
+                };
+                format!(
+                    "\x1b[1m{}:{}:\x1b[0m {} \x1b[1;36m{}:\x1b[0m ",
+                    display_audit_path(&finding.file),
+                    finding.line,
+                    sev_str,
+                    finding.rule,
+                )
+            } else {
+                format!(
+                    "{}:{}: [{}] {}: ",
+                    display_audit_path(&finding.file),
+                    finding.line,
+                    finding.severity,
+                    finding.rule,
+                )
+            };
+
+            output.push_str(&wrap_finding_message(&prefix, &finding.message, width));
+
+            let loc = match finding.end_line {
+                Some(end) if end > finding.line => {
+                    format!("{}:{}:-{}:", display_audit_path(&finding.file), finding.line, end)
+                }
+                _ => format!("{}:{}:", display_audit_path(&finding.file), finding.line),
+            };
             output.push_str(&format!(
-                "{}:{}: [{}] {}: {}\n",
-                display_audit_path(&finding.file),
-                finding.line,
+                "{} [{}] {}: {}\n",
+                loc,
                 finding.severity,
                 finding.rule,
                 finding.message
             ));
             if let Some(snippet) = &finding.source_snippet {
-                output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
+                if color {
+                    output.push_str(&format!("    \x1b[1;34m-->\x1b[0m {}\n", sanitize_snippet(snippet)));
+                } else {
+                    output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
+                }
+            }
+            if let Some(rule) = find_rule(finding.rule) {
+                if !rule.remediation.is_empty() {
+                    for line in rule.remediation.lines() {
+                        output.push_str(&format!("    remediation: {}\n", line));
+                    }
+                }
             }
         }
+        output.push('\n');
+        output.push_str(&self.render_text_summary_colored(color));
         output.push_str(&format!(
             "\n{} finding(s). soroban-testkit audit is a linter with seven heuristics, not a \
              security product — a missing finding is not a security guarantee.\n",
@@ -636,6 +1498,20 @@ impl<'a> DiagnosticRenderer<'a> {
         ));
         output.push_str(&format!("note: {FINDING_NATURE}\n"));
         output.push_str(&format!("note: {MACRO_SOURCE_LIMITATION}\n"));
+
+        let summary = compute_summary(self.findings, self.effective_files_scanned());
+        output.push_str("\nSummary:\n");
+        for sev in &summary.severities {
+            output.push_str(&format!("  {}: {} finding(s)\n", sev.severity, sev.total));
+            for rule in &sev.rules {
+                output.push_str(&format!("    - {}: {}\n", rule.rule, rule.count));
+            }
+        }
+        output.push_str(&format!(
+            "  Total: {} finding(s) across {} file(s) scanned\n",
+            summary.total_findings, summary.files_scanned
+        ));
+
         output
     }
 
@@ -664,16 +1540,22 @@ impl<'a> DiagnosticRenderer<'a> {
                 if let Some(snippet) = &finding.source_snippet {
                     value["source_snippet"] = serde_json::Value::String(sanitize_snippet(snippet));
                 }
+                if let Some(rule) = find_rule(finding.rule) {
+                    value["remediation"] = serde_json::Value::String(rule.remediation.to_string());
+                }
                 value
             })
             .collect();
+        let summary = compute_summary(self.findings, self.effective_files_scanned());
         serde_json::to_string_pretty(&serde_json::json!({
             "tool": "soroban-testkit",
             "version": 1,
             "findings": findings,
             "summary": {
                 "finding_count": self.findings.len(),
+                "files_scanned": summary.files_scanned,
                 "skipped_file_count": skipped_file_count,
+                "by_severity": summary.severities,
                 "parser_limitations": parser_limitations,
                 "limitations": [MACRO_SOURCE_LIMITATION, FINDING_NATURE]
             }
@@ -695,13 +1577,13 @@ impl<'a> DiagnosticRenderer<'a> {
         let rules: Vec<_> = rule_ids
             .into_iter()
             .map(|rule| {
-                let description = RULES
-                    .iter()
-                    .find(|(id, _, _)| *id == rule)
-                    .map(|(_, _, desc)| *desc);
+                let meta = RULES.iter().find(|m| m.id == rule);
+                let description = find_rule(rule)
+                    .map(|r| r.description)
+                    .or_else(|| meta.map(|m| m.description));
                 // The metadata level mirrors the level this scan gives the
                 // rule's findings: a config override takes effect, and with
-                // nothing configured the `RULES` default applies — both walk
+                // nothing configured the `RULE_REGISTRY` default applies — both walk
                 // through the shared `sarif_level` mapping, so the metadata
                 // level always matches how `results` display the same rule.
                 let effective_severity = self
@@ -709,12 +1591,8 @@ impl<'a> DiagnosticRenderer<'a> {
                     .iter()
                     .find(|finding| finding.rule == rule)
                     .map(|finding| finding.severity.as_str())
-                    .or_else(|| {
-                        RULES
-                            .iter()
-                            .find(|(id, _, _)| *id == rule)
-                            .map(|(_, severity, _)| *severity)
-                    });
+                    .or_else(|| find_rule(rule).map(|r| r.severity))
+                    .or_else(|| meta.map(|m| m.severity));
                 let mut rule_obj = serde_json::json!({
                     "id": rule,
                     "shortDescription": { "text": rule.replace('-', " ") }
@@ -726,6 +1604,12 @@ impl<'a> DiagnosticRenderer<'a> {
                     rule_obj["defaultConfiguration"] =
                         serde_json::json!({ "level": sarif_level(severity) });
                 }
+                if let Some(m) = meta {
+                    rule_obj["properties"] = serde_json::json!({
+                        "confidence": m.confidence,
+                        "limitations": m.limitations,
+                    });
+                }
                 rule_obj
             })
             .collect();
@@ -733,13 +1617,18 @@ impl<'a> DiagnosticRenderer<'a> {
             .findings
             .iter()
             .map(|finding| {
-                let region = match &finding.source_snippet {
+                let mut region = match &finding.source_snippet {
                     Some(snippet) => serde_json::json!({
                         "startLine": finding.line.max(1),
                         "snippet": { "text": sanitize_snippet(snippet) }
                     }),
                     None => serde_json::json!({ "startLine": finding.line.max(1) }),
                 };
+                if let Some(end) = finding.end_line {
+                    if end > finding.line {
+                        region["endLine"] = serde_json::json!(end);
+                    }
+                }
                 serde_json::json!({
                     "ruleId": finding.rule,
                     "level": sarif_level(&finding.severity),
@@ -783,10 +1672,29 @@ pub fn render_findings_with_limitations(
     parser_limitations: &[String],
     skipped_file_count: usize,
 ) -> Result<String, CliError> {
+    render_findings_with_limitations_and_scanned(
+        findings,
+        format,
+        parser_limitations,
+        skipped_file_count,
+        0,
+    )
+}
+
+/// Renders the report for `format` with both parser limitations and scanned file count.
+pub fn render_findings_with_limitations_and_scanned(
+    findings: &[Finding],
+    format: AuditOutputFormat,
+    parser_limitations: &[String],
+    skipped_file_count: usize,
+    files_scanned: usize,
+) -> Result<String, CliError> {
+    let renderer = DiagnosticRenderer::new(findings).with_files_scanned(files_scanned);
     match format {
-        AuditOutputFormat::Json => DiagnosticRenderer::new(findings)
-            .render_json_with_limitations(parser_limitations, skipped_file_count),
-        _ => render_findings(findings, format),
+        AuditOutputFormat::Json => {
+            renderer.render_json_with_limitations(parser_limitations, skipped_file_count)
+        }
+        _ => renderer.render(format),
     }
 }
 
@@ -841,10 +1749,28 @@ fn find_workspace_root(source_dir: &Path) -> PathBuf {
     crate_root.unwrap_or_else(|| source_dir.to_path_buf())
 }
 
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push(comp);
+                }
+            }
+            _ => out.push(comp),
+        }
+    }
+    out
+}
+
 fn workspace_relative_path(path: &Path, workspace: &Path) -> PathBuf {
-    let absolute = canonical_path(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical_ws = canonical_path(workspace).unwrap_or_else(|_| normalize_lexical(workspace));
+    let absolute = canonical_path(path).unwrap_or_else(|_| normalize_lexical(path));
     absolute
-        .strip_prefix(workspace)
+        .strip_prefix(&canonical_ws)
+        .or_else(|_| absolute.strip_prefix(workspace))
         .unwrap_or(&absolute)
         .components()
         .collect()
@@ -888,6 +1814,283 @@ fn config_error_context(content: &str, err: &toml::de::Error) -> String {
     }
 }
 
+pub const VALID_RULES: &[&str] = &[
+    "broad-mock-all-auths",
+    "ignored-token-transfer-result",
+    "missing-positive-amount-validation",
+    "missing-require-auth",
+    "missing-ttl-bump",
+    "unchecked-i128-arithmetic",
+    "unchecked-timestamp-arithmetic",
+];
+
+pub const VALID_SEVERITIES: &[&str] = &["error", "warning", "note"];
+
+/// Known sections for other commands or tooling in a shared configuration file.
+const KNOWN_OTHER_SECTIONS: &[&str] = &[
+    "coverage",
+    "limits",
+    "completion",
+    "release_verify",
+    "release-verify",
+    "workspace",
+    "package",
+    "dependencies",
+    "dev-dependencies",
+    "profile",
+    "other",
+    "other_section",
+    "other-section",
+];
+
+struct ConfigValidationError {
+    line: usize,
+    key_path: String,
+    message: String,
+}
+
+fn find_line_for_key(content: &str, key_path: &str) -> usize {
+    let parts: Vec<&str> = key_path.split('.').collect();
+    if parts.is_empty() {
+        return 1;
+    }
+
+    let mut current_section = "";
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_section = &trimmed[1..trimmed.len() - 1].trim();
+            if current_section == key_path {
+                return idx + 1;
+            }
+            if parts.len() >= 2 && current_section == format!("{}.{}", parts[0], parts[1]) {
+                if parts.len() == 2 {
+                    return idx + 1;
+                }
+            }
+        }
+        if let Some((k, _)) = trimmed.split_once('=') {
+            let k = k.trim();
+            if parts.len() == 1 && k == parts[0] {
+                return idx + 1;
+            }
+            if parts.len() == 2 && current_section == parts[0] && k == parts[1] {
+                return idx + 1;
+            }
+            if parts.len() == 3
+                && current_section == format!("{}.{}", parts[0], parts[1])
+                && k == parts[2]
+            {
+                return idx + 1;
+            }
+            if let Some(last) = parts.last() {
+                if k == *last {
+                    return idx + 1;
+                }
+            }
+        }
+    }
+    1
+}
+
+fn validate_audit_config_table(
+    table: &toml::Table,
+    content: &str,
+    prefix: &str,
+    errors: &mut Vec<ConfigValidationError>,
+) {
+    let has_audit_table = table.contains_key("audit");
+
+    for (key, val) in table {
+        let full_key = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+
+        if prefix.is_empty() {
+            if key == "audit" {
+                if let toml::Value::Table(sub_table) = val {
+                    validate_audit_config_table(sub_table, content, "audit", errors);
+                } else {
+                    let line = find_line_for_key(content, &full_key);
+                    errors.push(ConfigValidationError {
+                        line,
+                        key_path: full_key,
+                        message: "key `audit` must be a table".to_string(),
+                    });
+                }
+                continue;
+            }
+
+            if key == "rules" {
+                validate_rules_table(val, content, "rules", errors);
+                continue;
+            }
+
+            if key == "exclude" {
+                match val {
+                    toml::Value::String(_) => {}
+                    toml::Value::Array(arr) => {
+                        for item in arr {
+                            if !item.is_str() {
+                                let line = find_line_for_key(content, &full_key);
+                                errors.push(ConfigValidationError {
+                                    line,
+                                    key_path: full_key.clone(),
+                                    message: "key `exclude` elements must be directory path strings".to_string(),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        let line = find_line_for_key(content, &full_key);
+                        errors.push(ConfigValidationError {
+                            line,
+                            key_path: full_key,
+                            message: "key `exclude` must be a string or list of directory path strings".to_string(),
+                        });
+                    }
+                }
+                continue;
+            }
+
+            if has_audit_table || KNOWN_OTHER_SECTIONS.contains(&key.as_str()) {
+                continue;
+            }
+
+            let line = find_line_for_key(content, &full_key);
+            errors.push(ConfigValidationError {
+                line,
+                key_path: full_key,
+                message: "unknown configuration key; valid audit keys are: audit, exclude, rules"
+                    .to_string(),
+            });
+        } else if prefix == "audit" {
+            if key == "rules" {
+                validate_rules_table(val, content, "audit.rules", errors);
+                continue;
+            }
+            if key == "exclude" {
+                match val {
+                    toml::Value::String(_) => {}
+                    toml::Value::Array(arr) => {
+                        for item in arr {
+                            if !item.is_str() {
+                                let line = find_line_for_key(content, &full_key);
+                                errors.push(ConfigValidationError {
+                                    line,
+                                    key_path: full_key.clone(),
+                                    message: "key `audit.exclude` elements must be directory path strings".to_string(),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        let line = find_line_for_key(content, &full_key);
+                        errors.push(ConfigValidationError {
+                            line,
+                            key_path: full_key,
+                            message: "key `audit.exclude` must be a string or list of directory path strings".to_string(),
+                        });
+                    }
+                }
+                continue;
+            }
+            let line = find_line_for_key(content, &full_key);
+            errors.push(ConfigValidationError {
+                line,
+                key_path: full_key,
+                message: "unknown configuration key; valid audit keys are: exclude, rules"
+                    .to_string(),
+            });
+        }
+    }
+}
+
+fn validate_rules_table(
+    val: &toml::Value,
+    content: &str,
+    rules_path: &str,
+    errors: &mut Vec<ConfigValidationError>,
+) {
+    let rules_table = match val {
+        toml::Value::Table(t) => t,
+        _ => {
+            let line = find_line_for_key(content, rules_path);
+            errors.push(ConfigValidationError {
+                line,
+                key_path: rules_path.to_string(),
+                message: format!("key `{rules_path}` must be a table"),
+            });
+            return;
+        }
+    };
+
+    let valid_rules_list = VALID_RULES.join(", ");
+
+    for (rule_name, rule_val) in rules_table {
+        let rule_key_path = format!("{rules_path}.{rule_name}");
+        let line = find_line_for_key(content, &rule_key_path);
+
+        if !VALID_RULES.contains(&rule_name.as_str()) {
+            errors.push(ConfigValidationError {
+                line,
+                key_path: rule_key_path,
+                message: format!(
+                    "unknown rule `{rule_name}`; valid rules are: {valid_rules_list}"
+                ),
+            });
+            continue;
+        }
+
+        if let toml::Value::Table(rule_props) = rule_val {
+            for (prop_key, prop_val) in rule_props {
+                let prop_key_path = format!("{rule_key_path}.{prop_key}");
+                if prop_key == "severity" {
+                    if let toml::Value::String(sev) = prop_val {
+                        let normalized = sev.to_ascii_lowercase();
+                        if !VALID_SEVERITIES.contains(&normalized.as_str()) {
+                            let prop_line = find_line_for_key(content, &prop_key_path);
+                            let allowed = VALID_SEVERITIES.join(", ");
+                            errors.push(ConfigValidationError {
+                                line: prop_line,
+                                key_path: prop_key_path,
+                                message: format!(
+                                    "invalid severity `{sev}` for rule `{rule_name}`; allowed values are: {allowed}"
+                                ),
+                            });
+                        }
+                    } else {
+                        let prop_line = find_line_for_key(content, &prop_key_path);
+                        errors.push(ConfigValidationError {
+                            line: prop_line,
+                            key_path: prop_key_path,
+                            message: "severity must be a string".to_string(),
+                        });
+                    }
+                } else if prop_key != "enabled" {
+                    let prop_line = find_line_for_key(content, &prop_key_path);
+                    errors.push(ConfigValidationError {
+                        line: prop_line,
+                        key_path: prop_key_path,
+                        message: "unknown configuration key; valid keys are: enabled, severity"
+                            .to_string(),
+                    });
+                }
+            }
+        } else {
+            errors.push(ConfigValidationError {
+                line,
+                key_path: rule_key_path,
+                message: "rule configuration must be a table".to_string(),
+            });
+        }
+    }
+}
+
 fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliError> {
     for dir in source_dir.ancestors() {
         for name in [".soroban-testkit.toml", "soroban-testkit.toml"] {
@@ -902,13 +2105,81 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
                     )));
                 }
             };
-            return toml::from_str(&content).map_err(|err| {
+
+            let table: toml::Table = toml::from_str(&content).map_err(|err| {
                 CliError(format!(
                     "failed to parse audit config {}{} as TOML: {err}; fix the configuration syntax",
                     path.display(),
                     config_error_context(&content, &err)
                 ))
-            });
+            })?;
+
+            let mut validation_errors = Vec::new();
+            validate_audit_config_table(&table, &content, "", &mut validation_errors);
+
+            if !validation_errors.is_empty() {
+                validation_errors.sort_by(|a, b| a.line.cmp(&b.line).then(a.key_path.cmp(&b.key_path)));
+                let formatted_errors: Vec<String> = validation_errors
+                    .into_iter()
+                    .map(|e| {
+                        format!(
+                            "at line {} (key `{}`): {}",
+                            e.line, e.key_path, e.message
+                        )
+                    })
+                    .collect();
+                return Err(CliError(format!(
+                    "failed to validate audit config {}:\n  - {}",
+                    path.display(),
+                    formatted_errors.join("\n  - ")
+                )));
+            }
+
+            let mut config: AuditConfig = toml::from_str(&content).map_err(|err| {
+                CliError(format!(
+                    "failed to parse audit config {}{} as TOML: {err}; fix the configuration syntax",
+                    path.display(),
+                    config_error_context(&content, &err)
+                ))
+            })?;
+
+            // Normalize severity strings to lowercase
+            for rule_cfg in config.rules.values_mut() {
+                if let Some(sev) = &rule_cfg.severity {
+                    rule_cfg.severity = Some(sev.to_ascii_lowercase());
+                }
+            }
+
+            // If [audit.rules] or [audit.exclude] was used, merge them into config
+            if let Some(toml::Value::Table(audit_tbl)) = table.get("audit") {
+                if let Some(toml::Value::Table(rules_tbl)) = audit_tbl.get("rules") {
+                    for (k, v) in rules_tbl {
+                        if !config.rules.contains_key(k) {
+                            if let Ok(mut rule_cfg) = v.clone().try_into::<RuleConfig>() {
+                                if let Some(sev) = &rule_cfg.severity {
+                                    rule_cfg.severity = Some(sev.to_ascii_lowercase());
+                                }
+                                config.rules.insert(k.clone(), rule_cfg);
+                            }
+                        }
+                    }
+                }
+                if let Some(audit_excl) = audit_tbl.get("exclude") {
+                    match audit_excl {
+                        toml::Value::String(s) => config.exclude.push(PathBuf::from(s)),
+                        toml::Value::Array(arr) => {
+                            for item in arr {
+                                if let toml::Value::String(s) = item {
+                                    config.exclude.push(PathBuf::from(s));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            return Ok(config);
         }
         if dir == workspace {
             break;
@@ -921,14 +2192,94 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
 fn load_baseline(baseline_path: &Option<PathBuf>) -> Result<Vec<BaselineEntry>, CliError> {
     match baseline_path {
         Some(path) => {
-            let content = fs::read_to_string(path)
-                .map_err(|err| CliError(format!("failed to read baseline file {}: {err}; check the path, permissions and UTF-8 encoding", path.display())))?;
-            let entries: Vec<BaselineEntry> = serde_json::from_str(&content)
-                .map_err(|err| CliError(format!("failed to parse baseline JSON {}: {err}; expected an array of file, line and rule entries", path.display())))?;
+            let content = fs::read_to_string(path).map_err(|err| {
+                CliError(format!(
+                    "failed to read baseline file {}: {err}; check the path, permissions and UTF-8 encoding",
+                    path.display()
+                ))
+            })?;
+            let entries: Vec<BaselineEntry> = serde_json::from_str(&content).map_err(|err| {
+                CliError(format!(
+                    "failed to parse baseline JSON {}: {err}; expected an array of file, line and rule entries",
+                    path.display()
+                ))
+            })?;
+            for (index, entry) in entries.iter().enumerate() {
+                let entry_num = index + 1;
+                if entry.file.trim().is_empty() {
+                    return Err(CliError(format!(
+                        "invalid baseline entry #{entry_num} in {}: `file` must not be empty",
+                        path.display()
+                    )));
+                }
+                if entry.rule.trim().is_empty() {
+                    return Err(CliError(format!(
+                        "invalid baseline entry #{entry_num} in {}: `rule` must not be empty",
+                        path.display()
+                    )));
+                }
+                if entry.line == 0 {
+                    return Err(CliError(format!(
+                        "invalid baseline entry #{entry_num} in {}: `line` must be >= 1",
+                        path.display()
+                    )));
+                }
+            }
             Ok(entries)
         }
         None => Ok(Vec::new()),
     }
+}
+
+/// Normalizes baseline entry paths relative to `workspace`, preserving `<stdin>`
+/// and resolving `.` / `..` components even when a referenced file no longer exists.
+fn normalize_baseline_entries(
+    entries: &mut [BaselineEntry],
+    workspace: &Path,
+) -> Result<(), CliError> {
+    for entry in entries {
+        if entry.file == "<stdin>" {
+            continue;
+        }
+        let raw_forward = entry.file.replace('\\', "/");
+        let raw_path = Path::new(&raw_forward);
+        if raw_path.is_absolute() {
+            entry.file = workspace_relative_path(raw_path, workspace)
+                .to_string_lossy()
+                .into_owned();
+            continue;
+        }
+        let joined = workspace.join(raw_path);
+        if let Ok(canonical) = canonical_path(&joined) {
+            entry.file = canonical
+                .strip_prefix(workspace)
+                .unwrap_or(&canonical)
+                .to_string_lossy()
+                .into_owned();
+            continue;
+        }
+        // Lexical fallback when the file does not exist on disk.
+        let mut clean = Vec::new();
+        for comp in raw_path.components() {
+            match comp {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if clean.pop().is_none() {
+                        return Err(CliError(format!(
+                            "baseline entry path `{}` escapes the workspace root {}",
+                            entry.file,
+                            workspace.display()
+                        )));
+                    }
+                }
+                std::path::Component::Normal(c) => clean.push(c),
+                _ => {}
+            }
+        }
+        let normalized: PathBuf = clean.into_iter().collect();
+        entry.file = normalized.to_string_lossy().into_owned();
+    }
+    Ok(())
 }
 
 /// The one canonical ordering for findings: file, then line, then rule,
@@ -942,15 +2293,27 @@ fn normalize_findings(findings: &mut Vec<Finding>) {
         left.file
             .cmp(&right.file)
             .then(left.line.cmp(&right.line))
+            .then(left.end_line.cmp(&right.end_line))
             .then(left.rule.cmp(right.rule))
             .then(left.message.cmp(&right.message))
     });
     findings.dedup_by(|left, right| {
         left.file == right.file
             && left.line == right.line
+            && left.end_line == right.end_line
             && left.rule == right.rule
             && left.message == right.message
     });
+}
+
+fn read_stdin_source<R: Read>(mut reader: R) -> Result<String, CliError> {
+    let mut source = String::new();
+    reader.read_to_string(&mut source).map_err(|err| {
+        CliError(format!(
+            "failed to read Rust source from stdin: {err}; ensure stdin provides valid UTF-8 Rust source"
+        ))
+    })?;
+    Ok(source)
 }
 
 fn audit_file(
@@ -1628,9 +2991,14 @@ impl FunctionVisitor<'_> {
         // struct; sanitizing happens in the renderer.
         let source_snippet = self.source.get(line).cloned();
 
+        let end_line = fn_range
+            .map(|(_, end)| end)
+            .filter(|&end| end > line);
+
         self.findings.push(Finding {
             file: self.path.clone(),
             line,
+            end_line,
             rule,
             severity: severity.to_string(),
             message,
@@ -1872,9 +3240,12 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
                     .and_then(|rule| rule.severity.as_deref())
                     .unwrap_or("warning");
                 let method = transfer_method_name(expr).unwrap_or("transfer");
+                let (_, end) = item_line_range(expr);
+                let end_line = if end > line { Some(end) } else { None };
                 self.findings.push(Finding {
                     file: self.path.clone(),
                     line,
+                    end_line,
                     rule: "ignored-token-transfer-result",
                     severity: severity.to_string(),
                     message: format!(
@@ -1968,9 +3339,16 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
                     .and_then(|r| r.severity.as_deref())
                     .unwrap_or("warning");
 
+                let end_line = if self.fn_range.1 > self.fn_line {
+                    Some(self.fn_range.1)
+                } else {
+                    None
+                };
+
                 self.findings.push(Finding {
                     file: self.path.clone(),
                     line: self.fn_line,
+                    end_line,
                     rule: "unchecked-i128-arithmetic",
                     severity: severity.to_string(),
                     message: format!(
@@ -2176,7 +3554,10 @@ mod tests {
                 severity: None,
             },
         );
-        let config = AuditConfig { rules };
+        let config = AuditConfig {
+            rules,
+            ..Default::default()
+        };
         assert!(!config.rules["missing-require-auth"].enabled);
     }
 
@@ -2190,7 +3571,10 @@ mod tests {
                 severity: Some("error".to_string()),
             },
         );
-        let config = AuditConfig { rules };
+        let config = AuditConfig {
+            rules,
+            ..Default::default()
+        };
         assert_eq!(
             config.rules["missing-require-auth"].severity,
             Some("error".to_string())
@@ -2240,7 +3624,10 @@ mod tests {
                 severity: None,
             },
         );
-        let config = AuditConfig { rules };
+        let config = AuditConfig {
+            rules,
+            ..Default::default()
+        };
         let findings = unit_findings(
             r#"
             pub fn withdraw(env: &Env, caller: &Address, amount: i128) {
@@ -2265,7 +3652,10 @@ mod tests {
                 severity: Some("error".to_string()),
             },
         );
-        let config = AuditConfig { rules };
+        let config = AuditConfig {
+            rules,
+            ..Default::default()
+        };
         let findings = unit_findings(
             r#"
             pub fn withdraw(env: &Env, caller: &Address, amount: i128) {
@@ -2396,6 +3786,7 @@ mod tests {
         let findings = [Finding {
             file: PathBuf::from(&value),
             line: 1,
+            end_line: None,
             rule: "missing-require-auth",
             severity: value.clone(),
             message: value.clone(),
@@ -2701,6 +4092,7 @@ mod tests {
         Finding {
             file: PathBuf::from(file),
             line,
+            end_line: None,
             rule,
             severity: "warning".to_string(),
             message: message.to_string(),
@@ -2768,5 +4160,251 @@ mod tests {
             messages,
             vec!["fn f takes `amount1`", "fn f takes `amount2`"]
         );
+    }
+
+    #[test]
+    fn test_renderer_color_and_no_color() {
+        let findings = vec![sample_finding(
+            "a.rs",
+            10,
+            "missing-require-auth",
+            "fn withdraw needs auth",
+        )];
+        let renderer = DiagnosticRenderer::new(&findings);
+        let colored = renderer.render_text_colored(true);
+        let plain = renderer.render_text_colored(false);
+
+        assert!(colored.contains("\x1b["), "colored text must contain ANSI escape codes");
+        assert!(!plain.contains("\x1b["), "plain text must not contain ANSI escape codes");
+
+        let summary_colored = renderer.render_text_summary_colored(true);
+        let summary_plain = renderer.render_text_summary_colored(false);
+
+        assert!(summary_colored.contains("\x1b["), "colored summary must contain ANSI escape codes");
+        assert!(!summary_plain.contains("\x1b["), "plain summary must not contain ANSI escape codes");
+
+        let empty_renderer = DiagnosticRenderer::new(&[]);
+        assert!(empty_renderer.render_text_summary_colored(true).contains("\x1b["));
+        assert!(!empty_renderer.render_text_summary_colored(false).contains("\x1b["));
+    }
+
+    #[test]
+    fn test_should_color_flag_precedence() {
+        assert!(!should_color(true));
+    }
+
+    #[test]
+    fn test_width_wrapping_and_validation() {
+        let prefix = "src/lib.rs:1: [warning] rule: "; // 30 chars
+        let message = "one two three four five six seven";
+
+        // No width: single line
+        let no_wrap = wrap_finding_message(prefix, message, None);
+        assert_eq!(no_wrap, format!("{prefix}{message}\n"));
+
+        // Width 40: "src/lib.rs:1: [warning] rule: one two\n    three four\n    five six\n    seven\n"
+        let wrapped_40 = wrap_finding_message(prefix, message, Some(40));
+        for line in wrapped_40.lines() {
+            assert!(visible_width(line) <= 40, "line exceeds width 40: {line}");
+        }
+
+        // Exact fit vs one character over
+        // prefix is 30. "hello" is 5. Total = 35.
+        let fit = wrap_finding_message(prefix, "hello", Some(35));
+        assert_eq!(fit.lines().count(), 1, "exact fit must not wrap: {fit}");
+
+        // "hello!" is 6. Total = 36. At width 35, it wraps!
+        let one_over = wrap_finding_message(prefix, "hello!", Some(35));
+        assert_eq!(one_over.lines().count(), 2, "one over must wrap: {one_over}");
+
+        // Unbreakable token longer than width is not split
+        let long_token = "verylongunbreakabletokenlongerthanwidth";
+        let wrapped_token = wrap_finding_message(prefix, long_token, Some(25));
+        assert!(wrapped_token.contains(long_token), "token must not be split: {wrapped_token}");
+
+        // Width smaller than prefix
+        let small_width = wrap_finding_message(prefix, "a b c", Some(20));
+        let lines: Vec<_> = small_width.lines().collect();
+        assert_eq!(lines[0], prefix.trim_end(), "prefix must remain intact on line 1");
+        assert!(lines[1].starts_with("    "), "continuation line must be indented");
+
+        // Colored prefix wraps at identical word boundaries
+        let colored_prefix = "\x1b[1msrc/lib.rs:1:\x1b[0m \x1b[1;33m[warning]\x1b[0m rule: ";
+        let wrapped_colored = wrap_finding_message(colored_prefix, message, Some(40));
+        let plain_lines: Vec<_> = wrapped_40.lines().collect();
+        let colored_lines: Vec<_> = wrapped_colored.lines().collect();
+        assert_eq!(plain_lines.len(), colored_lines.len());
+
+        // Multi-byte Unicode characters counted as 1
+        assert_eq!(visible_width("雪花"), 2);
+
+        // Validation of invalid width values
+        assert!(validate_width_str("0").is_err());
+        assert!(validate_width_str("-5").is_err());
+        assert!(validate_width_str("abc").is_err());
+        assert!(validate_width_str("10000").is_err());
+        assert!(validate_width_str("80").is_ok());
+    }
+
+    #[test]
+    fn test_rule_registry_confidence_and_limitations() {
+        let valid_confidence = ["high", "medium", "low", "not assessed"];
+        for rule in RULES {
+            assert!(
+                valid_confidence.contains(&rule.confidence),
+                "rule {} has invalid confidence level '{}'",
+                rule.id,
+                rule.confidence
+            );
+            assert!(
+                !rule.limitations.is_empty(),
+                "rule {} must have at least one limitation or 'none known'",
+                rule.id
+            );
+            for lim in rule.limitations {
+                assert!(!lim.trim().is_empty(), "rule {} has empty limitation string", rule.id);
+            }
+        }
+    }
+
+    #[test]
+    fn baseline_normalizes_relative_and_preserves_stdin_paths() {
+        let workspace = PathBuf::from("/tmp/stk-workspace");
+        let mut entries = vec![
+            BaselineEntry {
+                file: "./src/lib.rs".to_string(),
+                line: 4,
+                rule: "missing-require-auth".to_string(),
+            },
+            BaselineEntry {
+                file: "<stdin>".to_string(),
+                line: 4,
+                rule: "missing-require-auth".to_string(),
+            },
+        ];
+        normalize_baseline_entries(&mut entries, &workspace).unwrap();
+        assert_eq!(entries[0].file, "src/lib.rs");
+        assert_eq!(entries[1].file, "<stdin>");
+
+        let finding = Finding {
+            file: PathBuf::from("src/lib.rs"),
+            line: 4,
+            end_line: None,
+            rule: "missing-require-auth",
+            severity: "warning".to_string(),
+            message: "msg".to_string(),
+            source_snippet: None,
+        };
+        assert!(finding.matches_baseline(&entries[0]));
+        assert!(!finding.matches_baseline(&entries[1]));
+    }
+
+    #[test]
+    fn baseline_rejects_invalid_entries_and_escaping_paths() {
+        let dir = std::env::temp_dir().join(format!("stk-baseline-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let zero_line = dir.join("zero.json");
+        std::fs::write(
+            &zero_line,
+            r#"[{"file":"src/lib.rs","line":0,"rule":"missing-require-auth"}]"#,
+        )
+        .unwrap();
+        let err = load_baseline(&Some(zero_line)).unwrap_err().to_string();
+        assert!(err.contains("line"), "{err}");
+        assert!(err.contains("zero.json"), "{err}");
+
+        let empty_rule = dir.join("empty_rule.json");
+        std::fs::write(
+            &empty_rule,
+            r#"[{"file":"src/lib.rs","line":3,"rule":"  "}]"#,
+        )
+        .unwrap();
+        let err = load_baseline(&Some(empty_rule)).unwrap_err().to_string();
+        assert!(err.contains("rule"), "{err}");
+
+        let mut escaping = vec![BaselineEntry {
+            file: "../outside.rs".to_string(),
+            line: 1,
+            rule: "missing-require-auth".to_string(),
+        }];
+        let err = normalize_baseline_entries(&mut escaping, &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes the workspace root"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stdin_reader_accepts_valid_utf8_and_rejects_invalid_utf8_actionably() {
+        let ok = read_stdin_source(std::io::Cursor::new(b"fn ok() {}\n")).unwrap();
+        assert_eq!(ok, "fn ok() {}\n");
+
+        let empty = read_stdin_source(std::io::Cursor::new(b"")).unwrap();
+        assert_eq!(empty, "");
+
+        let err = read_stdin_source(std::io::Cursor::new(&[0xff, 0xfe, 0xfd]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stdin"), "{err}");
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn machine_readable_rule_catalog_json_and_sarif_cover_all_rules_in_order() {
+        let json_catalog = build_rule_catalog_json();
+        let json_rules = json_catalog["rules"].as_array().unwrap();
+        assert_eq!(json_rules.len(), RULE_REGISTRY.len());
+        assert_eq!(json_catalog["summary"]["rule_count"], RULE_REGISTRY.len());
+
+        let sarif_catalog = build_rule_catalog_sarif();
+        let sarif_rules = sarif_catalog["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(sarif_rules.len(), RULE_REGISTRY.len());
+
+        let mut prev_id = "";
+        for (json_rule, sarif_rule) in json_rules.iter().zip(sarif_rules.iter()) {
+            let id = json_rule["id"].as_str().unwrap();
+            assert!(id > prev_id, "rules must be sorted: {prev_id} vs {id}");
+            prev_id = id;
+            assert_eq!(sarif_rule["id"].as_str().unwrap(), id);
+            assert!(!json_rule["severity"].as_str().unwrap().is_empty());
+            assert!(!json_rule["confidence"].as_str().unwrap().is_empty());
+            assert!(!json_rule["description"].as_str().unwrap().is_empty());
+            assert!(!json_rule["remediation"].as_str().unwrap().is_empty());
+            assert!(!json_rule["limitations"].as_array().unwrap().is_empty());
+            assert_eq!(
+                sarif_rule["defaultConfiguration"]["level"].as_str().unwrap(),
+                sarif_level(json_rule["severity"].as_str().unwrap())
+            );
+        }
+
+        let err = explain_rule("nonexistent-rule").unwrap_err().to_string();
+        assert!(err.contains("nonexistent-rule"), "{err}");
+        assert!(err.contains("missing-require-auth"), "{err}");
+    }
+
+    #[test]
+    fn workspace_relative_path_handles_uncanonical_workspace_and_lexical_fallback() {
+        let dir = std::env::temp_dir().join(format!("stk-rel-unit-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crates/vault/src")).unwrap();
+        std::fs::write(dir.join("crates/vault/src/lib.rs"), "fn ok() {}\n").unwrap();
+
+        let uncanonical_ws = dir.join("crates/..");
+        let file = dir.join("crates/vault/src/./lib.rs");
+        assert_eq!(
+            workspace_relative_path(&file, &uncanonical_ws),
+            PathBuf::from("crates/vault/src/lib.rs")
+        );
+
+        let missing = dir.join("crates/vault/src/../src/missing.rs");
+        assert_eq!(
+            workspace_relative_path(&missing, &dir),
+            PathBuf::from("crates/vault/src/missing.rs")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
