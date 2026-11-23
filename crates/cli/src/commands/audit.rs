@@ -867,7 +867,9 @@ pub fn matches_filter(
 
     // 2. Include patterns: if specified, must match at least one
     if !include_patterns.is_empty() {
-        return include_patterns.iter().any(|pat| glob_matches(pat, rel_norm));
+        return include_patterns
+            .iter()
+            .any(|pat| glob_matches(pat, rel_norm));
     }
 
     // 3. Otherwise included by default
@@ -931,7 +933,9 @@ fn collect_rust_sources_filtered_with_exclusions(
                 return false;
             }
             let rel = workspace_relative_path(entry.path(), workspace);
-            !exclusions.iter().any(|excl| rel == *excl || rel.starts_with(excl))
+            !exclusions
+                .iter()
+                .any(|excl| rel == *excl || rel.starts_with(excl))
         })
     {
         let entry = match entry {
@@ -955,7 +959,9 @@ fn collect_rust_sources_filtered_with_exclusions(
                 sources.push(entry.path().to_path_buf());
             } else {
                 let rel = workspace_relative_path(entry.path(), workspace);
-                let is_excluded = exclusions.iter().any(|excl| rel == *excl || rel.starts_with(excl));
+                let is_excluded = exclusions
+                    .iter()
+                    .any(|excl| rel == *excl || rel.starts_with(excl));
                 if !is_excluded {
                     sources.push(entry.path().to_path_buf());
                 }
@@ -1320,12 +1326,18 @@ fn build_rule_catalog_sarif() -> serde_json::Value {
 fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     match format {
         AuditOutputFormat::Text => {
-            println!("{:<36} {:<10} {:<12} DESCRIPTION", "RULE", "SEVERITY", "CONFIDENCE");
+            println!(
+                "{:<36} {:<10} {:<12} DESCRIPTION",
+                "RULE", "SEVERITY", "CONFIDENCE"
+            );
             println!("{}", "-".repeat(100));
             for rule in RULE_REGISTRY {
                 let meta = RULES.iter().find(|m| m.id == rule.id);
                 let confidence = meta.map_or("not assessed", |m| m.confidence);
-                println!("{:<36} {:<10} {:<12} {}", rule.id, rule.severity, confidence, rule.description);
+                println!(
+                    "{:<36} {:<10} {:<12} {}",
+                    rule.id, rule.severity, confidence, rule.description
+                );
                 if let Some(m) = meta {
                     for lim in m.limitations {
                         println!("    * limitation: {lim}");
@@ -1370,11 +1382,7 @@ pub fn visible_width(s: &str) -> usize {
 /// Wraps the human-readable message part of a finding at word boundaries,
 /// leaving the location prefix intact on line 1, and indenting continuation
 /// lines with 4 spaces. Unbreakable tokens longer than the width are not split.
-pub fn wrap_finding_message(
-    prefix: &str,
-    message: &str,
-    width: Option<usize>,
-) -> String {
+pub fn wrap_finding_message(prefix: &str, message: &str, width: Option<usize>) -> String {
     let Some(max_width) = width else {
         return format!("{prefix}{message}\n");
     };
@@ -1440,7 +1448,10 @@ fn validate_width_str(val: &str) -> Result<usize, CliError> {
     }
 }
 
-fn resolve_width(cli_width: &Option<String>, config: &AuditConfig) -> Result<Option<usize>, CliError> {
+fn resolve_width(
+    cli_width: &Option<String>,
+    config: &AuditConfig,
+) -> Result<Option<usize>, CliError> {
     if let Some(w) = cli_width {
         return validate_width_str(w).map(Some);
     }
@@ -1706,20 +1717,25 @@ impl<'a> DiagnosticRenderer<'a> {
 
             let loc = match finding.end_line {
                 Some(end) if end > finding.line => {
-                    format!("{}:{}:-{}:", display_audit_path(&finding.file), finding.line, end)
+                    format!(
+                        "{}:{}:-{}:",
+                        display_audit_path(&finding.file),
+                        finding.line,
+                        end
+                    )
                 }
                 _ => format!("{}:{}:", display_audit_path(&finding.file), finding.line),
             };
             output.push_str(&format!(
                 "{} [{}] {}: {}\n",
-                loc,
-                finding.severity,
-                finding.rule,
-                finding.message
+                loc, finding.severity, finding.rule, finding.message
             ));
             if let Some(snippet) = &finding.source_snippet {
                 if color {
-                    output.push_str(&format!("    \x1b[1;34m-->\x1b[0m {}\n", sanitize_snippet(snippet)));
+                    output.push_str(&format!(
+                        "    \x1b[1;34m-->\x1b[0m {}\n",
+                        sanitize_snippet(snippet)
+                    ));
                 } else {
                     output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
                 }
@@ -2185,7 +2201,9 @@ fn validate_audit_config_table(
                                 errors.push(ConfigValidationError {
                                     line,
                                     key_path: full_key.clone(),
-                                    message: "key `exclude` elements must be directory path strings".to_string(),
+                                    message:
+                                        "key `exclude` elements must be directory path strings"
+                                            .to_string(),
                                 });
                                 break;
                             }
@@ -2196,7 +2214,9 @@ fn validate_audit_config_table(
                         errors.push(ConfigValidationError {
                             line,
                             key_path: full_key,
-                            message: "key `exclude` must be a string or list of directory path strings".to_string(),
+                            message:
+                                "key `exclude` must be a string or list of directory path strings"
+                                    .to_string(),
                         });
                     }
                 }
@@ -2286,9 +2306,7 @@ fn validate_rules_table(
             errors.push(ConfigValidationError {
                 line,
                 key_path: rule_key_path,
-                message: format!(
-                    "unknown rule `{rule_name}`; valid rules are: {valid_rules_list}"
-                ),
+                message: format!("unknown rule `{rule_name}`; valid rules are: {valid_rules_list}"),
             });
             continue;
         }
@@ -2365,15 +2383,11 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
             validate_audit_config_table(&table, &content, "", &mut validation_errors);
 
             if !validation_errors.is_empty() {
-                validation_errors.sort_by(|a, b| a.line.cmp(&b.line).then(a.key_path.cmp(&b.key_path)));
+                validation_errors
+                    .sort_by(|a, b| a.line.cmp(&b.line).then(a.key_path.cmp(&b.key_path)));
                 let formatted_errors: Vec<String> = validation_errors
                     .into_iter()
-                    .map(|e| {
-                        format!(
-                            "at line {} (key `{}`): {}",
-                            e.line, e.key_path, e.message
-                        )
-                    })
+                    .map(|e| format!("at line {} (key `{}`): {}", e.line, e.key_path, e.message))
                     .collect();
                 return Err(CliError(format!(
                     "failed to validate audit config {}:\n  - {}",
@@ -3190,9 +3204,7 @@ impl FunctionVisitor<'_> {
         // struct; sanitizing happens in the renderer.
         let source_snippet = self.source.get(line).cloned();
 
-        let end_line = fn_range
-            .map(|(_, end)| end)
-            .filter(|&end| end > line);
+        let end_line = fn_range.map(|(_, end)| end).filter(|&end| end > line);
 
         self.findings.push(Finding {
             file: self.path.clone(),
@@ -4726,13 +4738,9 @@ mod tests {
     fn json_report_lists_parser_limitations_apart_from_findings() {
         let findings = audit_source_for_test("pub fn deposit(amount: i128) { save(amount); }");
         let limitations = vec!["failed to parse Rust source broken.rs:1:8".to_string()];
-        let output = render_findings_with_limitations(
-            &findings,
-            AuditOutputFormat::Json,
-            &limitations,
-            1,
-        )
-        .unwrap();
+        let output =
+            render_findings_with_limitations(&findings, AuditOutputFormat::Json, &limitations, 1)
+                .unwrap();
         let report: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(report["summary"]["finding_count"], findings.len());
         assert_eq!(report["findings"].as_array().unwrap().len(), findings.len());
@@ -5093,18 +5101,34 @@ mod tests {
         let colored = renderer.render_text_colored(true);
         let plain = renderer.render_text_colored(false);
 
-        assert!(colored.contains("\x1b["), "colored text must contain ANSI escape codes");
-        assert!(!plain.contains("\x1b["), "plain text must not contain ANSI escape codes");
+        assert!(
+            colored.contains("\x1b["),
+            "colored text must contain ANSI escape codes"
+        );
+        assert!(
+            !plain.contains("\x1b["),
+            "plain text must not contain ANSI escape codes"
+        );
 
         let summary_colored = renderer.render_text_summary_colored(true);
         let summary_plain = renderer.render_text_summary_colored(false);
 
-        assert!(summary_colored.contains("\x1b["), "colored summary must contain ANSI escape codes");
-        assert!(!summary_plain.contains("\x1b["), "plain summary must not contain ANSI escape codes");
+        assert!(
+            summary_colored.contains("\x1b["),
+            "colored summary must contain ANSI escape codes"
+        );
+        assert!(
+            !summary_plain.contains("\x1b["),
+            "plain summary must not contain ANSI escape codes"
+        );
 
         let empty_renderer = DiagnosticRenderer::new(&[]);
-        assert!(empty_renderer.render_text_summary_colored(true).contains("\x1b["));
-        assert!(!empty_renderer.render_text_summary_colored(false).contains("\x1b["));
+        assert!(empty_renderer
+            .render_text_summary_colored(true)
+            .contains("\x1b["));
+        assert!(!empty_renderer
+            .render_text_summary_colored(false)
+            .contains("\x1b["));
     }
 
     #[test]
@@ -5134,18 +5158,32 @@ mod tests {
 
         // "hello!" is 6. Total = 36. At width 35, it wraps!
         let one_over = wrap_finding_message(prefix, "hello!", Some(35));
-        assert_eq!(one_over.lines().count(), 2, "one over must wrap: {one_over}");
+        assert_eq!(
+            one_over.lines().count(),
+            2,
+            "one over must wrap: {one_over}"
+        );
 
         // Unbreakable token longer than width is not split
         let long_token = "verylongunbreakabletokenlongerthanwidth";
         let wrapped_token = wrap_finding_message(prefix, long_token, Some(25));
-        assert!(wrapped_token.contains(long_token), "token must not be split: {wrapped_token}");
+        assert!(
+            wrapped_token.contains(long_token),
+            "token must not be split: {wrapped_token}"
+        );
 
         // Width smaller than prefix
         let small_width = wrap_finding_message(prefix, "a b c", Some(20));
         let lines: Vec<_> = small_width.lines().collect();
-        assert_eq!(lines[0], prefix.trim_end(), "prefix must remain intact on line 1");
-        assert!(lines[1].starts_with("    "), "continuation line must be indented");
+        assert_eq!(
+            lines[0],
+            prefix.trim_end(),
+            "prefix must remain intact on line 1"
+        );
+        assert!(
+            lines[1].starts_with("    "),
+            "continuation line must be indented"
+        );
 
         // Colored prefix wraps at identical word boundaries
         let colored_prefix = "\x1b[1msrc/lib.rs:1:\x1b[0m \x1b[1;33m[warning]\x1b[0m rule: ";
@@ -5181,7 +5219,11 @@ mod tests {
                 rule.id
             );
             for lim in rule.limitations {
-                assert!(!lim.trim().is_empty(), "rule {} has empty limitation string", rule.id);
+                assert!(
+                    !lim.trim().is_empty(),
+                    "rule {} has empty limitation string",
+                    rule.id
+                );
             }
         }
     }
@@ -5295,7 +5337,9 @@ mod tests {
             assert!(!json_rule["remediation"].as_str().unwrap().is_empty());
             assert!(!json_rule["limitations"].as_array().unwrap().is_empty());
             assert_eq!(
-                sarif_rule["defaultConfiguration"]["level"].as_str().unwrap(),
+                sarif_rule["defaultConfiguration"]["level"]
+                    .as_str()
+                    .unwrap(),
                 sarif_level(json_rule["severity"].as_str().unwrap())
             );
         }

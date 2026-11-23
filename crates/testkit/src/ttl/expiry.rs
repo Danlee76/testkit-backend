@@ -2713,8 +2713,15 @@ mod tests {
         env.advance_ledgers(10);
         let after = env.ttl_of(&id, StorageKind::Temporary, DataKey::Temp);
 
-        assert!(after < before, "expected Temporary TTL to decrease: {after} < {before}");
-        assert_eq!(before - after, 10, "expected decrease of exactly 10 ledgers");
+        assert!(
+            after < before,
+            "expected Temporary TTL to decrease: {after} < {before}"
+        );
+        assert_eq!(
+            before - after,
+            10,
+            "expected decrease of exactly 10 ledgers"
+        );
     }
 
     /// `ttl_of` must decrease monotonically for `Instance` storage as the
@@ -2730,8 +2737,15 @@ mod tests {
         env.advance_ledgers(10);
         let after = env.ttl_of(&id, StorageKind::Instance, DataKey::Record);
 
-        assert!(after < before, "expected Instance TTL to decrease: {after} < {before}");
-        assert_eq!(before - after, 10, "expected decrease of exactly 10 ledgers");
+        assert!(
+            after < before,
+            "expected Instance TTL to decrease: {after} < {before}"
+        );
+        assert_eq!(
+            before - after,
+            10,
+            "expected decrease of exactly 10 ledgers"
+        );
     }
 
     /// `ttl_of` must decrease monotonically for `Persistent` storage (this
@@ -2748,8 +2762,15 @@ mod tests {
         env.advance_ledgers(10);
         let after = env.ttl_of(&id, StorageKind::Persistent, DataKey::Record);
 
-        assert!(after < before, "expected Persistent TTL to decrease: {after} < {before}");
-        assert_eq!(before - after, 10, "expected decrease of exactly 10 ledgers");
+        assert!(
+            after < before,
+            "expected Persistent TTL to decrease: {after} < {before}"
+        );
+        assert_eq!(
+            before - after,
+            10,
+            "expected decrease of exactly 10 ledgers"
+        );
     }
 
     // ── Issue #185: expire_entry advances only past the named entry ──
@@ -2763,7 +2784,7 @@ mod tests {
         let id = env.env().register(Vault, ());
         let client = VaultClient::new(env.env(), &id);
         client.set_record(&1); // Persistent: gets min_persistent_entry_ttl
-        client.set_temp(&2);   // Temporary: gets min_temp_entry_ttl (shorter)
+        client.set_temp(&2); // Temporary: gets min_temp_entry_ttl (shorter)
 
         // Persistent typically has a longer TTL than temporary.  Expire only
         // the temporary entry; the persistent sibling should still be live.
@@ -2837,5 +2858,4 @@ mod tests {
         assert_eq!(timeline.remaining_at(110), 0);
         assert_eq!(timeline.remaining_at(u32::MAX), 0);
     }
-
 }
