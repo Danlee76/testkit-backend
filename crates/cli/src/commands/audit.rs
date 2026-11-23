@@ -1126,7 +1126,13 @@ pub fn find_rule(id: &str) -> Option<&'static RuleDefinition> {
 }
 
 fn explain_rule(rule: &str) -> Result<(), CliError> {
-    let def = find_rule(rule).ok_or_else(|| CliError(format!("unknown rule: {rule}")))?;
+    let def = find_rule(rule).ok_or_else(|| {
+        let valid: Vec<_> = RULE_REGISTRY.iter().map(|r| r.id).collect();
+        CliError(format!(
+            "unknown rule: {rule}; available rules: {}",
+            valid.join(", ")
+        ))
+    })?;
     let meta = RULES.iter().find(|m| m.id == rule);
     // Every message above describes a syntactic pattern, not a proven
     // defect: state the heuristic nature right next to the rule so the
@@ -1141,6 +1147,76 @@ fn explain_rule(rule: &str) -> Result<(), CliError> {
     }
     println!("\nnote: {FINDING_NATURE}");
     Ok(())
+}
+
+/// Builds the machine-readable JSON rule catalog containing every registered
+/// audit rule, its default severity, confidence, description, limitations,
+/// and remediation guidance.
+fn build_rule_catalog_json() -> serde_json::Value {
+    let mut entries: Vec<_> = RULE_REGISTRY.iter().collect();
+    entries.sort_by(|a, b| a.id.cmp(b.id));
+    let rules: Vec<_> = entries
+        .into_iter()
+        .map(|rule| {
+            let meta = RULES.iter().find(|m| m.id == rule.id);
+            let confidence = meta.map_or("not assessed", |m| m.confidence);
+            let limitations: &[&str] = meta.map_or(&[], |m| m.limitations);
+            serde_json::json!({
+                "id": rule.id,
+                "severity": rule.severity,
+                "confidence": confidence,
+                "description": rule.description,
+                "limitations": limitations,
+                "remediation": rule.remediation,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "tool": "soroban-testkit",
+        "version": 1,
+        "rules": rules,
+        "summary": {
+            "rule_count": rules.len(),
+            "limitations": [FINDING_NATURE]
+        },
+    })
+}
+
+/// Builds the machine-readable SARIF 2.1.0 rule catalog (`runs[0].tool.driver.rules`)
+/// with `defaultConfiguration.level` routed through [`sarif_level`].
+fn build_rule_catalog_sarif() -> serde_json::Value {
+    let mut entries: Vec<_> = RULE_REGISTRY.iter().collect();
+    entries.sort_by(|a, b| a.id.cmp(b.id));
+    let rules: Vec<_> = entries
+        .into_iter()
+        .map(|rule| {
+            let meta = RULES.iter().find(|m| m.id == rule.id);
+            let confidence = meta.map_or("not assessed", |m| m.confidence);
+            let limitations: &[&str] = meta.map_or(&[], |m| m.limitations);
+            serde_json::json!({
+                "id": rule.id,
+                "shortDescription": { "text": rule.id.replace('-', " ") },
+                "fullDescription": { "text": rule.description },
+                "defaultConfiguration": {
+                    "level": sarif_level(rule.severity)
+                },
+                "properties": {
+                    "confidence": confidence,
+                    "limitations": limitations,
+                    "remediation": rule.remediation,
+                }
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": { "driver": { "name": "soroban-testkit", "rules": rules } },
+            "results": [],
+            "properties": { "limitations": [FINDING_NATURE] }
+        }]
+    })
 }
 
 fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
@@ -1162,64 +1238,12 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
             Ok(())
         }
         AuditOutputFormat::Json => {
-            let rules: Vec<_> = RULE_REGISTRY
-                .iter()
-                .map(|rule| {
-                    let meta = RULES.iter().find(|m| m.id == rule.id);
-                    let confidence = meta.map_or("not assessed", |m| m.confidence);
-                    let limitations: &[&str] = meta.map_or(&[], |m| m.limitations);
-                    serde_json::json!({
-                        "id": rule.id,
-                        "severity": rule.severity,
-                        "confidence": confidence,
-                        "description": rule.description,
-                        "limitations": limitations,
-                        "remediation": rule.remediation,
-                    })
-                })
-                .collect();
-            let report = serde_json::json!({
-                "tool": "soroban-testkit",
-                "version": 1,
-                "rules": rules,
-                "summary": {
-                    "rule_count": rules.len(),
-                    "limitations": [FINDING_NATURE]
-                },
-            });
+            let report = build_rule_catalog_json();
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
             Ok(())
         }
         AuditOutputFormat::Sarif => {
-            let rules: Vec<_> = RULE_REGISTRY
-                .iter()
-                .map(|rule| {
-                    let meta = RULES.iter().find(|m| m.id == rule.id);
-                    let confidence = meta.map_or("not assessed", |m| m.confidence);
-                    let limitations: &[&str] = meta.map_or(&[], |m| m.limitations);
-                    serde_json::json!({
-                        "id": rule.id,
-                        "shortDescription": { "text": rule.id.replace('-', " ") },
-                        "fullDescription": { "text": rule.description },
-                        "defaultConfiguration": {
-                            "level": sarif_level(rule.severity)
-                        },
-                        "properties": {
-                            "confidence": confidence,
-                            "limitations": limitations,
-                        }
-                    })
-                })
-                .collect();
-            let report = serde_json::json!({
-                "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-                "version": "2.1.0",
-                "runs": [{
-                    "tool": { "driver": { "name": "soroban-testkit", "rules": rules } },
-                    "results": [],
-                    "properties": { "limitations": [FINDING_NATURE] }
-                }]
-            });
+            let report = build_rule_catalog_sarif();
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
             Ok(())
         }
@@ -4337,5 +4361,40 @@ mod tests {
             .to_string();
         assert!(err.contains("stdin"), "{err}");
         assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn machine_readable_rule_catalog_json_and_sarif_cover_all_rules_in_order() {
+        let json_catalog = build_rule_catalog_json();
+        let json_rules = json_catalog["rules"].as_array().unwrap();
+        assert_eq!(json_rules.len(), RULE_REGISTRY.len());
+        assert_eq!(json_catalog["summary"]["rule_count"], RULE_REGISTRY.len());
+
+        let sarif_catalog = build_rule_catalog_sarif();
+        let sarif_rules = sarif_catalog["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(sarif_rules.len(), RULE_REGISTRY.len());
+
+        let mut prev_id = "";
+        for (json_rule, sarif_rule) in json_rules.iter().zip(sarif_rules.iter()) {
+            let id = json_rule["id"].as_str().unwrap();
+            assert!(id > prev_id, "rules must be sorted: {prev_id} vs {id}");
+            prev_id = id;
+            assert_eq!(sarif_rule["id"].as_str().unwrap(), id);
+            assert!(!json_rule["severity"].as_str().unwrap().is_empty());
+            assert!(!json_rule["confidence"].as_str().unwrap().is_empty());
+            assert!(!json_rule["description"].as_str().unwrap().is_empty());
+            assert!(!json_rule["remediation"].as_str().unwrap().is_empty());
+            assert!(!json_rule["limitations"].as_array().unwrap().is_empty());
+            assert_eq!(
+                sarif_rule["defaultConfiguration"]["level"].as_str().unwrap(),
+                sarif_level(json_rule["severity"].as_str().unwrap())
+            );
+        }
+
+        let err = explain_rule("nonexistent-rule").unwrap_err().to_string();
+        assert!(err.contains("nonexistent-rule"), "{err}");
+        assert!(err.contains("missing-require-auth"), "{err}");
     }
 }

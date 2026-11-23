@@ -3301,6 +3301,26 @@ fn audit_stdin_reports_invalid_utf8_actionably() {
     assert!(stderr.contains("UTF-8"), "{stderr}");
 }
 
+#[test]
+fn audit_rule_catalog_subcommands_and_flag_emit_identical_json_and_sarif() {
+    for format in ["json", "sarif"] {
+        let rules_out = run(&["audit", "rules", "--format", format]);
+        let list_rules_out = run(&["audit", "list-rules", "--format", format]);
+        let flag_out = run(&["audit", "--list-rules", "--format", format]);
+        assert!(rules_out.status.success(), "{format}: {rules_out:?}");
+        assert!(list_rules_out.status.success(), "{format}: {list_rules_out:?}");
+        assert!(flag_out.status.success(), "{format}: {flag_out:?}");
+        assert_eq!(rules_out.stdout, list_rules_out.stdout);
+        assert_eq!(rules_out.stdout, flag_out.stdout);
+    }
+
+    let unknown = run(&["audit", "explain", "does-not-exist"]);
+    assert!(!unknown.status.success(), "{unknown:?}");
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(stderr.contains("does-not-exist"), "{stderr}");
+    assert!(stderr.contains("missing-require-auth"), "{stderr}");
+}
+
 
 
 
