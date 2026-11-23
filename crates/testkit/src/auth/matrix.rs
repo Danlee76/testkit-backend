@@ -136,6 +136,52 @@ impl<'a> AuthMatrix<'a> {
         self
     }
 
+    /// Register an entry point with expected error text for selected callers.
+    pub fn entry_point_with_expected_errors(
+        mut self,
+        name: &str,
+        allowed: &[Address],
+        expected_errors: &[(Address, &str)],
+        invoke: impl Fn(&Address) -> Result<(), soroban_sdk::Error> + 'a,
+    ) -> Self {
+        self.entry_points.push(EntryPointSpec {
+            name: name.to_string(),
+            allowed: allowed.to_vec(),
+            expected_errors: expected_errors
+                .iter()
+                .map(|(address, error)| (address.clone(), (*error).to_string()))
+                .collect(),
+            invoke: Box::new(invoke),
+        });
+        self
+    }
+
+    /// Attach a human-readable role name to an actor.
+    pub fn role(mut self, actor: &Address, name: &str) -> Self {
+        self.roles.retain(|(address, _)| address != actor);
+        self.roles.push((actor.clone(), name.to_string()));
+        self
+    }
+
+    /// Validate that every supplied contract actor is represented in the matrix.
+    pub fn validate_against(&self, actors: &[Address]) -> Result<(), TestkitError> {
+        let known = self.known_actors();
+        let missing: Vec<String> = actors
+            .iter()
+            .filter(|actor| !known.contains(actor))
+            .map(|actor| format!("{actor:?}"))
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(TestkitError::AssertionFailed(format!(
+                "auth matrix is missing {} actor(s): {}",
+                missing.len(),
+                missing.join(", "),
+            )))
+        }
+    }
+
     /// The matrix's **known actors**: every address named in any entry
     /// point's `allowed` list, de-duplicated and kept in first-seen order.
     ///
