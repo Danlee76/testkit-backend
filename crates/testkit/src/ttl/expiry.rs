@@ -2825,4 +2825,17 @@ mod tests {
             "expire_entry must advance exactly ttl + 1 ledgers for Instance storage"
         );
     }
+    #[test]
+    fn remaining_ttl_saturates_at_and_after_expiry() {
+        let timeline = TtlTimeline {
+            kind: StorageKind::Persistent,
+            current_sequence: 100,
+            expires_at_sequence: 110,
+            ttl_remaining: 10,
+        };
+        assert_eq!(timeline.remaining_at(109), 1);
+        assert_eq!(timeline.remaining_at(110), 0);
+        assert_eq!(timeline.remaining_at(u32::MAX), 0);
+    }
+
 }
