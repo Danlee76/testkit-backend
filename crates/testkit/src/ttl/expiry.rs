@@ -280,6 +280,22 @@ impl TtlSnapshot {
 }
 
 impl TestEnv {
+    /// Read the current ledger info once and return it.
+    ///
+    /// This is the single shared path through which [`archival_parameters`],
+    /// [`expire`], and the [`ttl_of`] family all obtain their ledger data,
+    /// so there is exactly one call-site to audit and no risk of the three
+    /// callers seeing inconsistent snapshots within the same logical step.
+    ///
+    /// [`archival_parameters`]: TestEnv::archival_parameters
+    /// [`expire`]: TestEnv::expire
+    /// [`ttl_of`]: TestEnv::ttl_of
+    fn ledger_info(&self) -> soroban_sdk::testutils::LedgerInfo {
+        self.env().ledger().get()
+    }
+}
+
+impl TestEnv {
     /// Build a protocol-version fixture for archival behavior: an
     /// environment whose ledger is pinned to `protocol_version`.
     ///
@@ -335,7 +351,7 @@ impl TestEnv {
     /// assert_eq!(params.sequence_number, env.sequence());
     /// ```
     pub fn archival_parameters(&self) -> ArchivalParameters {
-        let info = self.env().ledger().get();
+        let info = self.ledger_info();
         ArchivalParameters {
             protocol_version: info.protocol_version,
             sequence_number: info.sequence_number,
@@ -395,7 +411,7 @@ impl TestEnv {
     ) -> TtlTimeline {
         let key_val = key.into_val(self.env());
         let ttl = self.ttl_of_val(contract, kind, &key_val);
-        let sequence = self.env().ledger().get().sequence_number;
+        let sequence = self.ledger_info().sequence_number;
         TtlTimeline {
             kind,
             current_sequence: sequence,
@@ -573,10 +589,10 @@ impl TestEnv {
     /// ```
     pub fn expire(&self, kind: StorageKind) {
         let _ = kind;
-        let ledger = self.env().ledger().get();
+        let ledger = self.ledger_info();
         let max_entry_ttl = ledger.max_entry_ttl;
         self.advance_ledgers(max_entry_ttl.saturating_add(1));
-        let current = self.env().ledger().get();
+        let current = self.ledger_info();
         if current.protocol_version != ledger.protocol_version
             || current.base_reserve != ledger.base_reserve
             || current.network_id != ledger.network_id
@@ -595,6 +611,76 @@ impl TestEnv {
                 max_entry_ttl: ledger.max_entry_ttl,
             });
         }
+    }
+
+    /// Advance the ledger to exactly **one ledger past** the expiry of the
+    /// entry at `contract`/`kind`/`key`.
+    ///
+    /// Unlike [`TestEnv::expire`], which advances past `max_entry_ttl` and
+    /// therefore expires *every* entry simultaneously, this method reads the
+    /// live TTL of the named entry and advances only as far as necessary to
+    /// cross that specific entry's boundary. Sibling entries with more TTL
+    /// headroom remain live.
+    ///
+    /// This is the per-entry counterpart of [`TestEnv::expire`] and the
+    /// building block for [`TestEnv::assert_runs_after_expiry`].
+    ///
+    /// # Panics
+    ///
+    /// Panics (via the underlying SDK) if the entry does not exist or has
+    /// already expired — take a [`TtlTimeline`] snapshot with
+    /// [`TestEnv::ttl_timeline`] while the entry is live if you need to
+    /// observe expiry without touching the entry afterward.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::ttl::StorageKind;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Store;
+    ///
+    /// #[contractimpl]
+    /// impl Store {
+    ///     pub fn set(env: Env, key: Symbol, value: i128) {
+    ///         env.storage().persistent().set(&key, &value);
+    ///     }
+    ///     pub fn set_temp(env: Env, key: Symbol, value: i128) {
+    ///         env.storage().temporary().set(&key, &value);
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Store, ());
+    /// let client = StoreClient::new(env.env(), &id);
+    /// client.set(&symbol_short!("p"), &1);
+    /// client.set_temp(&symbol_short!("t"), &2);
+    ///
+    /// // Expire only the persistent entry; the temporary sibling stays live.
+    /// let temp_before = env.ttl_of(&id, StorageKind::Temporary, symbol_short!("t"));
+    /// let persistent_ttl = env.ttl_of(&id, StorageKind::Persistent, symbol_short!("p"));
+    /// env.expire_entry(&id, StorageKind::Persistent, symbol_short!("p"));
+    ///
+    /// // The ledger advanced by exactly persistent_ttl + 1 ledgers.
+    /// let temp_after = env.ttl_of(&id, StorageKind::Temporary, symbol_short!("t"));
+    /// assert_eq!(temp_before - temp_after, persistent_ttl + 1);
+    /// # }
+    /// ```
+    pub fn expire_entry<K: IntoVal<Env, Val>>(
+        &self,
+        contract: &Address,
+        kind: StorageKind,
+        key: K,
+    ) {
+        let key_val = key.into_val(self.env());
+        let ttl = self.ttl_of_val(contract, kind, &key_val);
+        // Advance by ttl + 1: `ttl` is the number of ledgers the entry
+        // stays alive *after* the current one, so one more crosses the
+        // boundary.
+        self.advance_ledgers(ttl.saturating_add(1));
     }
 
     /// Assert that running `f` extends the TTL of the entry at `contract`/
@@ -2327,6 +2413,169 @@ mod tests {
             || client.read_temp_checked(),
             3,
             0,
+        );
+    }
+
+    // ── Issue #178: unsupported storage inspection returns Misuse, not a guessed constant ──
+
+    /// Regression: `try_ttl_of_val` must return `Err(Misuse(...))` for an
+    /// unregistered address instead of falling back to any hardcoded TTL
+    /// constant.  Before this fix a guessed constant could silently mask
+    /// the problem; now only a proper error is acceptable.
+    #[test]
+    fn try_ttl_of_returns_misuse_for_unregistered_address() {
+        let env = TestEnv::new();
+        let unregistered = env.address(); // not a contract — no storage
+
+        let err = env
+            .try_ttl_of(&unregistered, StorageKind::Persistent, DataKey::Record)
+            .expect_err("unregistered address must return an error");
+
+        assert!(
+            err.is_misuse(),
+            "expected Misuse for unsupported storage inspection, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("unsupported storage inspection"),
+            "error message must name the problem: {err}"
+        );
+    }
+
+    /// The panicking variant must also panic (not silently succeed with a
+    /// guessed value) when the address is not a registered contract.
+    #[test]
+    #[should_panic(expected = "unsupported storage inspection")]
+    fn ttl_of_panics_with_misuse_message_for_unregistered_address() {
+        let env = TestEnv::new();
+        let unregistered = env.address();
+        env.ttl_of(&unregistered, StorageKind::Persistent, DataKey::Record);
+    }
+
+    // ── Issue #179: monotonic-decrease tests for all three StorageKind variants ──
+
+    /// `ttl_of` must decrease monotonically for `Temporary` storage as the
+    /// ledger advances.
+    #[test]
+    fn ttl_of_decreases_monotonically_for_temporary_storage() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&7);
+
+        let before = env.ttl_of(&id, StorageKind::Temporary, DataKey::Temp);
+        env.advance_ledgers(10);
+        let after = env.ttl_of(&id, StorageKind::Temporary, DataKey::Temp);
+
+        assert!(after < before, "expected Temporary TTL to decrease: {after} < {before}");
+        assert_eq!(before - after, 10, "expected decrease of exactly 10 ledgers");
+    }
+
+    /// `ttl_of` must decrease monotonically for `Instance` storage as the
+    /// ledger advances.
+    #[test]
+    fn ttl_of_decreases_monotonically_for_instance_storage() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        // Register a contract — the act of registration creates the instance
+        // entry, so there is no need for an explicit write.
+
+        let before = env.ttl_of(&id, StorageKind::Instance, DataKey::Record);
+        env.advance_ledgers(10);
+        let after = env.ttl_of(&id, StorageKind::Instance, DataKey::Record);
+
+        assert!(after < before, "expected Instance TTL to decrease: {after} < {before}");
+        assert_eq!(before - after, 10, "expected decrease of exactly 10 ledgers");
+    }
+
+    /// `ttl_of` must decrease monotonically for `Persistent` storage (this
+    /// case was already covered; kept here so the three variants are
+    /// co-located and the coverage is explicit).
+    #[test]
+    fn ttl_of_decreases_monotonically_for_persistent_storage() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        let before = env.ttl_of(&id, StorageKind::Persistent, DataKey::Record);
+        env.advance_ledgers(10);
+        let after = env.ttl_of(&id, StorageKind::Persistent, DataKey::Record);
+
+        assert!(after < before, "expected Persistent TTL to decrease: {after} < {before}");
+        assert_eq!(before - after, 10, "expected decrease of exactly 10 ledgers");
+    }
+
+    // ── Issue #185: expire_entry advances only past the named entry ──
+
+    /// `expire_entry` must advance the ledger by exactly `ttl + 1` ledgers —
+    /// placing it one past the named entry's expiry boundary — leaving
+    /// sibling entries with more headroom still live.
+    #[test]
+    fn expire_entry_advances_exactly_past_the_named_entry() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1); // Persistent: gets min_persistent_entry_ttl
+        client.set_temp(&2);   // Temporary: gets min_temp_entry_ttl (shorter)
+
+        // Persistent typically has a longer TTL than temporary.  Expire only
+        // the temporary entry; the persistent sibling should still be live.
+        let temp_ttl = env.ttl_of(&id, StorageKind::Temporary, DataKey::Temp);
+        let persistent_before = env.ttl_of(&id, StorageKind::Persistent, DataKey::Record);
+
+        env.expire_entry(&id, StorageKind::Temporary, DataKey::Temp);
+
+        // Ledger advanced by exactly temp_ttl + 1.
+        let persistent_after = env.ttl_of(&id, StorageKind::Persistent, DataKey::Record);
+        assert_eq!(
+            persistent_before - persistent_after,
+            temp_ttl + 1,
+            "expire_entry must advance exactly temp_ttl + 1 ledgers"
+        );
+        // Persistent entry must still be live.
+        assert!(
+            persistent_after > 0,
+            "persistent sibling must still be live after expire_entry on the temporary entry"
+        );
+    }
+
+    /// `expire_entry` with `StorageKind::Persistent` advances one ledger
+    /// past that entry's specific TTL.
+    #[test]
+    fn expire_entry_works_for_persistent_storage() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&42);
+
+        let ttl_before = env.ttl_of(&id, StorageKind::Persistent, DataKey::Record);
+        let seq_before = env.sequence();
+
+        env.expire_entry(&id, StorageKind::Persistent, DataKey::Record);
+
+        assert_eq!(
+            env.sequence() - seq_before,
+            ttl_before + 1,
+            "expire_entry must advance exactly ttl + 1 ledgers"
+        );
+    }
+
+    /// After `expire_entry` on an Instance entry the instance TTL is crossed
+    /// and the advance is proportional to the instance TTL.
+    #[test]
+    fn expire_entry_works_for_instance_storage() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+
+        let ttl_before = env.ttl_of(&id, StorageKind::Instance, DataKey::Record);
+        let seq_before = env.sequence();
+
+        env.expire_entry(&id, StorageKind::Instance, DataKey::Record);
+
+        assert_eq!(
+            env.sequence() - seq_before,
+            ttl_before + 1,
+            "expire_entry must advance exactly ttl + 1 ledgers for Instance storage"
         );
     }
 }
