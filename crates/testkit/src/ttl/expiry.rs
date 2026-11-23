@@ -206,6 +206,14 @@ impl TtlTimeline {
         sequence >= self.expires_at_sequence
     }
 
+    /// Return the remaining TTL at an arbitrary ledger sequence.
+    ///
+    /// Saturating arithmetic makes this safe to call at or after expiry:
+    /// callers receive zero instead of an unsigned-integer underflow.
+    pub fn remaining_at(&self, sequence: u32) -> u32 {
+        self.expires_at_sequence.saturating_sub(sequence)
+    }
+
     /// Whether the entry had already expired when this snapshot was taken.
     ///
     /// Only possible for a manually constructed [`TtlTimeline`]; a snapshot
