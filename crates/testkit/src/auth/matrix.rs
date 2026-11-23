@@ -620,4 +620,20 @@ mod tests {
         let env = TestEnv::new();
         env.assert_requires_auth(|| {});
     }
+    #[test]
+    fn reports_include_roles_denied_addresses_and_csv() {
+        let env = TestEnv::new();
+        let admin = env.address();
+        let user = env.address();
+        let matrix = AuthMatrix::new(&env)
+            .role(&admin, "admin")
+            .role(&user, "user")
+            .entry_point("configure", std::slice::from_ref(&admin), |_| Ok(()));
+        assert_eq!(matrix.denied_addresses("configure"), vec![user.clone()]);
+        let csv = matrix.to_csv();
+        assert!(csv.starts_with("entry_point,actor,role,allowed,expected_error"));
+        assert!(csv.contains("admin"));
+        assert!(csv.contains("false"));
+    }
+
 }
