@@ -41,7 +41,8 @@ pub struct AuthMatrix<'a> {
 }
 
 fn csv_escape(value: &str) -> String {
-    format!("\\\"{}\\\"", value.replace('\\\"', "\\\"\\\""))
+    format!("\"{}\"", value.replace('"', """"))
+}
 }
 
 impl<'a> AuthMatrix<'a> {
@@ -89,7 +90,7 @@ impl<'a> AuthMatrix<'a> {
                 let actor_text = format!("{actor:?}");
                 let fields = [entry.name.as_str(), actor_text.as_str(), self.role_name(&actor), if entry.allowed.contains(&actor) { "true" } else { "false" }, expected_error];
                 csv.push_str(&fields.iter().map(|field| csv_escape(field)).collect::<Vec<_>>().join(","));
-                csv.push('\\n');
+                csv.push('\n');
             }
         }
         csv
