@@ -7,6 +7,9 @@ type InvokeFn<'a> = Box<dyn Fn(&Address) -> Result<(), soroban_sdk::Error> + 'a>
 struct EntryPointSpec<'a> {
     name: String,
     allowed: Vec<Address>,
+    // Optional per-cell error expectations. This lets callers assert the
+    // contract returned the right authorization error, not merely any error.
+    expected_errors: Vec<(Address, String)>,
     invoke: InvokeFn<'a>,
 }
 
@@ -79,6 +82,31 @@ impl<'a> AuthMatrix<'a> {
         self.entry_points.push(EntryPointSpec {
             name: name.to_string(),
             allowed: allowed.to_vec(),
+            expected_errors: Vec::new(),
+            invoke: Box::new(invoke),
+        });
+        self
+    }
+
+    /// Register an entry point with expected error text for selected caller cells.
+    ///
+    /// The expected text is matched against the debug and display forms of the
+    /// returned Soroban error. This is useful when an escrow stream and a
+    /// recurring contract intentionally use different authorization errors.
+    pub fn entry_point_with_expected_errors(
+        mut self,
+        name: &str,
+        allowed: &[Address],
+        expected_errors: &[(Address, &str)],
+        invoke: impl Fn(&Address) -> Result<(), soroban_sdk::Error> + 'a,
+    ) -> Self {
+        self.entry_points.push(EntryPointSpec {
+            name: name.to_string(),
+            allowed: allowed.to_vec(),
+            expected_errors: expected_errors
+                .iter()
+                .map(|(address, error)| (address.clone(), (*error).to_string()))
+                .collect(),
             invoke: Box::new(invoke),
         });
         self
