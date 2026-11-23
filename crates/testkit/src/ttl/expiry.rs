@@ -1,3 +1,42 @@
+//! TTL expiry helpers and the boundaries of what they can guarantee.
+//!
+//! # Protocol and SDK limitations per storage kind
+//!
+//! The rules below are what the pinned `soroban-sdk` host enforces. They are
+//! documented here because they are limits of the protocol/SDK, not choices
+//! this crate can make on the caller's behalf:
+//!
+//! - **Protocol.** [`ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH`],
+//!   [`ARCHIVAL_PROTOCOL_CONTRACT_LIFECYCLE`] and
+//!   [`ARCHIVAL_PROTOCOL_STATE_ARCHIVAL`] are fixtures for pinning intent. The
+//!   host simulates the same archival rules at every protocol it understands;
+//!   they are not feature switches. Minimum and maximum TTLs are network
+//!   parameters that changed across protocol versions, so they must be read
+//!   from the ledger at runtime via [`TestEnv::archival_parameters`] — never
+//!   hardcoded from this module's docs or from memory.
+//! - **SDK inspection.** `soroban_sdk::testutils` TTL getters are only usable
+//!   inside a contract context and panic when an entry is missing or already
+//!   expired. [`TestEnv::try_ttl_of`] contains those panics and reports them
+//!   as [`TestkitError`]; [`TestEnv::ttl_timeline`] records the expiry
+//!   boundary while the entry is still live so it can be consulted later.
+//!   An archived persistent entry is not inspectable by TTL: it is reported
+//!   as a missing key until a read restores it.
+//! - **Temporary.** Granted `min_temp_entry_ttl` on write and **deleted** on
+//!   expiry — there is no SDK operation to recover it.
+//! - **Persistent.** Granted `min_persistent_entry_ttl` on write and
+//!   **archived** on expiry; the next read restores it with a fresh TTL. That
+//!   read is itself a restore, so inspecting the TTL afterwards no longer
+//!   describes the pre-expiry entry.
+//! - **Instance.** One entry per contract (its own data plus its code),
+//!   granted `min_persistent_entry_ttl`; the SDK's instance TTL getter takes
+//!   no key, so [`TestEnv::ttl_of`] ignores `key` for this kind. Contract
+//!   lifecycle operations (instance/code TTL extension) only exist from
+//!   [`ARCHIVAL_PROTOCOL_CONTRACT_LIFECYCLE`] onward.
+//! - **`expire`.** The SDK exposes no way to enumerate entries or read their
+//!   headroom from outside a contract, so [`TestEnv::expire`] accepts `kind`
+//!   only to document intent and advances one ledger past the runtime
+//!   `max_entry_ttl` to expire every kind at once.
+
 use std::any::Any;
 use std::fmt;
 
@@ -9,6 +48,9 @@ use crate::core::{TestEnv, TestkitError};
 
 /// Which of Soroban's three storage kinds an entry lives in. TTL semantics
 /// differ per kind — see [`TestEnv::ttl_of`] and [`TestEnv::expire`].
+///
+/// The protocol and SDK limits behind these differences (including what the
+/// host can and cannot inspect) are documented in the [module docs](crate::ttl).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageKind {
     /// Cheapest, expires soonest, and once gone is gone — used for data
@@ -422,50 +464,29 @@ impl TestEnv {
 }
 
 impl TestEnv {
-    /// The current TTL of a storage entry, in ledgers.
+    /// Attempt to inspect the TTL of a storage entry, in ledgers.
     ///
-    /// Ignores `key` for [`StorageKind::Instance`], which has one TTL per
-    /// contract rather than one per key.
+    /// This is the checked counterpart of [`TestEnv::ttl_of`]: a live entry
+    /// yields `Ok(ttl)`, and conditions that would otherwise panic from the
+    /// SDK are reported as a [`TestkitError`] instead.
     ///
-    /// # Panics
+    /// For [`StorageKind::Instance`] `key` is ignored: there is one instance
+    /// entry per contract, so every key resolves to the same TTL.
     ///
-    /// Panics if the entry does not exist, or — for
-    /// [`StorageKind::Persistent`] and [`StorageKind::Temporary`] — has
-    /// already expired. This matches `soroban_sdk::testutils`' own
-    /// `get_ttl` methods, which this is built on.
+    /// # Errors
     ///
-    /// # Example
+    /// - [`TestkitError::AssertionFailed`] if the key is missing from
+    ///   Temporary or Persistent storage for a registered contract. An
+    ///   expired/archived entry is no longer present and is reported the
+    ///   same way; use [`TtlTimeline`] from while the entry was live to
+    ///   reason about its expiry boundary afterwards.
+    /// - [`TestkitError::Misuse`] if storage cannot be inspected for the
+    ///   given address (for example, an unregistered address or one that is
+    ///   not a contract).
     ///
-    /// ```
-    /// use soroban_testkit::core::TestEnv;
-    /// use soroban_testkit::ttl::StorageKind;
-    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
-    ///
-    /// #[contract]
-    /// struct Store;
-    ///
-    /// #[contractimpl]
-    /// impl Store {
-    ///     pub fn set(env: Env, key: Symbol, value: i128) {
-    ///         env.storage().persistent().set(&key, &value);
-    ///     }
-    /// }
-    ///
-    /// # fn main() {
-    /// let env = TestEnv::new();
-    /// let id = env.env().register(Store, ());
-    /// StoreClient::new(env.env(), &id).set(&symbol_short!("k"), &1);
-    ///
-    /// let ttl = env.ttl_of(&id, StorageKind::Persistent, symbol_short!("k"));
-    /// assert!(ttl > 0);
-    /// # }
-    /// ```
-    /// Attempt to inspect the TTL of a storage entry, returning `Ok(ttl)`
-    /// or a [`TestkitError`].
-    ///
-    /// Distinguishes between:
-    /// - **Missing key** ([`TestkitError::AssertionFailed`]): The contract exists and storage can be inspected, but the key is absent.
-    /// - **Unsupported storage inspection** ([`TestkitError::Misuse`]): The target cannot be inspected (e.g. invalid or unregistered contract address).
+    /// The underlying `soroban_sdk::testutils` TTL getters panic for missing
+    /// or expired entries and outside a contract context. This helper keeps
+    /// those panics contained so callers receive a typed, matchable error.
     ///
     /// # Example
     ///
@@ -478,6 +499,7 @@ impl TestEnv {
     /// let unregistered = env.address();
     /// let res = env.try_ttl_of(&unregistered, StorageKind::Persistent, symbol_short!("k"));
     /// assert!(res.is_err());
+    /// assert!(res.unwrap_err().is_misuse());
     /// ```
     pub fn try_ttl_of<K: IntoVal<Env, Val>>(
         &self,
@@ -489,12 +511,17 @@ impl TestEnv {
         self.try_ttl_of_val(contract, kind, &key_val)
     }
 
-    /// Returns the current TTL of a storage entry in ledgers.
+    /// The current TTL of a storage entry, in ledgers.
     ///
-    /// Panics if the entry does not exist, or — for
-    /// [`StorageKind::Persistent`] and [`StorageKind::Temporary`] — has
-    /// already expired. This matches `soroban_sdk::testutils`' own
-    /// `get_ttl` methods, which this is built on.
+    /// Ignores `key` for [`StorageKind::Instance`], which has one TTL per
+    /// contract rather than one per key.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the [`TestkitError`] returned by [`TestEnv::try_ttl_of`]
+    /// if the entry does not exist, has already expired, or its storage
+    /// cannot be inspected. Use `try_ttl_of` to handle those cases without a
+    /// panic.
     ///
     /// # Example
     ///
@@ -689,7 +716,7 @@ impl TestEnv {
     /// # Panics
     ///
     /// Panics with a [`TestkitError::AssertionFailed`] showing the before
-    /// and after TTLs if `f` did not increase it.
+    /// and after TTLs and their delta if `f` did not increase it.
     ///
     /// # Example
     ///
@@ -734,10 +761,11 @@ impl TestEnv {
         f();
         let after = self.ttl_of_val(contract, kind, &key_val);
         if after <= before {
+            let delta = i64::from(after) - i64::from(before);
             panic!(
                 "{}",
                 TestkitError::AssertionFailed(format!(
-                    "expected the call to extend the {kind:?} TTL beyond {before}, but it was {after} afterward"
+                    "expected the call to extend the {kind:?} TTL: before={before}, after={after} (delta={delta}); the TTL did not increase"
                 ))
             );
         }
@@ -814,7 +842,10 @@ impl TestEnv {
         for (key_val, before, label) in &befores {
             let after = self.ttl_of_val(contract, kind, key_val);
             if after <= *before {
-                failures.push(format!("{label}: expected > {before}, got {after}"));
+                let delta = i64::from(after) - i64::from(*before);
+                failures.push(format!(
+                    "{label}: before={before}, after={after} (delta={delta}); expected an increase"
+                ));
             }
         }
 
@@ -1767,6 +1798,115 @@ mod tests {
         assert_eq!(before - after, 10);
     }
 
+    // #184 — checked TTL inspection API.
+
+    #[test]
+    fn try_ttl_of_returns_the_ttl_for_live_entries_of_every_kind() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.initialize(&env.address());
+        client.set_record(&1);
+        client.set_temp(&2);
+
+        let persistent = env
+            .try_ttl_of(&id, StorageKind::Persistent, DataKey::Record)
+            .expect("a live persistent entry has a TTL");
+        let temporary = env
+            .try_ttl_of(&id, StorageKind::Temporary, DataKey::Temp)
+            .expect("a live temporary entry has a TTL");
+        let instance = env
+            .try_ttl_of(&id, StorageKind::Instance, DataKey::Balance)
+            .expect("a registered contract has an instance TTL");
+
+        assert!(persistent > 0);
+        assert!(temporary > 0);
+        assert!(instance > 0);
+        assert_eq!(
+            persistent,
+            env.ttl_of(&id, StorageKind::Persistent, DataKey::Record)
+        );
+    }
+
+    #[test]
+    fn try_ttl_of_reports_a_missing_key_as_assertion_failed() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        for kind in [StorageKind::Persistent, StorageKind::Temporary] {
+            let err = env
+                .try_ttl_of(&id, kind, DataKey::Balance)
+                .expect_err("a key that was never written must be an error");
+            assert!(
+                err.is_assertion_failed(),
+                "missing key should be AssertionFailed, got: {err}"
+            );
+            assert!(
+                err.message().contains("missing key"),
+                "the message must name the missing key: {err}"
+            );
+            let kind_name = format!("{kind:?}");
+            assert!(
+                err.message().contains(kind_name.as_str()),
+                "the message must name the storage kind: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn try_ttl_of_reports_an_unregistered_contract_as_misuse() {
+        let env = TestEnv::new();
+        let unregistered = env.address();
+
+        let err = env
+            .try_ttl_of(&unregistered, StorageKind::Persistent, DataKey::Record)
+            .expect_err("an address that is not a contract cannot be inspected");
+        assert!(
+            err.is_misuse(),
+            "unsupported storage inspection should be Misuse, got: {err}"
+        );
+        assert!(
+            err.message().contains("unsupported storage inspection"),
+            "the message must explain the unsupported inspection: {err}"
+        );
+    }
+
+    #[test]
+    fn try_ttl_of_ignores_the_key_for_instance_storage() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        VaultClient::new(env.env(), &id).initialize(&env.address());
+
+        let with_balance = env
+            .try_ttl_of(&id, StorageKind::Instance, DataKey::Balance)
+            .expect("instance storage has a TTL");
+        let with_record = env
+            .try_ttl_of(&id, StorageKind::Instance, DataKey::Record)
+            .expect("the instance key is ignored");
+
+        assert_eq!(with_balance, with_record);
+    }
+
+    #[test]
+    fn try_ttl_of_reports_an_expired_entry_as_missing() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_temp(&1);
+        let ttl = env.ttl_of(&id, StorageKind::Temporary, DataKey::Temp);
+        env.advance_ledgers(ttl.saturating_add(1));
+
+        let err = env
+            .try_ttl_of(&id, StorageKind::Temporary, DataKey::Temp)
+            .expect_err("a deleted temporary entry is no longer inspectable");
+        assert!(
+            err.is_assertion_failed(),
+            "an expired entry should be reported as missing, got: {err}"
+        );
+    }
+
     #[test]
     #[should_panic(expected = "expected the call to extend the Persistent TTL")]
     fn assert_bumps_ttl_fails_on_a_contract_that_reads_without_bumping() {
@@ -1790,6 +1930,81 @@ mod tests {
         env.assert_bumps_ttl(&id, StorageKind::Persistent, DataKey::Record, || {
             client.touch_record_checked();
         });
+    }
+
+    // #180 — a panicking closure must not be mistaken for a TTL assertion
+    // failure; the closure's own panic is what the caller should see.
+
+    #[test]
+    #[should_panic(expected = "closure panicked before any TTL assertion")]
+    fn assert_bumps_ttl_forwards_a_panic_from_the_closure() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        env.assert_bumps_ttl(&id, StorageKind::Persistent, DataKey::Record, || {
+            panic!("closure panicked before any TTL assertion");
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "closure panicked after bumping the TTL")]
+    fn assert_bumps_ttl_forwards_a_panic_even_if_the_ttl_was_bumped() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        env.assert_bumps_ttl(&id, StorageKind::Persistent, DataKey::Record, || {
+            client.touch_record_checked();
+            panic!("closure panicked after bumping the TTL");
+        });
+    }
+
+    // #181 — failure messages must carry both readings and their delta.
+
+    #[test]
+    fn assert_bumps_ttl_failure_message_shows_before_after_and_delta() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            env.assert_bumps_ttl(&id, StorageKind::Persistent, DataKey::Record, || {
+                client.touch_record();
+            });
+        }));
+        let payload = result.expect_err("a non-bumping call must fail");
+        let message = panic_message(&*payload);
+        assert!(message.contains("before="), "{message}");
+        assert!(message.contains("after="), "{message}");
+        assert!(message.contains("delta="), "{message}");
+    }
+
+    #[test]
+    fn assert_bumps_ttl_multi_failure_message_shows_before_after_and_delta() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            env.assert_bumps_ttl_multi(
+                &id,
+                StorageKind::Persistent,
+                &[(DataKey::Record, "record")],
+                || {
+                    client.touch_record();
+                },
+            );
+        }));
+        let payload = result.expect_err("a non-bumping call must fail");
+        let message = panic_message(&*payload);
+        assert!(message.contains("record: before="), "{message}");
+        assert!(message.contains("after="), "{message}");
+        assert!(message.contains("delta="), "{message}");
     }
 
     #[test]
@@ -2173,6 +2388,30 @@ mod tests {
         );
         assert_eq!(params.min_temp_entry_ttl, info.min_temp_entry_ttl);
         assert_eq!(params.max_entry_ttl, info.max_entry_ttl);
+    }
+
+    // #182 — the documented protocol limits are read from the live ledger,
+    // never from constants baked into this module.
+
+    #[test]
+    fn archival_parameters_follow_runtime_protocol_and_ttl_changes() {
+        use soroban_sdk::testutils::Ledger as _;
+
+        let env = TestEnv::new();
+        env.env().ledger().set_min_persistent_entry_ttl(1_234);
+        env.env()
+            .ledger()
+            .set_protocol_version(ARCHIVAL_PROTOCOL_CONTRACT_LIFECYCLE);
+
+        let params = env.archival_parameters();
+        assert_eq!(
+            params.min_persistent_entry_ttl, 1_234,
+            "minimum TTLs are network parameters, not hardcoded values"
+        );
+        assert_eq!(
+            params.protocol_version, ARCHIVAL_PROTOCOL_CONTRACT_LIFECYCLE,
+            "the protocol fixture must be observable at runtime"
+        );
     }
 
     #[test]
