@@ -183,3 +183,65 @@ fn tracked_supply_remains_consistent_when_mint_traps() {
     token.mint_raw(&alice, 42);
     assert_eq!(token.total_tracked(), 100_000_042);
 }
+
+#[test]
+fn integration_mint_many_table_fixtures_work() {
+    let env = TestEnv::new();
+    let token = env.token();
+    let alice = env.address();
+    let bob = env.address();
+    let carol = env.address();
+
+    // Table of allocations with various types
+    token.mint_many([(&alice, 10), (&bob, 25), (&carol, 50)]);
+    token.assert_balance_whole(&alice, 10);
+    token.assert_balance_whole(&bob, 25);
+    token.assert_balance_whole(&carol, 50);
+
+    token.mint_many_raw([(&alice, 5), (&bob, 15)]);
+    token.assert_balance(&alice, 100_000_005);
+    token.assert_balance(&bob, 250_000_015);
+}
+
+#[test]
+fn integration_supply_and_balance_delta_assertions() {
+    let env = TestEnv::new();
+    let token = env.token();
+    let alice = env.address();
+    let bob = env.address();
+
+    // Supply delta around closure
+    token.assert_supply_delta_whole(30, || {
+        token.mint(&alice, 10);
+        token.mint(&bob, 20);
+    });
+
+    // Balance delta around closure
+    token.assert_balance_delta_whole(&alice, 5, || {
+        token.mint(&alice, 5);
+    });
+
+    // Multi-account balance deltas
+    token.assert_balances_delta_whole([(&alice, 1), (&bob, 2)], || {
+        token.mint(&alice, 1);
+        token.mint(&bob, 2);
+    });
+}
+
+#[test]
+fn integration_token_snapshot_and_diff() {
+    let env = TestEnv::new();
+    let token = env.token();
+    let alice = env.address();
+    let bob = env.address();
+
+    let before = token.snapshot(&alice);
+    token.mint_many([(&alice, 7), (&bob, 3)]);
+    let after = token.snapshot(&alice);
+
+    let diff = before.diff(&after);
+    diff.assert_balance_delta_whole(7);
+    diff.assert_supply_delta_whole(10);
+    assert_eq!(diff.balance_delta_whole().unwrap(), 7);
+    assert_eq!(diff.supply_delta_whole().unwrap(), 10);
+}
