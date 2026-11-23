@@ -37,6 +37,11 @@ pub struct AuthMatrix<'a> {
     #[allow(dead_code)]
     env: &'a TestEnv,
     entry_points: Vec<EntryPointSpec<'a>>,
+    roles: Vec<(Address, String)>,
+}
+
+fn csv_escape(value: &str) -> String {
+    format!("\\\"{}\\\"", value.replace('\\\"', "\\\"\\\""))
 }
 
 impl<'a> AuthMatrix<'a> {
@@ -45,9 +50,53 @@ impl<'a> AuthMatrix<'a> {
         Self {
             env,
             entry_points: Vec::new(),
+            roles: Vec::new(),
         }
     }
 
+    /// Attach a human-readable role name to an actor.
+    pub fn role(mut self, actor: &Address, name: &str) -> Self {
+        self.roles.retain(|(address, _)| address != actor);
+        self.roles.push((actor.clone(), name.to_string()));
+        self
+    }
+
+    /// Attach several role names at once.
+    pub fn roles(mut self, actors: &[(Address, &str)]) -> Self {
+        for (actor, name) in actors { self = self.role(actor, name); }
+        self
+    }
+
+    fn role_name(&self, actor: &Address) -> &str {
+        self.roles.iter().find(|(address, _)| address == actor).map(|(_, name)| name.as_str()).unwrap_or("")
+    }
+
+    /// Return the known actors denied by an entry point.
+    pub fn denied_addresses(&self, name: &str) -> Vec<Address> {
+        let allowed = self.entry_points.iter().find(|entry| entry.name == name).map(|entry| &entry.allowed);
+        match allowed {
+            Some(allowed) => self.known_actors().into_iter().filter(|actor| !allowed.contains(actor)).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Export the expected authorization grid as deterministic CSV.
+    pub fn to_csv(&self) -> String {
+        let mut csv = String::from("entry_point,actor,role,allowed,expected_error\n");
+        for entry in &self.entry_points {
+            for actor in self.known_actors() {
+                let expected_error = entry.expected_errors.iter().find(|(address, _)| address == &actor).map(|(_, error)| error.as_str()).unwrap_or("");
+                let actor_text = format!("{actor:?}");
+                let fields = [entry.name.as_str(), actor_text.as_str(), self.role_name(&actor), if entry.allowed.contains(&actor) { "true" } else { "false" }, expected_error];
+                csv.push_str(&fields.iter().map(|field| csv_escape(field)).collect::<Vec<_>>().join(","));
+                csv.push('\\n');
+            }
+        }
+        csv
+    }
+
+    /// Alias for to_csv.
+    pub fn csv_report(&self) -> String { self.to_csv() }
     /// Register a privileged entry point: its name (for failure messages),
     /// the addresses permitted to call it, and a closure that attempts the
     /// call as a given caller, returning `Ok(())` if it succeeded and
