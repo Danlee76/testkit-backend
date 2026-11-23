@@ -306,6 +306,9 @@ impl Finding {
 /// 8. `unchecked-amount-division` [medium]: Unchecked `/` or `/=` in amount calculations.
 ///    Limitations: Matches amount-related identifier stems syntactically; non-zero
 ///    positive literal divisors are skipped; control-flow zero checks are not tracked.
+/// 9. `unchecked-narrowing-conversion` [medium]: Integer `as` casts that can truncate.
+///    Limitations: Tracks parameter and annotated local types; when source type is
+///    unknown, casts to `< 128`-bit integer types are flagged as potentially narrowing.
 ///
 /// # Scan roots and exclusions
 ///
@@ -1037,6 +1040,16 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
         remediation: "Use .checked_add(), .checked_sub(), .checked_mul(), or .checked_div() and handle overflow, or use saturating/wrapping arithmetic if truncation is intended.",
     },
     RuleDefinition {
+        id: "unchecked-narrowing-conversion",
+        severity: "warning",
+        description: "Unchecked narrowing `as` casts can silently truncate integer values.",
+        explanation: "unchecked-narrowing-conversion: Using `as` to cast a wider integer to a narrower integer type silently truncates high bits.\n\
+             This rule detects narrowing integer `as` casts (e.g. `u128 as u64`, `i128 as i64`, `u64 as u32`).\n\
+             Fix: Use `.try_into()` or `TryFrom::try_from(...)` and handle conversion errors explicitly.\n\
+             Reference: https://doc.rust-lang.org/std/convert/trait.TryFrom.html",
+        remediation: "Replace the narrowing `as` cast with `.try_into()` or `TryFrom::try_from(...)` and propagate or handle out-of-range errors.",
+    },
+    RuleDefinition {
         id: "unchecked-timestamp-arithmetic",
         severity: "warning",
         description: "Timestamp arithmetic can overflow and cause silent failures.",
@@ -1131,6 +1144,17 @@ pub const RULES: &[RuleMeta] = &[
             "Matches amount-related identifier stems syntactically without full type inference",
             "Non-zero positive integer literal divisors are not flagged for division-by-zero",
             "Does not track prior control-flow guards (such as require!(divisor > 0))",
+        ],
+    },
+    RuleMeta {
+        id: "unchecked-narrowing-conversion",
+        severity: "warning",
+        description: "Unchecked narrowing `as` casts can silently truncate integer values.",
+        confidence: "medium",
+        limitations: &[
+            "Tracks integer types from function parameters, annotated local bindings, and suffixed literals",
+            "When the source expression type cannot be inferred syntactically, casts to integer types narrower than 128 bits are flagged",
+            "Does not perform cross-function return type inference",
         ],
     },
     RuleMeta {
@@ -1990,6 +2014,7 @@ pub const VALID_RULES: &[&str] = &[
     "missing-ttl-bump",
     "unchecked-amount-division",
     "unchecked-i128-arithmetic",
+    "unchecked-narrowing-conversion",
     "unchecked-timestamp-arithmetic",
 ];
 
@@ -2893,6 +2918,7 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
             self.audit_function(&node.sig, &node.block, body_src.clone(), line, fn_range);
             self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
             self.audit_amount_division(&node.sig, &node.block, fn_range);
+            self.audit_narrowing_conversions(&node.sig, &node.block, fn_range);
             self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
         }
         self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
@@ -2911,6 +2937,7 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
             self.audit_function(&node.sig, &node.block, body_src.clone(), line, fn_range);
             self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
             self.audit_amount_division(&node.sig, &node.block, fn_range);
+            self.audit_narrowing_conversions(&node.sig, &node.block, fn_range);
             self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
         }
         self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
@@ -3201,6 +3228,40 @@ impl FunctionVisitor<'_> {
         };
         visitor.visit_block(body);
     }
+
+    fn audit_narrowing_conversions(
+        &mut self,
+        sig: &Signature,
+        body: &syn::Block,
+        fn_range: (usize, usize),
+    ) {
+        if !self.is_enabled("unchecked-narrowing-conversion") {
+            return;
+        }
+
+        let mut bindings = HashMap::new();
+        for arg in &sig.inputs {
+            if let FnArg::Typed(pat_type) = arg {
+                if let Some(info) = parse_int_type(&pat_type.ty) {
+                    if let Pat::Ident(ident) = &*pat_type.pat {
+                        bindings.insert(ident.ident.unraw().to_string(), info);
+                    }
+                }
+            }
+        }
+
+        let mut visitor = NarrowingConversionVisitor {
+            path: self.path.clone(),
+            fn_name: sig.ident.to_string(),
+            fn_range,
+            bindings,
+            findings: self.findings,
+            config: self.config,
+            suppressions: self.suppressions,
+            source: self.source,
+        };
+        visitor.visit_block(body);
+    }
 }
 
 fn signed_amount_params(sig: &Signature) -> Vec<String> {
@@ -3450,6 +3511,155 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IntTypeInfo {
+    name: &'static str,
+    bits: u8,
+    is_pointer_sized: bool,
+    max_unsigned: u128,
+}
+
+fn parse_int_type_name(name: &str) -> Option<IntTypeInfo> {
+    match name {
+        "u8" => Some(IntTypeInfo { name: "u8", bits: 8, is_pointer_sized: false, max_unsigned: u8::MAX as u128 }),
+        "i8" => Some(IntTypeInfo { name: "i8", bits: 8, is_pointer_sized: false, max_unsigned: i8::MAX as u128 }),
+        "u16" => Some(IntTypeInfo { name: "u16", bits: 16, is_pointer_sized: false, max_unsigned: u16::MAX as u128 }),
+        "i16" => Some(IntTypeInfo { name: "i16", bits: 16, is_pointer_sized: false, max_unsigned: i16::MAX as u128 }),
+        "u32" => Some(IntTypeInfo { name: "u32", bits: 32, is_pointer_sized: false, max_unsigned: u32::MAX as u128 }),
+        "i32" => Some(IntTypeInfo { name: "i32", bits: 32, is_pointer_sized: false, max_unsigned: i32::MAX as u128 }),
+        "u64" => Some(IntTypeInfo { name: "u64", bits: 64, is_pointer_sized: false, max_unsigned: u64::MAX as u128 }),
+        "i64" => Some(IntTypeInfo { name: "i64", bits: 64, is_pointer_sized: false, max_unsigned: i64::MAX as u128 }),
+        "u128" => Some(IntTypeInfo { name: "u128", bits: 128, is_pointer_sized: false, max_unsigned: u128::MAX }),
+        "i128" => Some(IntTypeInfo { name: "i128", bits: 128, is_pointer_sized: false, max_unsigned: i128::MAX as u128 }),
+        "usize" => Some(IntTypeInfo { name: "usize", bits: 32, is_pointer_sized: true, max_unsigned: u32::MAX as u128 }),
+        "isize" => Some(IntTypeInfo { name: "isize", bits: 32, is_pointer_sized: true, max_unsigned: i32::MAX as u128 }),
+        _ => None,
+    }
+}
+
+fn parse_int_type(ty: &Type) -> Option<IntTypeInfo> {
+    match ty {
+        Type::Reference(r) => parse_int_type(&r.elem),
+        Type::Group(g) => parse_int_type(&g.elem),
+        Type::Paren(p) => parse_int_type(&p.elem),
+        Type::Path(p) => p
+            .path
+            .get_ident()
+            .and_then(|ident| parse_int_type_name(&ident.unraw().to_string())),
+        _ => None,
+    }
+}
+
+fn is_narrowing_cast(src: IntTypeInfo, dst: IntTypeInfo) -> bool {
+    if src.is_pointer_sized && dst.is_pointer_sized {
+        return false;
+    }
+    if src.is_pointer_sized {
+        // On 64-bit targets `usize`/`isize` is 64 bits, so casting to <=32 bits narrows.
+        return dst.bits <= 32;
+    }
+    if dst.is_pointer_sized {
+        // On wasm32 (Soroban's target) `usize`/`isize` is 32 bits, so >=64 bits narrows.
+        return src.bits >= 64;
+    }
+    src.bits > dst.bits
+}
+
+struct NarrowingConversionVisitor<'a> {
+    path: PathBuf,
+    fn_name: String,
+    fn_range: (usize, usize),
+    bindings: HashMap<String, IntTypeInfo>,
+    findings: &'a mut Vec<Finding>,
+    config: &'a AuditConfig,
+    suppressions: &'a [Suppression],
+    source: &'a SourceLines,
+}
+
+impl NarrowingConversionVisitor<'_> {
+    fn infer_expr_int_type(&self, expr: &Expr) -> Option<IntTypeInfo> {
+        match expr {
+            Expr::Paren(p) => self.infer_expr_int_type(&p.expr),
+            Expr::Group(g) => self.infer_expr_int_type(&g.expr),
+            Expr::Path(p) => p
+                .path
+                .get_ident()
+                .and_then(|ident| self.bindings.get(&ident.unraw().to_string()).copied()),
+            Expr::Cast(cast) => parse_int_type(&cast.ty),
+            Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(lit),
+                ..
+            }) => {
+                let suffix = lit.suffix();
+                if suffix.is_empty() {
+                    None
+                } else {
+                    parse_int_type_name(suffix)
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for NarrowingConversionVisitor<'_> {
+    fn visit_local(&mut self, node: &'ast Local) {
+        if let Pat::Type(pat_type) = &node.pat {
+            if let Some(info) = parse_int_type(&pat_type.ty) {
+                if let Pat::Ident(ident) = &*pat_type.pat {
+                    self.bindings.insert(ident.ident.unraw().to_string(), info);
+                }
+            }
+        } else if let Pat::Ident(ident) = &node.pat {
+            if let Some(init) = &node.init {
+                if let Some(info) = self.infer_expr_int_type(&init.expr) {
+                    self.bindings.insert(ident.ident.unraw().to_string(), info);
+                }
+            }
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_expr_cast(&mut self, node: &'ast syn::ExprCast) {
+        if let Some(dst) = parse_int_type(&node.ty) {
+            let is_unsuffixed_fitting_lit = matches!(
+                &*node.expr,
+                Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(lit), .. })
+                    if lit.suffix().is_empty()
+                        && lit.base10_parse::<u128>().is_ok_and(|v| v <= dst.max_unsigned)
+            );
+            if !is_unsuffixed_fitting_lit {
+                let should_flag = match self.infer_expr_int_type(&node.expr) {
+                    Some(src) => is_narrowing_cast(src, dst),
+                    None => dst.bits < 128,
+                };
+                if should_flag {
+                    let line = line_of(node);
+                    let (_, end) = item_line_range(node);
+                    FindingEmitter {
+                        path: &self.path,
+                        fn_range: self.fn_range,
+                        findings: self.findings,
+                        config: self.config,
+                        suppressions: self.suppressions,
+                        source: self.source,
+                    }
+                    .emit(
+                        "unchecked-narrowing-conversion",
+                        line,
+                        Some(end),
+                        format!(
+                            "fn {} performs unchecked narrowing cast `as {}`; use try_into() or TryFrom to avoid silent truncation",
+                            self.fn_name, dst.name
+                        ),
+                    );
+                }
+            }
+        }
+        visit::visit_expr_cast(self, node);
+    }
+}
+
 impl I128ArithmeticVisitor<'_> {
     fn touches_i128(&self, expr: &Expr) -> bool {
         match expr {
@@ -3635,6 +3845,155 @@ impl<'ast> Visit<'ast> for AmountDivisionVisitor<'_> {
             );
         }
         visit::visit_expr_binary(self, node);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IntTypeInfo {
+    name: &'static str,
+    bits: u8,
+    is_pointer_sized: bool,
+    max_unsigned: u128,
+}
+
+fn parse_int_type_name(name: &str) -> Option<IntTypeInfo> {
+    match name {
+        "u8" => Some(IntTypeInfo { name: "u8", bits: 8, is_pointer_sized: false, max_unsigned: u8::MAX as u128 }),
+        "i8" => Some(IntTypeInfo { name: "i8", bits: 8, is_pointer_sized: false, max_unsigned: i8::MAX as u128 }),
+        "u16" => Some(IntTypeInfo { name: "u16", bits: 16, is_pointer_sized: false, max_unsigned: u16::MAX as u128 }),
+        "i16" => Some(IntTypeInfo { name: "i16", bits: 16, is_pointer_sized: false, max_unsigned: i16::MAX as u128 }),
+        "u32" => Some(IntTypeInfo { name: "u32", bits: 32, is_pointer_sized: false, max_unsigned: u32::MAX as u128 }),
+        "i32" => Some(IntTypeInfo { name: "i32", bits: 32, is_pointer_sized: false, max_unsigned: i32::MAX as u128 }),
+        "u64" => Some(IntTypeInfo { name: "u64", bits: 64, is_pointer_sized: false, max_unsigned: u64::MAX as u128 }),
+        "i64" => Some(IntTypeInfo { name: "i64", bits: 64, is_pointer_sized: false, max_unsigned: i64::MAX as u128 }),
+        "u128" => Some(IntTypeInfo { name: "u128", bits: 128, is_pointer_sized: false, max_unsigned: u128::MAX }),
+        "i128" => Some(IntTypeInfo { name: "i128", bits: 128, is_pointer_sized: false, max_unsigned: i128::MAX as u128 }),
+        "usize" => Some(IntTypeInfo { name: "usize", bits: 32, is_pointer_sized: true, max_unsigned: u32::MAX as u128 }),
+        "isize" => Some(IntTypeInfo { name: "isize", bits: 32, is_pointer_sized: true, max_unsigned: i32::MAX as u128 }),
+        _ => None,
+    }
+}
+
+fn parse_int_type(ty: &Type) -> Option<IntTypeInfo> {
+    match ty {
+        Type::Reference(r) => parse_int_type(&r.elem),
+        Type::Group(g) => parse_int_type(&g.elem),
+        Type::Paren(p) => parse_int_type(&p.elem),
+        Type::Path(p) => p
+            .path
+            .get_ident()
+            .and_then(|ident| parse_int_type_name(&ident.unraw().to_string())),
+        _ => None,
+    }
+}
+
+fn is_narrowing_cast(src: IntTypeInfo, dst: IntTypeInfo) -> bool {
+    if src.is_pointer_sized && dst.is_pointer_sized {
+        return false;
+    }
+    if src.is_pointer_sized {
+        // On 64-bit targets `usize`/`isize` is 64 bits, so casting to <=32 bits narrows.
+        return dst.bits <= 32;
+    }
+    if dst.is_pointer_sized {
+        // On wasm32 (Soroban's target) `usize`/`isize` is 32 bits, so >=64 bits narrows.
+        return src.bits >= 64;
+    }
+    src.bits > dst.bits
+}
+
+struct NarrowingConversionVisitor<'a> {
+    path: PathBuf,
+    fn_name: String,
+    fn_range: (usize, usize),
+    bindings: HashMap<String, IntTypeInfo>,
+    findings: &'a mut Vec<Finding>,
+    config: &'a AuditConfig,
+    suppressions: &'a [Suppression],
+    source: &'a SourceLines,
+}
+
+impl NarrowingConversionVisitor<'_> {
+    fn infer_expr_int_type(&self, expr: &Expr) -> Option<IntTypeInfo> {
+        match expr {
+            Expr::Paren(p) => self.infer_expr_int_type(&p.expr),
+            Expr::Group(g) => self.infer_expr_int_type(&g.expr),
+            Expr::Path(p) => p
+                .path
+                .get_ident()
+                .and_then(|ident| self.bindings.get(&ident.unraw().to_string()).copied()),
+            Expr::Cast(cast) => parse_int_type(&cast.ty),
+            Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(lit),
+                ..
+            }) => {
+                let suffix = lit.suffix();
+                if suffix.is_empty() {
+                    None
+                } else {
+                    parse_int_type_name(suffix)
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for NarrowingConversionVisitor<'_> {
+    fn visit_local(&mut self, node: &'ast Local) {
+        if let Pat::Type(pat_type) = &node.pat {
+            if let Some(info) = parse_int_type(&pat_type.ty) {
+                if let Pat::Ident(ident) = &*pat_type.pat {
+                    self.bindings.insert(ident.ident.unraw().to_string(), info);
+                }
+            }
+        } else if let Pat::Ident(ident) = &node.pat {
+            if let Some(init) = &node.init {
+                if let Some(info) = self.infer_expr_int_type(&init.expr) {
+                    self.bindings.insert(ident.ident.unraw().to_string(), info);
+                }
+            }
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_expr_cast(&mut self, node: &'ast syn::ExprCast) {
+        if let Some(dst) = parse_int_type(&node.ty) {
+            let is_unsuffixed_fitting_lit = matches!(
+                &*node.expr,
+                Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(lit), .. })
+                    if lit.suffix().is_empty()
+                        && lit.base10_parse::<u128>().is_ok_and(|v| v <= dst.max_unsigned)
+            );
+            if !is_unsuffixed_fitting_lit {
+                let should_flag = match self.infer_expr_int_type(&node.expr) {
+                    Some(src) => is_narrowing_cast(src, dst),
+                    None => dst.bits < 128,
+                };
+                if should_flag {
+                    let line = line_of(node);
+                    let (_, end) = item_line_range(node);
+                    FindingEmitter {
+                        path: &self.path,
+                        fn_range: self.fn_range,
+                        findings: self.findings,
+                        config: self.config,
+                        suppressions: self.suppressions,
+                        source: self.source,
+                    }
+                    .emit(
+                        "unchecked-narrowing-conversion",
+                        line,
+                        Some(end),
+                        format!(
+                            "fn {} performs unchecked narrowing cast `as {}`; use try_into() or TryFrom to avoid silent truncation",
+                            self.fn_name, dst.name
+                        ),
+                    );
+                }
+            }
+        }
+        visit::visit_expr_cast(self, node);
     }
 }
 
@@ -4706,5 +5065,53 @@ mod tests {
         assert!(!unrelated
             .iter()
             .any(|f| f.rule == "unchecked-amount-division"));
+    }
+
+    #[test]
+    fn unchecked_narrowing_conversion_detects_positive_negative_and_edge_cases() {
+        // Positive: explicit narrowing from wider parameter and local binding
+        let narrowing = audit_source_for_test("pub fn shrink(amount: u128) -> u64 { amount as u64 }");
+        assert!(
+            narrowing
+                .iter()
+                .any(|f| f.rule == "unchecked-narrowing-conversion"),
+            "expected unchecked-narrowing-conversion finding: {narrowing:?}"
+        );
+
+        let local_narrowing = audit_source_for_test(
+            "pub fn shrink_local() -> u32 { let big: u64 = 100; big as u32 }",
+        );
+        assert!(local_narrowing
+            .iter()
+            .any(|f| f.rule == "unchecked-narrowing-conversion"));
+
+        // Positive: overflowing unsuffixed literal cast
+        let overflow_lit = audit_source_for_test("pub fn bad_lit() -> u8 { 300 as u8 }");
+        assert!(overflow_lit
+            .iter()
+            .any(|f| f.rule == "unchecked-narrowing-conversion"));
+
+        // Negative: widening cast, same-width cast, fitting unsuffixed literal, and try_into()
+        let widening = audit_source_for_test("pub fn widen(x: u32) -> u128 { x as u128 }");
+        assert!(!widening
+            .iter()
+            .any(|f| f.rule == "unchecked-narrowing-conversion"));
+
+        let same_width = audit_source_for_test("pub fn same(x: u64) -> u64 { x as u64 }");
+        assert!(!same_width
+            .iter()
+            .any(|f| f.rule == "unchecked-narrowing-conversion"));
+
+        let fitting_lit = audit_source_for_test("pub fn ok_lit() -> u32 { 42 as u32 }");
+        assert!(!fitting_lit
+            .iter()
+            .any(|f| f.rule == "unchecked-narrowing-conversion"));
+
+        let checked = audit_source_for_test(
+            "pub fn safe(amount: u128) -> Result<u64, ()> { amount.try_into().map_err(|_| ()) }",
+        );
+        assert!(!checked
+            .iter()
+            .any(|f| f.rule == "unchecked-narrowing-conversion"));
     }
 }

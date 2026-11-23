@@ -1052,6 +1052,7 @@ fn audit_explain_rules_document_the_heuristic_nature_of_findings() {
         "ignored-token-transfer-result",
         "missing-positive-amount-validation",
         "unchecked-amount-division",
+        "unchecked-narrowing-conversion",
         "unchecked-timestamp-arithmetic",
     ] {
         let output = run(&["audit", "explain", rule]);
@@ -1888,10 +1889,11 @@ fn audit_list_rules_subcommand_and_flag_list_all_registered_rules() {
         "missing-ttl-bump",
         "unchecked-amount-division",
         "unchecked-i128-arithmetic",
+        "unchecked-narrowing-conversion",
         "unchecked-timestamp-arithmetic",
     ];
     // Exact count check to prevent silent rule additions/removals without test updates
-    assert_eq!(expected_rules.len(), 8);
+    assert_eq!(expected_rules.len(), 9);
 
     for invocation in [&["audit", "list-rules"][..], &["audit", "--list-rules"][..]] {
         let output = run(invocation);
@@ -1937,6 +1939,7 @@ fn audit_list_rules_structured_formats() {
         "missing-ttl-bump",
         "unchecked-amount-division",
         "unchecked-i128-arithmetic",
+        "unchecked-narrowing-conversion",
         "unchecked-timestamp-arithmetic",
     ];
 
@@ -1945,9 +1948,9 @@ fn audit_list_rules_structured_formats() {
     assert!(json_output.status.success(), "{json_output:?}");
     let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
     assert_eq!(report["tool"], "soroban-testkit");
-    assert_eq!(report["summary"]["rule_count"], 8);
+    assert_eq!(report["summary"]["rule_count"], 9);
     let rules = report["rules"].as_array().expect("rules array");
-    assert_eq!(rules.len(), 8);
+    assert_eq!(rules.len(), 9);
     for (i, expected_id) in expected_rules.iter().enumerate() {
         assert_eq!(rules[i]["id"], *expected_id);
         assert!(!rules[i]["description"].as_str().unwrap().is_empty());
@@ -1961,7 +1964,7 @@ fn audit_list_rules_structured_formats() {
     let sarif_rules = sarif["runs"][0]["tool"]["driver"]["rules"]
         .as_array()
         .expect("sarif rules array");
-    assert_eq!(sarif_rules.len(), 8);
+    assert_eq!(sarif_rules.len(), 9);
     for (i, expected_id) in expected_rules.iter().enumerate() {
         assert_eq!(sarif_rules[i]["id"], *expected_id);
     }
@@ -3390,6 +3393,36 @@ fn audit_flags_unchecked_amount_division_and_allows_checked_div() {
         .as_str()
         .unwrap()
         .contains("checked_div"));
+}
+
+#[test]
+fn audit_flags_unchecked_narrowing_conversion_and_allows_try_into() {
+    let fixture = AuditFixture::new("narrowing-conversion");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+        pub fn truncate(amount: u128) -> u64 {
+            amount as u64
+        }
+        pub fn safe_convert(amount: u128) -> Result<u64, core::num::TryFromIntError> {
+            amount.try_into()
+        }
+        "#,
+    );
+    let output = fixture.scan(&["--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let cast_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "unchecked-narrowing-conversion")
+        .collect();
+    assert_eq!(cast_findings.len(), 1, "{report}");
+    assert!(cast_findings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("try_into"));
 }
 
 
