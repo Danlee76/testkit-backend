@@ -640,7 +640,7 @@ mod tests {
             .entry_point_with_expected_errors(
                 "role_guard",
                 std::slice::from_ref(&allowed),
-                &[(denied.clone(), "not authorized")],
+                &[(denied.clone(), "Contract")],
                 move |caller| {
                     if *caller == allowed {
                         Ok(())
