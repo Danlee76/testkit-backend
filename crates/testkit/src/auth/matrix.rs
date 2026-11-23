@@ -217,10 +217,31 @@ impl<'a> AuthMatrix<'a> {
                 // Reset auth state before invoking this actor case so that
                 // previously mocked or recorded auths do not leak into it.
                 self.reset_auth();
-                let actual = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    (ep.invoke)(addr).is_ok()
-                }))
-                .unwrap_or(false);
+                // Isolate every cell: a panic must not prevent later
+                // callers from being checked.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (ep.invoke)(addr)
+                }));
+                let actual = matches!(&outcome, Ok(Ok(())));
+                let error_text = match &outcome {
+                    Ok(Err(error)) => Some(format!("{error:?} / {error}")),
+                    Err(_) => Some("invocation panicked".to_string()),
+                    _ => None,
+                };
+                let expected_error = ep
+                    .expected_errors
+                    .iter()
+                    .find(|(actor, _)| actor == addr)
+                    .map(|(_, text)| text.as_str());
+                let error_matches = expected_error
+                    .map(|expected| error_text.as_deref().is_some_and(|actual| actual.contains(expected)))
+                    .unwrap_or(true);
+                let cell_matches = if expected {
+                    actual && expected_error.is_none()
+                } else {
+                    !actual && error_matches
+                };
+
                 // Reset auth state immediately after invocation to keep the
                 // slate clean for the next actor case.
                 self.reset_auth();
@@ -229,18 +250,18 @@ impl<'a> AuthMatrix<'a> {
                     "    {addr:?}: expected={} actual={}{}\n",
                     if expected { "pass" } else { "reject" },
                     if actual { "pass" } else { "reject" },
-                    if expected == actual {
-                        ""
-                    } else {
-                        "  <-- MISMATCH"
-                    },
+                    if cell_matches { "" } else { "  <-- MISMATCH" },
                 ));
-                if expected != actual {
+                if !cell_matches {
                     violations.push(format!(
-                        "entry point {:?}: caller {addr:?} expected to {} but {}",
+                        "entry point {:?}: caller {addr:?} expected {} but observed {}",
                         ep.name,
-                        if expected { "succeed" } else { "be rejected" },
-                        if actual { "succeeded" } else { "was rejected" },
+                        if expected {
+                            "success".to_string()
+                        } else {
+                            format!("error containing {:?}", expected_error.unwrap_or("an error"))
+                        },
+                        error_text.unwrap_or_else(|| "success".to_string()),
                     ));
                 }
             }
