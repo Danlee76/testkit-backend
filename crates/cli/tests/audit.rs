@@ -1048,6 +1048,7 @@ fn audit_explain_rules_document_the_heuristic_nature_of_findings() {
         "missing-require-auth",
         "unchecked-i128-arithmetic",
         "missing-ttl-bump",
+        "storage-write-missing-ttl",
         "broad-mock-all-auths",
         "ignored-contract-call-result",
         "ignored-token-transfer-result",
@@ -1889,13 +1890,14 @@ fn audit_list_rules_subcommand_and_flag_list_all_registered_rules() {
         "missing-positive-amount-validation",
         "missing-require-auth",
         "missing-ttl-bump",
+        "storage-write-missing-ttl",
         "unchecked-amount-division",
         "unchecked-i128-arithmetic",
         "unchecked-narrowing-conversion",
         "unchecked-timestamp-arithmetic",
     ];
     // Exact count check to prevent silent rule additions/removals without test updates
-    assert_eq!(expected_rules.len(), 10);
+    assert_eq!(expected_rules.len(), 11);
 
     for invocation in [&["audit", "list-rules"][..], &["audit", "--list-rules"][..]] {
         let output = run(invocation);
@@ -1940,6 +1942,7 @@ fn audit_list_rules_structured_formats() {
         "missing-positive-amount-validation",
         "missing-require-auth",
         "missing-ttl-bump",
+        "storage-write-missing-ttl",
         "unchecked-amount-division",
         "unchecked-i128-arithmetic",
         "unchecked-narrowing-conversion",
@@ -1951,9 +1954,9 @@ fn audit_list_rules_structured_formats() {
     assert!(json_output.status.success(), "{json_output:?}");
     let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
     assert_eq!(report["tool"], "soroban-testkit");
-    assert_eq!(report["summary"]["rule_count"], 10);
+    assert_eq!(report["summary"]["rule_count"], 11);
     let rules = report["rules"].as_array().expect("rules array");
-    assert_eq!(rules.len(), 10);
+    assert_eq!(rules.len(), 11);
     for (i, expected_id) in expected_rules.iter().enumerate() {
         assert_eq!(rules[i]["id"], *expected_id);
         assert!(!rules[i]["description"].as_str().unwrap().is_empty());
@@ -1967,7 +1970,7 @@ fn audit_list_rules_structured_formats() {
     let sarif_rules = sarif["runs"][0]["tool"]["driver"]["rules"]
         .as_array()
         .expect("sarif rules array");
-    assert_eq!(sarif_rules.len(), 10);
+    assert_eq!(sarif_rules.len(), 11);
     for (i, expected_id) in expected_rules.iter().enumerate() {
         assert_eq!(sarif_rules[i]["id"], *expected_id);
     }
@@ -3457,6 +3460,37 @@ fn audit_flags_ignored_contract_call_result_and_allows_propagated() {
         .as_str()
         .unwrap()
         .contains("try_deposit"));
+}
+
+#[test]
+fn audit_flags_storage_write_missing_ttl_and_allows_neighboring_extend_ttl() {
+    let fixture = AuditFixture::new("storage-write-ttl");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+        pub fn write_without_ttl(env: Env, key: Symbol, val: i128) {
+            env.storage().persistent().set(&key, &val);
+        }
+        pub fn write_with_ttl(env: Env, key: Symbol, val: i128) {
+            env.storage().persistent().set(&key, &val);
+            env.storage().persistent().extend_ttl(&key, 100, 1000);
+        }
+        "#,
+    );
+    let output = fixture.scan(&["--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let ttl_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "storage-write-missing-ttl")
+        .collect();
+    assert_eq!(ttl_findings.len(), 1, "{report}");
+    assert!(ttl_findings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("extend_ttl"));
 }
 
 

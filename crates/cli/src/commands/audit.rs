@@ -313,6 +313,10 @@ impl Finding {
 ///     `try_invoke_contract`) whose `Result` return value is discarded.
 ///     Limitations: Syntactic heuristic matching `try_*` contract call patterns;
 ///     excludes `try_transfer`/`try_transfer_from` (covered by `ignored-token-transfer-result`).
+/// 11. `storage-write-missing-ttl` [medium]: Persistent or temporary storage writes
+///     (`.set`, `.update`) without a matching `.extend_ttl(` in the same function.
+///     Limitations: Does not check `instance()` storage; does not verify key equivalence
+///     between write and `extend_ttl`; does not inspect helper functions.
 ///
 /// # Scan roots and exclusions
 ///
@@ -1034,6 +1038,16 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
         remediation: "Call env.storage().persistent().extend_ttl(...) or temporary().extend_ttl(...) for accessed keys to prevent state expiration before the next interaction.",
     },
     RuleDefinition {
+        id: "storage-write-missing-ttl",
+        severity: "warning",
+        description: "Storage writes without a neighboring extend_ttl can expire prematurely.",
+        explanation: "storage-write-missing-ttl: Persistent or temporary storage writes without a matching extend_ttl() call can expire.\n\
+             This rule detects .persistent().set/.update or .temporary().set/.update without a matching .extend_ttl() in the same function.\n\
+             Fix: Call .extend_ttl() on the same storage tier after writing to storage.\n\
+             Reference: https://developers.stellar.org/docs/smart-contracts/storing-data",
+        remediation: "Call env.storage().persistent().extend_ttl(...) or temporary().extend_ttl(...) for written keys so state does not expire prematurely.",
+    },
+    RuleDefinition {
         id: "unchecked-amount-division",
         severity: "warning",
         description: "Unchecked division in amount calculations can panic on zero or overflow.",
@@ -1117,6 +1131,17 @@ pub const RULES: &[RuleMeta] = &[
             "Heuristic token match on body source; does not track storage key equivalence between read and extend_ttl",
             "Does not detect TTL bumps performed in helper functions or separate transactions",
             "Does not check instance storage (.instance().get(...))",
+        ],
+    },
+    RuleMeta {
+        id: "storage-write-missing-ttl",
+        severity: "warning",
+        description: "Storage writes without a neighboring extend_ttl can expire prematurely.",
+        confidence: "medium",
+        limitations: &[
+            "Does not verify key equivalence between the storage write and extend_ttl call",
+            "Does not detect TTL extensions performed in helper functions or separate transactions",
+            "Does not check instance storage (.instance().set(...) or .update(...))",
         ],
     },
     RuleMeta {
@@ -2038,6 +2063,7 @@ pub const VALID_RULES: &[&str] = &[
     "missing-positive-amount-validation",
     "missing-require-auth",
     "missing-ttl-bump",
+    "storage-write-missing-ttl",
     "unchecked-amount-division",
     "unchecked-i128-arithmetic",
     "unchecked-narrowing-conversion",
@@ -2946,6 +2972,7 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
             self.audit_amount_division(&node.sig, &node.block, fn_range);
             self.audit_narrowing_conversions(&node.sig, &node.block, fn_range);
             self.audit_ignored_contract_call_results(&node.sig, &node.block, fn_range);
+            self.audit_storage_write_ttl(&node.sig, &node.block, fn_range);
             self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
         }
         self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
@@ -2966,6 +2993,7 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
             self.audit_amount_division(&node.sig, &node.block, fn_range);
             self.audit_narrowing_conversions(&node.sig, &node.block, fn_range);
             self.audit_ignored_contract_call_results(&node.sig, &node.block, fn_range);
+            self.audit_storage_write_ttl(&node.sig, &node.block, fn_range);
             self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
         }
         self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
@@ -3234,6 +3262,51 @@ impl FunctionVisitor<'_> {
         visitor.visit_block(body);
     }
 
+    fn audit_storage_write_ttl(
+        &mut self,
+        sig: &Signature,
+        body: &syn::Block,
+        fn_range: (usize, usize),
+    ) {
+        if !self.is_enabled("storage-write-missing-ttl") {
+            return;
+        }
+
+        let mut visitor = StorageWriteTtlVisitor {
+            tier_bindings: HashMap::new(),
+            writes: Vec::new(),
+            ttl_extensions: Vec::new(),
+        };
+        visitor.visit_block(body);
+
+        let fn_name = sig.ident.to_string();
+        for (line, end_line, tier) in visitor.writes {
+            let has_neighboring_ttl = visitor
+                .ttl_extensions
+                .iter()
+                .any(|ext_tier| ext_tier.is_none() || *ext_tier == Some(tier));
+            if !has_neighboring_ttl {
+                FindingEmitter {
+                    path: &self.path,
+                    fn_range,
+                    findings: self.findings,
+                    config: self.config,
+                    suppressions: self.suppressions,
+                    source: self.source,
+                }
+                .emit(
+                    "storage-write-missing-ttl",
+                    line,
+                    Some(end_line),
+                    format!(
+                        "fn {fn_name} writes to {} storage without a neighboring extend_ttl call; state may expire prematurely",
+                        tier.as_str()
+                    ),
+                );
+            }
+        }
+    }
+
     fn audit_ignored_transfer_results(
         &mut self,
         sig: &Signature,
@@ -3392,6 +3465,79 @@ fn line_of(node: impl quote::ToTokens) -> usize {
         .next()
         .map(|token| token.span().start().line)
         .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageTier {
+    Persistent,
+    Temporary,
+}
+
+impl StorageTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            StorageTier::Persistent => "persistent",
+            StorageTier::Temporary => "temporary",
+        }
+    }
+}
+
+struct StorageWriteTtlVisitor {
+    tier_bindings: HashMap<String, StorageTier>,
+    writes: Vec<(usize, usize, StorageTier)>,
+    ttl_extensions: Vec<Option<StorageTier>>,
+}
+
+impl StorageWriteTtlVisitor {
+    fn infer_storage_tier(&self, expr: &Expr) -> Option<StorageTier> {
+        match expr {
+            Expr::MethodCall(call) => match call.method.unraw().to_string().as_str() {
+                "persistent" => Some(StorageTier::Persistent),
+                "temporary" => Some(StorageTier::Temporary),
+                _ => None,
+            },
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .and_then(|ident| self.tier_bindings.get(&ident.unraw().to_string()).copied()),
+            Expr::Paren(p) => self.infer_storage_tier(&p.expr),
+            Expr::Group(g) => self.infer_storage_tier(&g.expr),
+            _ => None,
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for StorageWriteTtlVisitor {
+    fn visit_local(&mut self, node: &'ast Local) {
+        if let Pat::Ident(ident) = &node.pat {
+            if let Some(init) = &node.init {
+                if let Some(tier) = self.infer_storage_tier(&init.expr) {
+                    self.tier_bindings
+                        .insert(ident.ident.unraw().to_string(), tier);
+                }
+            }
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        let method = node.method.unraw().to_string();
+        match method.as_str() {
+            "set" | "update" => {
+                if let Some(tier) = self.infer_storage_tier(&node.receiver) {
+                    let line = line_of(node);
+                    let (_, end) = item_line_range(node);
+                    self.writes.push((line, end, tier));
+                }
+            }
+            "extend_ttl" => {
+                let tier = self.infer_storage_tier(&node.receiver);
+                self.ttl_extensions.push(tier);
+            }
+            _ => {}
+        }
+        visit::visit_expr_method_call(self, node);
+    }
 }
 
 struct IgnoredContractCallVisitor<'a> {
@@ -5328,5 +5474,56 @@ mod tests {
         assert!(!transfer
             .iter()
             .any(|f| f.rule == "ignored-contract-call-result"));
+    }
+
+    #[test]
+    fn storage_write_missing_ttl_detects_positive_negative_and_edge_cases() {
+        // Positive: persistent and temporary writes without extend_ttl
+        let persistent_write = audit_source_for_test(
+            "pub fn save(env: Env, k: Symbol, v: i128) { env.storage().persistent().set(&k, &v); }",
+        );
+        assert!(
+            persistent_write
+                .iter()
+                .any(|f| f.rule == "storage-write-missing-ttl"),
+            "expected storage-write-missing-ttl finding: {persistent_write:?}"
+        );
+
+        let temp_update = audit_source_for_test(
+            "pub fn upd(env: Env, k: Symbol) { let t = env.storage().temporary(); t.update(&k, |v| v); }",
+        );
+        assert!(temp_update
+            .iter()
+            .any(|f| f.rule == "storage-write-missing-ttl"));
+
+        // Positive (tier mismatch): persistent write with only temporary extend_ttl
+        let tier_mismatch = audit_source_for_test(
+            "pub fn mismatch(env: Env, k: Symbol, v: i128) { env.storage().persistent().set(&k, &v); env.storage().temporary().extend_ttl(&k, 1, 2); }",
+        );
+        assert!(tier_mismatch
+            .iter()
+            .any(|f| f.rule == "storage-write-missing-ttl"));
+
+        // Negative: matching extend_ttl on chained call or bound handle, and instance storage
+        let with_ttl = audit_source_for_test(
+            "pub fn save_ok(env: Env, k: Symbol, v: i128) { env.storage().persistent().set(&k, &v); env.storage().persistent().extend_ttl(&k, 100, 1000); }",
+        );
+        assert!(!with_ttl
+            .iter()
+            .any(|f| f.rule == "storage-write-missing-ttl"));
+
+        let bound_with_ttl = audit_source_for_test(
+            "pub fn save_bound(env: Env, k: Symbol, v: i128) { let p = env.storage().persistent(); p.set(&k, &v); p.extend_ttl(&k, 100, 1000); }",
+        );
+        assert!(!bound_with_ttl
+            .iter()
+            .any(|f| f.rule == "storage-write-missing-ttl"));
+
+        let instance_write = audit_source_for_test(
+            "pub fn save_inst(env: Env, k: Symbol, v: i128) { env.storage().instance().set(&k, &v); }",
+        );
+        assert!(!instance_write
+            .iter()
+            .any(|f| f.rule == "storage-write-missing-ttl"));
     }
 }
