@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
@@ -30,6 +30,8 @@ pub struct TestToken {
     address: Address,
     admin: Address,
     total_tracked: Cell<i128>,
+    holders: RefCell<Vec<Address>>,
+    metadata: RefCell<TokenMetadata>,
 }
 
 impl TestToken {
@@ -40,6 +42,8 @@ impl TestToken {
             address: sac.address(),
             admin,
             total_tracked: Cell::new(0),
+            holders: RefCell::new(Vec::new()),
+            metadata: RefCell::new(TokenMetadata::default()),
         }
     }
 
@@ -242,6 +246,7 @@ impl TestToken {
         match invoke_res {
             Ok(Ok(Ok(()))) => {
                 self.total_tracked.set(new_total);
+                self.track_holder(to);
                 Ok(())
             }
             Ok(Err(err)) => Err(TestkitError::AssertionFailed(format!(
@@ -292,7 +297,11 @@ impl TestToken {
         }
     }
 
-    /// The whole-unit balance of `of` (truncated).
+    /// The whole-unit balance of `of`, **truncated**: a fractional part is
+    /// silently dropped, so a balance of `1.5` units reads as `1`.
+    ///
+    /// Use [`TestToken::balance_whole_exact`] when a fractional balance should
+    /// be an error instead of being rounded away.
     ///
     /// # Example
     ///
@@ -338,6 +347,91 @@ impl TestToken {
         self.assert_balance(of, raw_expected);
     }
 
+    /// Convert `base` units into whole units at this token's decimal
+    /// precision, refusing to drop a fractional part.
+    ///
+    /// Unlike [`TestToken::to_whole_units`], which truncates, this returns an
+    /// error when `base` is not an exact multiple of `10^decimals`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// assert_eq!(token.to_whole_units_exact(50_000_000).unwrap(), 5);
+    /// assert!(token.to_whole_units_exact(50_000_001).is_err());
+    /// ```
+    pub fn to_whole_units_exact(&self, base: i128) -> Result<i128, TestkitError> {
+        base_to_whole_units_exact(base, self.decimals())
+    }
+
+    /// The whole-unit balance of `of`, or an error if the balance is not an
+    /// exact number of whole units.
+    ///
+    /// The error says which account was queried, shows the balance both
+    /// formatted and in base units, and states the fractional remainder, so a
+    /// test that expected a round balance points straight at the stray
+    /// base units.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// let alice = env.address();
+    ///
+    /// token.mint(&alice, 10);
+    /// assert_eq!(token.try_balance_whole_exact(&alice).unwrap(), 10);
+    ///
+    /// token.mint_raw(&alice, 1); // one stray base unit
+    /// assert!(token.try_balance_whole_exact(&alice).is_err());
+    /// ```
+    pub fn try_balance_whole_exact(&self, of: &Address) -> Result<i128, TestkitError> {
+        let raw = self.balance(of);
+        self.to_whole_units_exact(raw)
+            .map_err(|err| TestkitError::Context {
+                context: format!(
+                    "balance of {of:?} is {} ({raw} base units)",
+                    self.format_amount(raw)
+                ),
+                source: Box::new(err),
+            })
+    }
+
+    /// The whole-unit balance of `of`, panicking if the balance is not an
+    /// exact number of whole units.
+    ///
+    /// This is the checked counterpart of [`TestToken::balance_whole`], which
+    /// truncates.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the [`TestkitError`] from
+    /// [`TestToken::try_balance_whole_exact`] if the balance has a fractional
+    /// part.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// let alice = env.address();
+    ///
+    /// token.mint(&alice, 25);
+    /// assert_eq!(token.balance_whole_exact(&alice), 25);
+    /// ```
+    pub fn balance_whole_exact(&self, of: &Address) -> i128 {
+        self.try_balance_whole_exact(of).unwrap_or_else(|err| {
+            panic!("{err}");
+        })
+    }
+
     /// Total **base units** minted through this `TestToken` (via
     /// [`TestToken::mint`] or [`TestToken::mint_raw`]) across every
     /// recipient — for supply-conservation assertions.
@@ -355,6 +449,265 @@ impl TestToken {
     /// ```
     pub fn total_tracked(&self) -> i128 {
         self.total_tracked.get()
+    }
+
+    fn track_holder(&self, who: &Address) {
+        let mut holders = self.holders.borrow_mut();
+        if !holders.contains(who) {
+            holders.push(who.clone());
+        }
+    }
+
+    /// Every address this `TestToken` has successfully minted to, in the
+    /// order each was first minted to, without duplicates.
+    ///
+    /// A failed or rejected mint does not add its recipient. Addresses that
+    /// only ever *received a transfer* are not tracked: the list is the set of
+    /// holders the testkit funded, the same population [`TestToken::total_tracked`]
+    /// sums over.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// let alice = env.address();
+    /// let bob = env.address();
+    ///
+    /// token.mint_raw(&alice, 10);
+    /// token.mint_raw(&bob, 5);
+    /// token.mint_raw(&alice, 1); // already tracked, listed once
+    /// assert_eq!(token.tracked_holders(), vec![alice, bob]);
+    /// ```
+    pub fn tracked_holders(&self) -> Vec<Address> {
+        self.holders.borrow().clone()
+    }
+
+    /// How many distinct addresses [`TestToken::tracked_holders`] lists.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// assert_eq!(token.tracked_holder_count(), 0);
+    ///
+    /// token.mint_raw(&env.address(), 10);
+    /// assert_eq!(token.tracked_holder_count(), 1);
+    /// ```
+    pub fn tracked_holder_count(&self) -> usize {
+        self.holders.borrow().len()
+    }
+
+    /// Whether `who` has been minted to through this `TestToken`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// let alice = env.address();
+    /// let bob = env.address();
+    ///
+    /// token.mint_raw(&alice, 10);
+    /// assert!(token.is_tracked_holder(&alice));
+    /// assert!(!token.is_tracked_holder(&bob));
+    /// ```
+    pub fn is_tracked_holder(&self, who: &Address) -> bool {
+        self.holders.borrow().contains(who)
+    }
+
+    /// The current balance, in **base units**, of every tracked holder, in the
+    /// same order as [`TestToken::tracked_holders`].
+    ///
+    /// Balances are read from the contract now, so they reflect transfers and
+    /// burns made since the mint.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// let alice = env.address();
+    /// let bob = env.address();
+    ///
+    /// token.mint_raw(&alice, 10);
+    /// token.mint_raw(&bob, 5);
+    /// assert_eq!(token.tracked_balances(), vec![(alice, 10), (bob, 5)]);
+    /// ```
+    pub fn tracked_balances(&self) -> Vec<(Address, i128)> {
+        self.tracked_holders()
+            .into_iter()
+            .map(|holder| {
+                let balance = self.balance(&holder);
+                (holder, balance)
+            })
+            .collect()
+    }
+
+    /// A [`TokenSnapshot`] of every tracked holder's balance plus the tracked
+    /// supply, for diffing a whole fixture before and after an operation.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// let alice = env.address();
+    /// let bob = env.address();
+    /// token.mint_raw(&alice, 10);
+    /// token.mint_raw(&bob, 5);
+    ///
+    /// let before = token.snapshot_tracked();
+    /// token.mint_raw(&bob, 7);
+    /// let diff = before.diff(&token.snapshot_tracked());
+    ///
+    /// assert_eq!(diff.balance_delta_of(&alice), Some(0));
+    /// assert_eq!(diff.balance_delta_of(&bob), Some(7));
+    /// assert_eq!(diff.supply_delta(), 7);
+    /// ```
+    pub fn snapshot_tracked(&self) -> TokenSnapshot {
+        let holders = self.tracked_holders();
+        self.snapshot_accounts(holders.iter())
+    }
+
+    /// This token's display metadata: the name and symbol the testkit
+    /// attaches to it. See [`TokenMetadata`] for what that does and does not
+    /// affect.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token_with_metadata("US Dollar Coin", "USDC");
+    /// assert_eq!(token.metadata().symbol(), "USDC");
+    /// ```
+    pub fn metadata(&self) -> TokenMetadata {
+        self.metadata.borrow().clone()
+    }
+
+    /// This token's display name. `"Test Token"` until configured.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// assert_eq!(env.token().name(), "Test Token");
+    /// ```
+    pub fn name(&self) -> String {
+        self.metadata.borrow().name().to_string()
+    }
+
+    /// This token's display symbol. `"TEST"` until configured.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// assert_eq!(env.token().symbol(), "TEST");
+    /// ```
+    pub fn symbol(&self) -> String {
+        self.metadata.borrow().symbol().to_string()
+    }
+
+    /// Set this token's display name and symbol.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::Misuse`] if `name` is blank or `symbol`
+    /// is not 1 to 12 ASCII letters or digits. The previous metadata is kept.
+    /// Use [`TestToken::try_set_metadata`] to handle the error instead.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// token.set_metadata("Euro Coin", "EURC");
+    /// assert_eq!(token.name(), "Euro Coin");
+    /// assert_eq!(token.symbol(), "EURC");
+    /// ```
+    pub fn set_metadata(&self, name: &str, symbol: &str) {
+        if let Err(err) = self.try_set_metadata(name, symbol) {
+            panic!("{err}");
+        }
+    }
+
+    /// Set this token's display name and symbol, returning an error for an
+    /// invalid name or symbol and leaving the previous metadata untouched.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// assert!(token.try_set_metadata("Euro Coin", "EURC").is_ok());
+    /// assert!(token.try_set_metadata("Euro Coin", "not valid").is_err());
+    /// assert_eq!(token.symbol(), "EURC");
+    /// ```
+    pub fn try_set_metadata(&self, name: &str, symbol: &str) -> Result<(), TestkitError> {
+        let metadata = TokenMetadata::new(name, symbol)?;
+        *self.metadata.borrow_mut() = metadata;
+        Ok(())
+    }
+
+    /// Format an amount in **base units** as a human-readable string with this
+    /// token's symbol, for failure messages and logs.
+    ///
+    /// The whole part and the fractional part are computed with integer
+    /// arithmetic, so no precision is lost, and trailing fractional zeros are
+    /// dropped. A negative amount keeps its sign.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token_with_metadata("US Dollar Coin", "USDC");
+    /// assert_eq!(token.format_amount(15_000_000), "1.5 USDC");
+    /// assert_eq!(token.format_amount(20_000_000), "2 USDC");
+    /// assert_eq!(token.format_amount(1), "0.0000001 USDC");
+    /// assert_eq!(token.format_amount(-5_000_000), "-0.5 USDC");
+    /// ```
+    pub fn format_amount(&self, base: i128) -> String {
+        let decimals = self.decimals();
+        let scale = 10u128.pow(decimals);
+        let magnitude = base.unsigned_abs();
+        let whole = magnitude / scale;
+        let fraction = magnitude % scale;
+
+        let mut out = String::new();
+        if base < 0 {
+            out.push('-');
+        }
+        out.push_str(&whole.to_string());
+        if fraction != 0 {
+            let digits = format!("{fraction:0width$}", width = decimals as usize);
+            out.push('.');
+            out.push_str(digits.trim_end_matches('0'));
+        }
+        format!("{out} {}", self.symbol())
     }
 
     /// Mint multiple (recipient, amount) allocations in **whole units** for table-driven fixtures.
@@ -1420,6 +1773,410 @@ pub fn base_to_whole_units(base: i128, decimals: u32) -> Result<i128, TestkitErr
     Ok(base / scale)
 }
 
+/// Convert a base-unit amount into whole units at the given decimal
+/// precision, refusing to drop a fractional part.
+///
+/// [`base_to_whole_units`] truncates; this returns
+/// `Err(TestkitError::Misuse)` when `base` is not an exact multiple of
+/// `10^decimals`, naming the whole units and the base units left over. It also
+/// returns an error if `10^decimals` overflows `i128`.
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::tokens::base_to_whole_units_exact;
+///
+/// assert_eq!(base_to_whole_units_exact(100_000_000, 7).unwrap(), 10);
+/// assert!(base_to_whole_units_exact(100_000_001, 7).is_err());
+/// ```
+pub fn base_to_whole_units_exact(base: i128, decimals: u32) -> Result<i128, TestkitError> {
+    let scale = 10i128.checked_pow(decimals).ok_or_else(|| {
+        TestkitError::Misuse(format!(
+            "decimal precision {decimals} is too large: 10^{decimals} overflows i128"
+        ))
+    })?;
+    let remainder = base % scale;
+    if remainder != 0 {
+        return Err(TestkitError::Misuse(format!(
+            "{base} base units is not a whole number of units at {decimals} decimals \
+             ({} whole units and {remainder} base units left over); use \
+             base_to_whole_units to truncate, or keep the amount in base units",
+            base / scale
+        )));
+    }
+    Ok(base / scale)
+}
+
+/// The longest symbol a Stellar asset code allows.
+const MAX_SYMBOL_LEN: usize = 12;
+
+/// Display metadata for a [`TestToken`]: a human-readable name and a
+/// ticker-style symbol.
+///
+/// These are labels the test double carries so failure messages and fixtures
+/// can say `1.5 USDC` instead of `15000000`. They are **not** written to the
+/// token contract. A Stellar Asset Contract takes its on-chain `name()` and
+/// `symbol()` from its underlying asset, which this double does not
+/// configure, so a contract under test that reads them through a token client
+/// will not see these values.
+///
+/// The symbol follows the Stellar asset-code rule — 1 to 12 ASCII letters or
+/// digits — so any symbol accepted here is one a real asset could carry. The
+/// name only has to be non-blank; surrounding whitespace is trimmed.
+///
+/// Until configured, a token's metadata is the name `"Test Token"` and the
+/// symbol `"TEST"`.
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::tokens::TokenMetadata;
+///
+/// let metadata = TokenMetadata::new("US Dollar Coin", "USDC").unwrap();
+/// assert_eq!(metadata.name(), "US Dollar Coin");
+/// assert_eq!(metadata.symbol(), "USDC");
+///
+/// // A symbol must be a valid asset code.
+/// assert!(TokenMetadata::new("US Dollar Coin", "US-DOLLAR").is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenMetadata {
+    name: String,
+    symbol: String,
+}
+
+impl TokenMetadata {
+    /// Validate and build metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(TestkitError::Misuse)` if `name` is empty or only
+    /// whitespace, or if `symbol` is empty, longer than 12 characters, or
+    /// contains anything other than ASCII letters and digits.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::tokens::TokenMetadata;
+    ///
+    /// assert!(TokenMetadata::new("  Euro Coin  ", "EURC").is_ok());
+    /// assert!(TokenMetadata::new("   ", "EURC").is_err());
+    /// assert!(TokenMetadata::new("Euro Coin", "").is_err());
+    /// assert!(TokenMetadata::new("Euro Coin", "ABCDEFGHIJKLM").is_err()); // 13 characters
+    /// ```
+    pub fn new(name: impl Into<String>, symbol: impl Into<String>) -> Result<Self, TestkitError> {
+        let name: String = name.into();
+        let name = name.trim().to_string();
+        let symbol: String = symbol.into();
+        if name.is_empty() {
+            return Err(TestkitError::Misuse(
+                "token name must not be empty or only whitespace".to_string(),
+            ));
+        }
+        if symbol.is_empty()
+            || symbol.len() > MAX_SYMBOL_LEN
+            || !symbol.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return Err(TestkitError::Misuse(format!(
+                "token symbol {symbol:?} is not a valid Stellar asset code: use 1 to \
+                 {MAX_SYMBOL_LEN} ASCII letters or digits"
+            )));
+        }
+        Ok(Self { name, symbol })
+    }
+
+    /// The display name.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::tokens::TokenMetadata;
+    ///
+    /// assert_eq!(TokenMetadata::new("Euro Coin", "EURC").unwrap().name(), "Euro Coin");
+    /// ```
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The display symbol.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::tokens::TokenMetadata;
+    ///
+    /// assert_eq!(TokenMetadata::new("Euro Coin", "EURC").unwrap().symbol(), "EURC");
+    /// ```
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+}
+
+impl Default for TokenMetadata {
+    fn default() -> Self {
+        Self {
+            name: "Test Token".to_string(),
+            symbol: "TEST".to_string(),
+        }
+    }
+}
+
+/// Several [`TestToken`]s deployed into one test environment and addressed by
+/// label, for contracts that handle more than one asset (a DEX pair, a
+/// multi-collateral vault, a payment router).
+///
+/// Build one with [`TestEnv::token_set`]. Each token is independent — its own
+/// contract, its own tracked supply and holders — and its name and symbol are
+/// set from its label, so amounts in failure messages read `5 USDC` rather
+/// than `5 TEST`.
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::core::TestEnv;
+///
+/// let env = TestEnv::new();
+/// let tokens = env.token_set(["USDC", "EURC"]);
+/// let alice = env.address();
+///
+/// tokens.mint_each(&alice, 100);
+/// tokens.token("USDC").mint(&alice, 5);
+///
+/// assert_eq!(tokens.token("USDC").balance_whole(&alice), 105);
+/// assert_eq!(tokens.token("EURC").balance_whole(&alice), 100);
+/// ```
+pub struct TokenSet {
+    tokens: Vec<(String, TestToken)>,
+}
+
+impl TokenSet {
+    /// How many tokens the set holds.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// assert_eq!(env.token_set(["USDC", "EURC"]).len(), 2);
+    /// ```
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Whether the set holds no tokens. A set built by
+    /// [`TestEnv::token_set`] never does.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// assert!(!env.token_set(["USDC"]).is_empty());
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// The labels, in the order the set was built.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let tokens = env.token_set(["USDC", "EURC"]);
+    /// assert_eq!(tokens.labels(), vec!["USDC", "EURC"]);
+    /// ```
+    pub fn labels(&self) -> Vec<&str> {
+        self.tokens.iter().map(|(label, _)| label.as_str()).collect()
+    }
+
+    /// The token with `label`, if the set has one.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let tokens = env.token_set(["USDC"]);
+    /// assert!(tokens.get("USDC").is_some());
+    /// assert!(tokens.get("EURC").is_none());
+    /// ```
+    pub fn get(&self, label: &str) -> Option<&TestToken> {
+        self.tokens
+            .iter()
+            .find(|(candidate, _)| candidate == label)
+            .map(|(_, token)| token)
+    }
+
+    /// The token with `label`.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::Misuse`] listing the labels the set does
+    /// have if `label` is not one of them. Use [`TokenSet::get`] to probe.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let tokens = env.token_set(["USDC", "EURC"]);
+    /// assert_eq!(tokens.token("EURC").symbol(), "EURC");
+    /// ```
+    pub fn token(&self, label: &str) -> &TestToken {
+        self.get(label).unwrap_or_else(|| {
+            panic!(
+                "{}",
+                TestkitError::Misuse(format!(
+                    "no token labelled {label:?} in this set; known labels: {:?}",
+                    self.labels()
+                ))
+            )
+        })
+    }
+
+    /// Every `(label, token)` pair, in the order the set was built.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let tokens = env.token_set(["USDC", "EURC"]);
+    /// let symbols: Vec<String> = tokens.iter().map(|(_, token)| token.symbol()).collect();
+    /// assert_eq!(symbols, vec!["USDC", "EURC"]);
+    /// ```
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &TestToken)> {
+        self.tokens
+            .iter()
+            .map(|(label, token)| (label.as_str(), token))
+    }
+
+    /// Mint `amount` **whole units** of every token in the set to `to`.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`TestToken::mint`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let tokens = env.token_set(["USDC", "EURC"]);
+    /// let alice = env.address();
+    ///
+    /// tokens.mint_each(&alice, 10);
+    /// assert_eq!(tokens.token("USDC").balance(&alice), 100_000_000);
+    /// assert_eq!(tokens.token("EURC").balance(&alice), 100_000_000);
+    /// ```
+    pub fn mint_each(&self, to: &Address, amount: i128) {
+        for (_, token) in &self.tokens {
+            token.mint(to, amount);
+        }
+    }
+
+    /// Mint `amount` **base units** of every token in the set to `to`.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`TestToken::mint_raw`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let tokens = env.token_set(["USDC", "EURC"]);
+    /// let alice = env.address();
+    ///
+    /// tokens.mint_each_raw(&alice, 42);
+    /// assert_eq!(tokens.token("USDC").balance(&alice), 42);
+    /// ```
+    pub fn mint_each_raw(&self, to: &Address, amount: i128) {
+        for (_, token) in &self.tokens {
+            token.mint_raw(to, amount);
+        }
+    }
+
+    /// `of`'s balance of every token, in **base units**, as `(label, balance)`
+    /// pairs in the order the set was built.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let tokens = env.token_set(["USDC", "EURC"]);
+    /// let alice = env.address();
+    /// tokens.token("USDC").mint_raw(&alice, 7);
+    ///
+    /// assert_eq!(
+    ///     tokens.balances_of(&alice),
+    ///     vec![("USDC".to_string(), 7), ("EURC".to_string(), 0)]
+    /// );
+    /// ```
+    pub fn balances_of(&self, of: &Address) -> Vec<(String, i128)> {
+        self.tokens
+            .iter()
+            .map(|(label, token)| (label.clone(), token.balance(of)))
+            .collect()
+    }
+
+    /// Assert `of`'s balance of each listed token, with each `expected` amount
+    /// in **base units**. Tokens not listed are not checked.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::AssertionFailed`] naming the token and
+    /// showing the expected and actual balance, formatted and in base units,
+    /// for the first mismatch. Panics with a [`TestkitError::Misuse`] if a
+    /// label is not in the set.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let tokens = env.token_set(["USDC", "EURC"]);
+    /// let alice = env.address();
+    /// tokens.token("USDC").mint_raw(&alice, 7);
+    ///
+    /// tokens.assert_balances(&alice, [("USDC", 7), ("EURC", 0)]);
+    /// ```
+    pub fn assert_balances<'a, I>(&self, of: &Address, expected: I)
+    where
+        I: IntoIterator<Item = (&'a str, i128)>,
+    {
+        for (label, expected_base) in expected {
+            let token = self.token(label);
+            let actual = token.balance(of);
+            if actual != expected_base {
+                panic!(
+                    "{}",
+                    TestkitError::AssertionFailed(format!(
+                        "expected {label} balance of {of:?} to be {} ({expected_base} base \
+                         units), found {} ({actual} base units)",
+                        token.format_amount(expected_base),
+                        token.format_amount(actual)
+                    ))
+                );
+            }
+        }
+    }
+}
+
 impl TestEnv {
     /// Deploy a Stellar Asset Contract with the standard 7 decimals, using a
     /// fresh test address as its admin.
@@ -1488,6 +2245,164 @@ impl TestEnv {
             );
         }
         self.token()
+    }
+
+    /// Deploy a token carrying display metadata (see [`TokenMetadata`]).
+    ///
+    /// The metadata is validated before anything is deployed.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::Misuse`] if `name` is blank or `symbol`
+    /// is not 1 to 12 ASCII letters or digits. Use
+    /// [`TestEnv::try_token_with_metadata`] to handle the error.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token_with_metadata("US Dollar Coin", "USDC");
+    /// assert_eq!(token.name(), "US Dollar Coin");
+    /// assert_eq!(token.symbol(), "USDC");
+    /// ```
+    pub fn token_with_metadata(&self, name: &str, symbol: &str) -> TestToken {
+        match self.try_token_with_metadata(name, symbol) {
+            Ok(token) => token,
+            Err(err) => panic!("{err}"),
+        }
+    }
+
+    /// Deploy a token carrying display metadata, returning an error for an
+    /// invalid name or symbol instead of deploying anything.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// assert!(env.try_token_with_metadata("Euro Coin", "EURC").is_ok());
+    /// assert!(env.try_token_with_metadata("Euro Coin", "no spaces").is_err());
+    /// ```
+    pub fn try_token_with_metadata(
+        &self,
+        name: &str,
+        symbol: &str,
+    ) -> Result<TestToken, TestkitError> {
+        let metadata = TokenMetadata::new(name, symbol)?;
+        let token = self.token();
+        *token.metadata.borrow_mut() = metadata;
+        Ok(token)
+    }
+
+    /// Deploy `count` independent tokens with default metadata.
+    ///
+    /// Use [`TestEnv::token_set`] when the tokens should be addressed by
+    /// label. Like [`TestEnv::token`], this does not advance the address
+    /// stream.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let tokens = env.tokens(3);
+    /// assert_eq!(tokens.len(), 3);
+    /// assert_ne!(tokens[0].address(), tokens[1].address());
+    /// ```
+    pub fn tokens(&self, count: usize) -> Vec<TestToken> {
+        (0..count).map(|_| self.token()).collect()
+    }
+
+    /// Deploy one token per label and return them as a [`TokenSet`].
+    ///
+    /// Each label becomes that token's name and symbol, so it must be a valid
+    /// asset code: 1 to 12 ASCII letters or digits.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError`] if `labels` is empty, repeats a label,
+    /// or contains a label that is not a valid asset code. Nothing is
+    /// deployed in that case. Use [`TestEnv::try_token_set`] to handle the
+    /// error.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let tokens = env.token_set(["USDC", "EURC"]);
+    /// assert_eq!(tokens.token("USDC").symbol(), "USDC");
+    /// ```
+    pub fn token_set<I, S>(&self, labels: I) -> TokenSet
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        match self.try_token_set(labels) {
+            Ok(set) => set,
+            Err(err) => panic!("{err}"),
+        }
+    }
+
+    /// Deploy one token per label, returning an error for an empty,
+    /// duplicated or invalid label before anything is deployed.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// assert!(env.try_token_set(["USDC", "EURC"]).is_ok());
+    /// assert!(env.try_token_set(["USDC", "USDC"]).is_err());
+    /// assert!(env.try_token_set(Vec::<&str>::new()).is_err());
+    /// ```
+    pub fn try_token_set<I, S>(&self, labels: I) -> Result<TokenSet, TestkitError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let labels: Vec<String> = labels
+            .into_iter()
+            .map(|label| label.as_ref().to_string())
+            .collect();
+        if labels.is_empty() {
+            return Err(TestkitError::Misuse(
+                "a token set needs at least one label".to_string(),
+            ));
+        }
+
+        let mut metadata = Vec::with_capacity(labels.len());
+        for (index, label) in labels.iter().enumerate() {
+            if labels[..index].contains(label) {
+                return Err(TestkitError::Misuse(format!(
+                    "duplicate token label {label:?}: every token in a set needs its own label"
+                )));
+            }
+            let entry = TokenMetadata::new(label.as_str(), label.as_str()).map_err(|err| {
+                TestkitError::Context {
+                    context: format!("token label {label:?} cannot be used as a name and symbol"),
+                    source: Box::new(err),
+                }
+            })?;
+            metadata.push(entry);
+        }
+
+        let tokens = labels
+            .into_iter()
+            .zip(metadata)
+            .map(|(label, entry)| {
+                let token = self.token();
+                *token.metadata.borrow_mut() = entry;
+                (label, token)
+            })
+            .collect();
+        Ok(TokenSet { tokens })
     }
 }
 
@@ -2093,5 +3008,582 @@ mod tests {
         let s2 = token.snapshot(&alice);
 
         s1.diff(&s2).assert_supply_delta(50);
+    }
+
+    // ── Exact whole-unit balances (#138) ──
+
+    #[test]
+    fn exact_conversion_accepts_whole_multiples() {
+        assert_eq!(base_to_whole_units_exact(0, 7).unwrap(), 0);
+        assert_eq!(base_to_whole_units_exact(100_000_000, 7).unwrap(), 10);
+        assert_eq!(base_to_whole_units_exact(-20_000_000, 7).unwrap(), -2);
+        assert_eq!(base_to_whole_units_exact(5, 0).unwrap(), 5);
+    }
+
+    #[test]
+    fn exact_conversion_rejects_a_fractional_part_and_says_what_is_left_over() {
+        let message = base_to_whole_units_exact(15_000_000, 7)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("not a whole number of units"),
+            "{message}"
+        );
+        assert!(
+            message.contains("1 whole units and 5000000 base units left over"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn exact_conversion_rejects_a_negative_fractional_amount() {
+        assert!(base_to_whole_units_exact(-15_000_000, 7).is_err());
+        assert!(base_to_whole_units_exact(1, 7).is_err());
+    }
+
+    #[test]
+    fn exact_conversion_reports_an_overflowing_precision() {
+        let message = base_to_whole_units_exact(1, 39).unwrap_err().to_string();
+        assert!(message.contains("too large"), "{message}");
+    }
+
+    #[test]
+    fn token_to_whole_units_exact_matches_the_free_function() {
+        let env = TestEnv::new();
+        let token = env.token();
+        assert_eq!(token.to_whole_units_exact(50_000_000).unwrap(), 5);
+        assert!(token.to_whole_units_exact(50_000_001).is_err());
+    }
+
+    #[test]
+    fn balance_whole_exact_reads_round_balances() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+
+        token.mint(&alice, 25);
+
+        assert_eq!(token.balance_whole_exact(&alice), 25);
+        assert_eq!(token.try_balance_whole_exact(&alice).unwrap(), 25);
+        // An account that never held the token has a round balance of zero.
+        assert_eq!(token.balance_whole_exact(&bob), 0);
+    }
+
+    #[test]
+    fn balance_whole_still_truncates_where_the_exact_query_refuses() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+
+        token.mint(&alice, 1);
+        token.mint_raw(&alice, 5_000_000); // 1.5 units
+
+        assert_eq!(token.balance_whole(&alice), 1);
+        assert!(token.try_balance_whole_exact(&alice).is_err());
+    }
+
+    #[test]
+    fn exact_balance_error_names_the_balance_and_the_remainder() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        token.mint_raw(&alice, 15_000_000);
+
+        let message = token.try_balance_whole_exact(&alice).unwrap_err().to_string();
+
+        assert!(message.contains("1.5 TEST"), "{message}");
+        assert!(message.contains("15000000 base units"), "{message}");
+        assert!(message.contains("left over"), "{message}");
+    }
+
+    #[test]
+    #[should_panic(expected = "not a whole number of units")]
+    fn balance_whole_exact_panics_on_a_fractional_balance() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        token.mint_raw(&alice, 1);
+
+        let _ = token.balance_whole_exact(&alice);
+    }
+
+    // ── Token metadata (#139) ──
+
+    #[test]
+    fn metadata_defaults_to_test_token() {
+        let env = TestEnv::new();
+        let token = env.token();
+        assert_eq!(token.name(), "Test Token");
+        assert_eq!(token.symbol(), "TEST");
+        assert_eq!(token.metadata(), TokenMetadata::default());
+    }
+
+    #[test]
+    fn token_with_metadata_sets_name_and_symbol() {
+        let env = TestEnv::new();
+        let token = env.token_with_metadata("US Dollar Coin", "USDC");
+        assert_eq!(token.name(), "US Dollar Coin");
+        assert_eq!(token.symbol(), "USDC");
+        assert_eq!(token.metadata().name(), "US Dollar Coin");
+        assert_eq!(token.metadata().symbol(), "USDC");
+    }
+
+    #[test]
+    fn set_metadata_replaces_the_previous_values() {
+        let env = TestEnv::new();
+        let token = env.token_with_metadata("US Dollar Coin", "USDC");
+        token.set_metadata("Euro Coin", "EURC");
+        assert_eq!(token.name(), "Euro Coin");
+        assert_eq!(token.symbol(), "EURC");
+    }
+
+    #[test]
+    fn invalid_metadata_is_rejected_and_keeps_the_previous_values() {
+        let env = TestEnv::new();
+        let token = env.token_with_metadata("US Dollar Coin", "USDC");
+
+        for (name, symbol) in [
+            ("   ", "USDC"),
+            ("", "USDC"),
+            ("US Dollar Coin", ""),
+            ("US Dollar Coin", "ABCDEFGHIJKLM"),
+            ("US Dollar Coin", "US-DC"),
+            ("US Dollar Coin", "US DC"),
+            ("US Dollar Coin", "USDÉ"),
+        ] {
+            assert!(
+                token.try_set_metadata(name, symbol).is_err(),
+                "({name:?}, {symbol:?}) should be rejected"
+            );
+        }
+
+        assert_eq!(token.name(), "US Dollar Coin");
+        assert_eq!(token.symbol(), "USDC");
+    }
+
+    #[test]
+    fn symbol_accepts_the_stellar_asset_code_limits() {
+        assert!(TokenMetadata::new("One", "A").is_ok());
+        assert!(TokenMetadata::new("Twelve", "ABCDEFGHIJKL").is_ok());
+        assert!(TokenMetadata::new("Mixed", "Usd2024").is_ok());
+    }
+
+    #[test]
+    fn metadata_name_is_trimmed() {
+        let metadata = TokenMetadata::new("  Euro Coin  ", "EURC").unwrap();
+        assert_eq!(metadata.name(), "Euro Coin");
+    }
+
+    #[test]
+    fn try_token_with_metadata_rejects_bad_input() {
+        let env = TestEnv::new();
+        assert!(env.try_token_with_metadata("Euro Coin", "EURC").is_ok());
+        assert!(env.try_token_with_metadata("Euro Coin", "no spaces").is_err());
+        assert!(env.try_token_with_metadata("", "EURC").is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "not a valid Stellar asset code")]
+    fn token_with_metadata_panics_on_a_bad_symbol() {
+        let env = TestEnv::new();
+        let _ = env.token_with_metadata("Euro Coin", "EU-RC");
+    }
+
+    #[test]
+    #[should_panic(expected = "token name must not be empty")]
+    fn set_metadata_panics_on_a_blank_name() {
+        let env = TestEnv::new();
+        env.token().set_metadata("  ", "EURC");
+    }
+
+    #[test]
+    fn format_amount_prints_whole_and_fractional_parts() {
+        let env = TestEnv::new();
+        let token = env.token_with_metadata("US Dollar Coin", "USDC");
+
+        assert_eq!(token.format_amount(0), "0 USDC");
+        assert_eq!(token.format_amount(10_000_000), "1 USDC");
+        assert_eq!(token.format_amount(15_000_000), "1.5 USDC");
+        assert_eq!(token.format_amount(12_345_678), "1.2345678 USDC");
+        assert_eq!(token.format_amount(1), "0.0000001 USDC");
+        assert_eq!(token.format_amount(1_000_000), "0.1 USDC");
+        assert_eq!(token.format_amount(-5_000_000), "-0.5 USDC");
+        assert_eq!(token.format_amount(-30_000_000), "-3 USDC");
+    }
+
+    #[test]
+    fn format_amount_uses_the_default_symbol_until_configured() {
+        let env = TestEnv::new();
+        let token = env.token();
+        assert_eq!(token.format_amount(15_000_000), "1.5 TEST");
+    }
+
+    #[test]
+    fn format_amount_handles_the_extremes_without_overflow() {
+        let env = TestEnv::new();
+        let token = env.token();
+        assert_eq!(
+            token.format_amount(i128::MAX),
+            "17014118346046923173168730371588.4105727 TEST"
+        );
+        assert_eq!(
+            token.format_amount(i128::MIN),
+            "-17014118346046923173168730371588.4105728 TEST"
+        );
+    }
+
+    #[test]
+    fn metadata_does_not_change_balances_or_holder_tracking() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        token.mint_raw(&alice, 10);
+
+        token.set_metadata("Euro Coin", "EURC");
+
+        token.assert_balance(&alice, 10);
+        assert_eq!(token.total_tracked(), 10);
+        assert_eq!(token.tracked_holders(), vec![alice]);
+    }
+
+    // ── Tracked-holder enumeration (#141) ──
+
+    #[test]
+    fn tracked_holders_starts_empty() {
+        let env = TestEnv::new();
+        let token = env.token();
+        assert!(token.tracked_holders().is_empty());
+        assert_eq!(token.tracked_holder_count(), 0);
+        assert!(token.tracked_balances().is_empty());
+    }
+
+    #[test]
+    fn tracked_holders_lists_minted_addresses_once_in_first_mint_order() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+        let carol = env.address();
+
+        token.mint_raw(&carol, 1);
+        token.mint_raw(&alice, 2);
+        token.mint_raw(&carol, 3); // already tracked
+        token.mint(&bob, 4);
+
+        assert_eq!(token.tracked_holders(), vec![carol, alice, bob]);
+        assert_eq!(token.tracked_holder_count(), 3);
+    }
+
+    #[test]
+    fn mint_many_tracks_every_recipient() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+
+        token.mint_many([(&alice, 1), (&bob, 2)]);
+
+        assert_eq!(token.tracked_holders(), vec![alice, bob]);
+    }
+
+    #[test]
+    fn a_rejected_mint_does_not_track_its_recipient() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+
+        assert!(token.try_mint_raw(&alice, -1).is_err());
+
+        assert!(!token.is_tracked_holder(&alice));
+        assert_eq!(token.tracked_holder_count(), 0);
+    }
+
+    #[test]
+    fn is_tracked_holder_agrees_with_the_list() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+
+        token.mint_raw(&alice, 10);
+
+        assert!(token.is_tracked_holder(&alice));
+        assert!(!token.is_tracked_holder(&bob));
+    }
+
+    #[test]
+    fn transfer_recipients_are_not_tracked_holders() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+        token.mint_raw(&alice, 100);
+
+        TokenClient::new(env.env(), &token.address())
+            .mock_auths(&[MockAuth {
+                address: &alice,
+                invoke: &MockAuthInvoke {
+                    contract: &token.address(),
+                    fn_name: "transfer",
+                    args: (alice.clone(), bob.clone(), 30_i128).into_val(env.env()),
+                    sub_invokes: &[],
+                },
+            }])
+            .transfer(&alice, soroban_sdk::MuxedAddress::from(bob.clone()), &30);
+
+        assert!(!token.is_tracked_holder(&bob));
+        // Tracked balances are read live, so they reflect the transfer.
+        assert_eq!(token.tracked_balances(), vec![(alice, 70)]);
+    }
+
+    #[test]
+    fn tracked_balances_follow_the_holder_order() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+
+        token.mint_raw(&bob, 5);
+        token.mint_raw(&alice, 10);
+
+        assert_eq!(token.tracked_balances(), vec![(bob, 5), (alice, 10)]);
+    }
+
+    #[test]
+    fn snapshot_tracked_covers_every_holder_and_diffs() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+        token.mint_raw(&alice, 10);
+        token.mint_raw(&bob, 5);
+
+        let before = token.snapshot_tracked();
+        assert_eq!(before.balance_of(&alice), Some(10));
+        assert_eq!(before.balance_of(&bob), Some(5));
+        assert_eq!(before.tracked_supply(), 15);
+
+        token.mint_raw(&bob, 7);
+        let diff = before.diff(&token.snapshot_tracked());
+
+        assert_eq!(diff.balance_delta_of(&alice), Some(0));
+        assert_eq!(diff.balance_delta_of(&bob), Some(7));
+        assert_eq!(diff.supply_delta(), 7);
+    }
+
+    #[test]
+    fn holders_are_tracked_per_token() {
+        let env = TestEnv::new();
+        let first = env.token();
+        let second = env.token();
+        let alice = env.address();
+
+        first.mint_raw(&alice, 1);
+
+        assert!(first.is_tracked_holder(&alice));
+        assert!(!second.is_tracked_holder(&alice));
+    }
+
+    // ── Multiple token assets (#140) ──
+
+    #[test]
+    fn tokens_deploys_independent_tokens() {
+        let env = TestEnv::new();
+        let tokens = env.tokens(3);
+        let alice = env.address();
+
+        assert_eq!(tokens.len(), 3);
+        assert_ne!(tokens[0].address(), tokens[1].address());
+        assert_ne!(tokens[1].address(), tokens[2].address());
+
+        tokens[0].mint_raw(&alice, 9);
+        assert_eq!(tokens[0].total_tracked(), 9);
+        assert_eq!(tokens[1].total_tracked(), 0);
+        tokens[1].assert_balance(&alice, 0);
+    }
+
+    #[test]
+    fn tokens_zero_is_empty() {
+        let env = TestEnv::new();
+        assert!(env.tokens(0).is_empty());
+    }
+
+    #[test]
+    fn tokens_and_token_sets_do_not_shift_the_address_stream() {
+        let env = TestEnv::with_seed(5);
+        let reference = TestEnv::with_seed(5);
+
+        let _tokens = env.tokens(2);
+        let _set = env.token_set(["USDC", "EURC"]);
+        let batch = env.addresses(3);
+
+        assert_eq!(batch, reference.addresses(3));
+    }
+
+    #[test]
+    fn token_set_labels_each_token_and_names_it_after_the_label() {
+        let env = TestEnv::new();
+        let tokens = env.token_set(["USDC", "EURC"]);
+
+        assert_eq!(tokens.len(), 2);
+        assert!(!tokens.is_empty());
+        assert_eq!(tokens.labels(), vec!["USDC", "EURC"]);
+        assert_eq!(tokens.token("USDC").symbol(), "USDC");
+        assert_eq!(tokens.token("USDC").name(), "USDC");
+        assert_eq!(tokens.token("EURC").symbol(), "EURC");
+        assert_ne!(tokens.token("USDC").address(), tokens.token("EURC").address());
+    }
+
+    #[test]
+    fn token_set_get_returns_none_for_an_unknown_label() {
+        let env = TestEnv::new();
+        let tokens = env.token_set(["USDC"]);
+
+        assert!(tokens.get("USDC").is_some());
+        assert!(tokens.get("EURC").is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "no token labelled \"DAI\" in this set")]
+    fn token_set_token_panics_for_an_unknown_label() {
+        let env = TestEnv::new();
+        let tokens = env.token_set(["USDC"]);
+
+        let _ = tokens.token("DAI");
+    }
+
+    #[test]
+    fn token_set_unknown_label_message_lists_the_known_labels() {
+        let env = TestEnv::new();
+        let tokens = env.token_set(["USDC", "EURC"]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = tokens.token("DAI");
+        }));
+
+        let payload = result.expect_err("an unknown label must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|m| m.to_string()))
+            .unwrap_or_default();
+        assert!(message.contains("known labels"), "{message}");
+        assert!(message.contains("USDC") && message.contains("EURC"), "{message}");
+    }
+
+    #[test]
+    fn token_set_rejects_empty_duplicate_and_invalid_labels() {
+        let env = TestEnv::new();
+
+        let empty = env
+            .try_token_set(Vec::<&str>::new())
+            .err()
+            .expect("an empty label list is rejected");
+        assert!(empty.to_string().contains("at least one label"));
+
+        let duplicate = env
+            .try_token_set(["USDC", "EURC", "USDC"])
+            .err()
+            .expect("a repeated label is rejected");
+        assert!(duplicate.to_string().contains("duplicate token label"));
+
+        let invalid = env
+            .try_token_set(["USDC", "not a code"])
+            .err()
+            .expect("a label that is not an asset code is rejected");
+        assert!(invalid
+            .to_string()
+            .contains("cannot be used as a name and symbol"));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate token label")]
+    fn token_set_panics_on_a_duplicate_label() {
+        let env = TestEnv::new();
+        let _ = env.token_set(["USDC", "USDC"]);
+    }
+
+    #[test]
+    fn token_set_mint_each_funds_every_token() {
+        let env = TestEnv::new();
+        let tokens = env.token_set(["USDC", "EURC"]);
+        let alice = env.address();
+
+        tokens.mint_each(&alice, 10);
+        tokens.mint_each_raw(&alice, 3);
+
+        for (_, token) in tokens.iter() {
+            token.assert_balance(&alice, 100_000_003);
+            assert!(token.is_tracked_holder(&alice));
+        }
+    }
+
+    #[test]
+    fn token_set_tokens_are_independent() {
+        let env = TestEnv::new();
+        let tokens = env.token_set(["USDC", "EURC"]);
+        let alice = env.address();
+
+        tokens.token("USDC").mint_raw(&alice, 50);
+
+        assert_eq!(tokens.token("USDC").total_tracked(), 50);
+        assert_eq!(tokens.token("EURC").total_tracked(), 0);
+        assert!(tokens.token("EURC").tracked_holders().is_empty());
+    }
+
+    #[test]
+    fn token_set_balances_of_lists_every_token_in_build_order() {
+        let env = TestEnv::new();
+        let tokens = env.token_set(["USDC", "EURC"]);
+        let alice = env.address();
+        tokens.token("EURC").mint_raw(&alice, 8);
+
+        assert_eq!(
+            tokens.balances_of(&alice),
+            vec![("USDC".to_string(), 0), ("EURC".to_string(), 8)]
+        );
+    }
+
+    #[test]
+    fn token_set_iter_keeps_build_order() {
+        let env = TestEnv::new();
+        let tokens = env.token_set(["B", "A", "C"]);
+
+        let labels: Vec<&str> = tokens.iter().map(|(label, _)| label).collect();
+
+        assert_eq!(labels, vec!["B", "A", "C"]);
+    }
+
+    #[test]
+    fn assert_balances_passes_when_every_listed_balance_matches() {
+        let env = TestEnv::new();
+        let tokens = env.token_set(["USDC", "EURC", "GBPC"]);
+        let alice = env.address();
+        tokens.token("USDC").mint_raw(&alice, 7);
+
+        // GBPC is not listed, so it is not checked.
+        tokens.assert_balances(&alice, [("USDC", 7), ("EURC", 0)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected EURC balance of")]
+    fn assert_balances_fails_naming_the_mismatched_token() {
+        let env = TestEnv::new();
+        let tokens = env.token_set(["USDC", "EURC"]);
+        let alice = env.address();
+        tokens.token("USDC").mint_raw(&alice, 5);
+
+        tokens.assert_balances(&alice, [("USDC", 5), ("EURC", 9)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "no token labelled \"DAI\" in this set")]
+    fn assert_balances_fails_for_a_label_outside_the_set() {
+        let env = TestEnv::new();
+        let tokens = env.token_set(["USDC"]);
+        let alice = env.address();
+
+        tokens.assert_balances(&alice, [("DAI", 0)]);
     }
 }
