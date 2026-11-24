@@ -1822,6 +1822,8 @@ fn audit_explain_includes_code_examples() {
 
 // ---- #350: scope allow comments to a single finding ----
 
+// === missing-ttl-bump ===
+
 #[test]
 fn audit_allow_comment_scopes_to_single_finding() {
     let root = std::env::temp_dir().join(format!(
@@ -1867,6 +1869,8 @@ impl Contract {
 }
 
 // ---- #351: report duplicate suppressions as stale configuration ----
+
+// === missing-positive-amount-validation ===
 
 #[test]
 fn audit_reports_duplicate_suppressions_as_stale_configuration() {
@@ -1928,3 +1932,4 @@ impl Contract {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+"#;

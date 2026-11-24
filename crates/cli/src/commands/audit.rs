@@ -36,6 +36,14 @@ pub const FINDING_NATURE: &str =
 pub const PARSE_WARNING_NATURE: &str =
     "parse warnings are not findings: an input that could not be read or parsed was skipped without being scanned; warnings are reported on stderr and, in JSON, under summary.parser_limitations, never counted in finding_count, and never trigger --strict; they make the audit incomplete instead";
 
+/// How to suppress findings in source code. Suppressions use a special comment
+/// format that the scanner recognizes and respects.
+pub const SUPPRESSION_GUIDANCE: &str =
+    "to suppress a finding, add `// audit:allow(<rule_id>)` on the line before it,
+or add `// audit:allow_all` to suppress all findings on that line.
+Suppressions apply only to the line they precede and do not cascade.
+Use `// audit:allow(<rule_id>, \"reason for suppression\")` to document why.";
+
 /// Single mapping from a rule severity to a SARIF reporting level. Both the
 /// `rules` metadata and the `results` entries (and the `audit rules`
 /// machine-readable listing) route through this one function, so the
@@ -173,8 +181,8 @@ enum AuditCommand {
     },
     /// List all rules with their descriptions in machine-readable format.
     Rules,
-    /// List all audit rules without running an audit.
-    ListRules,
+    /// Output JSON schema for machine-readable audit reports.
+    Schema,
 }
 
 /// Machine- and human-readable audit output formats.
@@ -340,38 +348,11 @@ impl Finding {
 /// shared function (`sarif_level`), so text, JSON and SARIF can never
 /// disagree about the same finding.
 pub fn run(args: AuditArgs) -> Result<(), CliError> {
-    if args.summary_only && args.format != AuditOutputFormat::Text {
-        return Err(CliError(
-            "--summary-only is only supported for text output; omit --summary-only or use --format text".into(),
-        ));
-    }
-
-    if args.list_rules
-        || matches!(
-            &args.command,
-            Some(AuditCommand::Rules | AuditCommand::ListRules)
-        )
-    {
-        return list_rules(args.format);
-    }
-    if let Some(AuditCommand::Explain { rule }) = &args.command {
-        return explain_rule(rule);
-    }
-
-    for pat in &args.include {
-        validate_glob(pat)?;
-    }
-    let mut exclude_globs = Vec::new();
-    let mut exclude_dirs = Vec::new();
-    for pat in &args.exclude {
-        if pat.contains(['*', '?', '[', '{']) {
-            validate_glob(pat)?;
-            exclude_globs.push(pat.clone());
-        } else {
-            validate_glob(pat)?;
-            exclude_globs.push(pat.clone());
-            exclude_dirs.push(PathBuf::from(pat));
-        }
+    match &args.command {
+        Some(AuditCommand::Explain { rule }) => return explain_rule(rule),
+        Some(AuditCommand::Rules) => return list_rules(args.format),
+        Some(AuditCommand::Schema) => return output_schema(),
+        None => {}
     }
 
     let stdin = args.path == Path::new("-");
@@ -1128,219 +1109,87 @@ fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     }
 }
 
-/// Count visible character width of a string, ignoring ANSI escape sequences.
-/// Wide characters are counted as 1 character width.
-pub fn visible_width(s: &str) -> usize {
-    let mut count = 0;
-    let mut in_escape = false;
-    for c in s.chars() {
-        if c == '\x1b' {
-            in_escape = true;
-        } else if in_escape {
-            if c.is_ascii_alphabetic() {
-                in_escape = false;
-            }
-        } else {
-            count += 1;
-        }
-    }
-    count
-}
-
-/// Wraps the human-readable message part of a finding at word boundaries,
-/// leaving the location prefix intact on line 1, and indenting continuation
-/// lines with 4 spaces. Unbreakable tokens longer than the width are not split.
-pub fn wrap_finding_message(prefix: &str, message: &str, width: Option<usize>) -> String {
-    let Some(max_width) = width else {
-        return format!("{prefix}{message}\n");
-    };
-
-    let words: Vec<&str> = message.split_whitespace().collect();
-    if words.is_empty() {
-        return format!("{prefix}\n");
-    }
-
-    let prefix_vis = visible_width(prefix);
-    let indent = "    ";
-    let indent_vis = 4;
-
-    let mut result = String::new();
-    let mut current_line = String::new();
-    let mut current_vis = 0;
-
-    let first_word = words[0];
-    let first_word_vis = visible_width(first_word);
-
-    if prefix_vis + first_word_vis <= max_width {
-        current_line.push_str(prefix);
-        current_line.push_str(first_word);
-        current_vis = prefix_vis + first_word_vis;
-    } else {
-        result.push_str(prefix.trim_end());
-        result.push('\n');
-        current_line.push_str(indent);
-        current_line.push_str(first_word);
-        current_vis = indent_vis + first_word_vis;
-    }
-
-    for &word in &words[1..] {
-        let w_vis = visible_width(word);
-        if current_vis + 1 + w_vis > max_width {
-            result.push_str(&current_line);
-            result.push('\n');
-            current_line.clear();
-            current_line.push_str(indent);
-            current_line.push_str(word);
-            current_vis = indent_vis + w_vis;
-        } else {
-            current_line.push(' ');
-            current_line.push_str(word);
-            current_vis += 1 + w_vis;
-        }
-    }
-
-    if !current_line.is_empty() {
-        result.push_str(&current_line);
-        result.push('\n');
-    }
-
-    result
-}
-
-fn validate_width_str(val: &str) -> Result<usize, CliError> {
-    match val.parse::<isize>() {
-        Ok(n) if n >= 20 && n <= 1000 => Ok(n as usize),
-        _ => Err(CliError(format!(
-            "invalid width `{val}`: width must be an integer between 20 and 1000 characters; specify a value in that range"
-        ))),
-    }
-}
-
-fn resolve_width(
-    cli_width: &Option<String>,
-    config: &AuditConfig,
-) -> Result<Option<usize>, CliError> {
-    if let Some(w) = cli_width {
-        return validate_width_str(w).map(Some);
-    }
-    if let Some(val) = &config.width {
-        match val {
-            toml::Value::Integer(n) => {
-                if *n >= 20 && *n <= 1000 {
-                    return Ok(Some(*n as usize));
-                } else {
-                    return Err(CliError(format!(
-                        "invalid width `{n}`: width must be an integer between 20 and 1000 characters; specify a value in that range"
-                    )));
+/// Output JSON schema for machine-readable audit report format validation.
+fn output_schema() -> Result<(), CliError> {
+    let schema = serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "Soroban Testkit Audit Report",
+        "description": "Machine-readable audit report schema for soroban-testkit findings",
+        "type": "object",
+        "properties": {
+            "tool": {
+                "type": "string",
+                "const": "soroban-testkit",
+                "description": "Identifies the tool that produced the report"
+            },
+            "version": {
+                "type": "integer",
+                "const": 1,
+                "description": "Schema version for future compatibility"
+            },
+            "findings": {
+                "type": "array",
+                "description": "List of all audit findings",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file": {
+                            "type": "string",
+                            "description": "Workspace-relative path to the file containing the finding"
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "Line number where the finding was detected (1-indexed)"
+                        },
+                        "rule": {
+                            "type": "string",
+                            "description": "Rule identifier (e.g., 'missing-require-auth')"
+                        },
+                        "severity": {
+                            "type": "string",
+                            "description": "Finding severity (e.g., 'warning', 'error')"
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Human-readable message describing the finding"
+                        },
+                        "source_snippet": {
+                            "type": ["string", "null"],
+                            "description": "The source line that triggered the finding (sanitized)"
+                        }
+                    },
+                    "required": ["file", "line", "rule", "severity", "message"]
                 }
+            },
+            "summary": {
+                "type": "object",
+                "properties": {
+                    "finding_count": {
+                        "type": "integer",
+                        "description": "Total number of findings reported"
+                    },
+                    "skipped_file_count": {
+                        "type": "integer",
+                        "description": "Number of files that could not be read or parsed"
+                    },
+                    "parser_limitations": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "List of parse warnings for files that were skipped"
+                    },
+                    "limitations": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Known limitations of the audit tool"
+                    }
+                },
+                "required": ["finding_count"]
             }
-            toml::Value::String(s) => {
-                return validate_width_str(s).map(Some);
-            }
-            other => {
-                return Err(CliError(format!(
-                    "invalid width `{other}`: width must be an integer between 20 and 1000 characters; specify a value in that range"
-                )));
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Determines whether ANSI color codes should be emitted for text output.
-///
-/// Precedence:
-/// 1. The `--no-color` command line flag (if `true`, color is off).
-/// 2. The `NO_COLOR` environment variable (if set and non-empty, color is off).
-/// 3. Automatic detection: `CLICOLOR_FORCE` environment variable (if set and != "0",
-///    color is forced on), otherwise terminal detection (`std::io::stdout().is_terminal()`).
-pub fn should_color(no_color_flag: bool) -> bool {
-    if no_color_flag {
-        return false;
-    }
-    if let Ok(val) = std::env::var("NO_COLOR") {
-        if !val.is_empty() {
-            return false;
-        }
-    }
-    if let Ok(force) = std::env::var("CLICOLOR_FORCE") {
-        if force != "0" {
-            return true;
-        }
-    }
-    use std::io::IsTerminal;
-    std::io::stdout().is_terminal()
-}
-/// Counts of findings for a single rule within a severity level.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuleFindingCount {
-    pub rule: String,
-    pub count: usize,
-}
-
-/// Summary of findings grouped under a specific severity level.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SeveritySummary {
-    pub severity: String,
-    pub total: usize,
-    pub rules: Vec<RuleFindingCount>,
-}
-
-/// Aggregated summary across all findings and scanned files.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuditSummary {
-    pub total_findings: usize,
-    pub files_scanned: usize,
-    pub severities: Vec<SeveritySummary>,
-}
-
-/// Priority rank for rule severities: most severe first.
-pub fn severity_rank(s: &str) -> u8 {
-    match s.to_lowercase().as_str() {
-        "error" => 0,
-        "warning" => 1,
-        "note" => 2,
-        _ => 3,
-    }
-}
-
-/// Computes an aggregated audit summary from findings and scanned files.
-/// Rule counts are sorted by count descending and then rule id ascending for determinism.
-pub fn compute_summary(findings: &[Finding], files_scanned: usize) -> AuditSummary {
-    let mut map: HashMap<String, HashMap<String, usize>> = HashMap::new();
-    for finding in findings {
-        let rule_map = map.entry(finding.severity.clone()).or_default();
-        *rule_map.entry(finding.rule.to_string()).or_default() += 1;
-    }
-
-    let mut severities: Vec<SeveritySummary> = map
-        .into_iter()
-        .map(|(severity, rules_map)| {
-            let total = rules_map.values().sum();
-            let mut rules: Vec<RuleFindingCount> = rules_map
-                .into_iter()
-                .map(|(rule, count)| RuleFindingCount { rule, count })
-                .collect();
-            rules.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.rule.cmp(&b.rule)));
-            SeveritySummary {
-                severity,
-                total,
-                rules,
-            }
-        })
-        .collect();
-
-    severities.sort_by(|a, b| {
-        severity_rank(&a.severity)
-            .cmp(&severity_rank(&b.severity))
-            .then_with(|| a.severity.cmp(&b.severity))
+        },
+        "required": ["tool", "version", "findings", "summary"]
     });
-
-    AuditSummary {
-        total_findings: findings.len(),
-        files_scanned,
-        severities,
-    }
+    println!("{}", serde_json::to_string_pretty(&schema).unwrap());
+    Ok(())
 }
 
 /// Centralized diagnostic renderer across Text, JSON, and SARIF formats.
@@ -1525,20 +1374,9 @@ impl<'a> DiagnosticRenderer<'a> {
         ));
         output.push_str(&format!("note: {FINDING_NATURE}\n"));
         output.push_str(&format!("note: {MACRO_SOURCE_LIMITATION}\n"));
-
-        let summary = compute_summary(self.findings, self.effective_files_scanned());
-        output.push_str("\nSummary:\n");
-        for sev in &summary.severities {
-            output.push_str(&format!("  {}: {} finding(s)\n", sev.severity, sev.total));
-            for rule in &sev.rules {
-                output.push_str(&format!("    - {}: {}\n", rule.rule, rule.count));
-            }
-        }
         output.push_str(&format!(
-            "  Total: {} finding(s) across {} file(s) scanned\n",
-            summary.total_findings, summary.files_scanned
+            "note: to suppress findings, add `// audit:allow(<rule_id>)` comments\n"
         ));
-
         output
     }
 
@@ -2312,22 +2150,27 @@ fn normalize_baseline_entries(
 }
 
 /// The one canonical ordering for findings: file, then line, then rule,
-/// then message. Exact duplicates collapse. Every
-/// report path funnels through this routine, in `audit_source` per parsed
-/// file and again in `run` after paths are rewritten workspace-relative, so
-/// text, JSON and SARIF always list a finding in the same place regardless
-/// of scan order.
+/// Sorts findings by file, line, rule, and message, then collapses exact
+/// duplicates. Every report path funnels through this routine, in `audit_source`
+/// per parsed file and again in `run` after paths are rewritten workspace-relative,
+/// so text, JSON and SARIF always list a finding in the same place regardless
+/// of scan order. File paths use lossy comparison to ensure deterministic ordering
+/// across platforms (e.g., case-insensitive file systems).
 fn normalize_findings(findings: &mut Vec<Finding>) {
     findings.sort_by(|left, right| {
-        left.file
-            .cmp(&right.file)
+        let left_file = left.file.to_string_lossy();
+        let right_file = right.file.to_string_lossy();
+        left_file
+            .cmp(&right_file)
             .then(left.line.cmp(&right.line))
             .then(left.end_line.cmp(&right.end_line))
             .then(left.rule.cmp(right.rule))
             .then(left.message.cmp(&right.message))
     });
     findings.dedup_by(|left, right| {
-        left.file == right.file
+        let left_file = left.file.to_string_lossy();
+        let right_file = right.file.to_string_lossy();
+        left_file == right_file
             && left.line == right.line
             && left.end_line == right.end_line
             && left.rule == right.rule
