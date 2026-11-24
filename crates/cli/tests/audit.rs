@@ -1856,6 +1856,8 @@ impl Vault {
     );
 }
 
+// === missing-ttl-bump ===
+
 #[test]
 fn audit_does_not_flag_nonzero_transfer() {
     let source = br#"
@@ -1910,6 +1912,8 @@ impl Vault {
         "arithmetic before range check must be flagged"
     );
 }
+
+// === missing-positive-amount-validation ===
 
 #[test]
 fn audit_does_not_flag_arithmetic_after_range_check() {
@@ -2031,3 +2035,4 @@ impl Vault {
         "audit:allow(<rule>) syntax must suppress the named rule"
     );
 }
+"#;

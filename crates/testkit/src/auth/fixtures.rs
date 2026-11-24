@@ -37,7 +37,7 @@
 //!             if *caller == owner {
 //!                 Ok(())
 //!             } else {
-//!                 Err(soroban_sdk::Error::from_contract_error(1))
+//!                 Err(soroban_sdk::Error::from((soroban_sdk::xdr::ScErrorType::Auth, soroban_sdk::xdr::ScErrorCode::InvalidAction)))
 //!             }
 //!         },
 //!     )
@@ -79,7 +79,7 @@ use crate::core::TestEnv;
 ///             if *caller == owner {
 ///                 Ok(())
 ///             } else {
-///                 Err(soroban_sdk::Error::from_contract_error(1))
+///                 Err(soroban_sdk::Error::from((soroban_sdk::xdr::ScErrorType::Auth, soroban_sdk::xdr::ScErrorCode::InvalidAction)))
 ///             }
 ///         },
 ///     )
@@ -193,7 +193,7 @@ impl OwnerActors {
 ///             if *caller == admin1 {
 ///                 Ok(())
 ///             } else {
-///                 Err(soroban_sdk::Error::from_contract_error(1))
+///                 Err(soroban_sdk::Error::from((soroban_sdk::xdr::ScErrorType::Auth, soroban_sdk::xdr::ScErrorCode::InvalidAction)))
 ///             }
 ///         },
 ///     )
@@ -205,7 +205,7 @@ impl OwnerActors {
 ///             if *caller == admin2 || *caller == user {
 ///                 Ok(())
 ///             } else {
-///                 Err(soroban_sdk::Error::from_contract_error(1))
+///                 Err(soroban_sdk::Error::from((soroban_sdk::xdr::ScErrorType::Auth, soroban_sdk::xdr::ScErrorCode::InvalidAction)))
 ///             }
 ///         },
 ///     )
@@ -339,21 +339,21 @@ impl AdminUserActors {
 ///         if *caller == admin1 {
 ///             Ok(())
 ///         } else {
-///             Err(soroban_sdk::Error::from_contract_error(1))
+///             Err(soroban_sdk::Error::from((soroban_sdk::xdr::ScErrorType::Auth, soroban_sdk::xdr::ScErrorCode::InvalidAction)))
 ///         }
 ///     })
 ///     .entry_point("operate", admin_and_op.as_slice(), move |caller| {
 ///         if *caller == admin2 || *caller == operator {
 ///             Ok(())
 ///         } else {
-///             Err(soroban_sdk::Error::from_contract_error(1))
+///             Err(soroban_sdk::Error::from((soroban_sdk::xdr::ScErrorType::Auth, soroban_sdk::xdr::ScErrorCode::InvalidAction)))
 ///         }
 ///     })
 ///     .entry_point("read", all_roles.as_slice(), move |caller| {
 ///         if *caller == admin3 || *caller == operator2 || *caller == viewer {
 ///             Ok(())
 ///         } else {
-///             Err(soroban_sdk::Error::from_contract_error(1))
+///             Err(soroban_sdk::Error::from((soroban_sdk::xdr::ScErrorType::Auth, soroban_sdk::xdr::ScErrorCode::InvalidAction)))
 ///         }
 ///     })
 ///     .assert_enforced();
@@ -508,7 +508,7 @@ impl RbacActors {
 ///         if fx.is_peer(caller) {
 ///             Ok(())
 ///         } else {
-///             Err(soroban_sdk::Error::from_contract_error(1))
+///             Err(soroban_sdk::Error::from((soroban_sdk::xdr::ScErrorType::Auth, soroban_sdk::xdr::ScErrorCode::InvalidAction)))
 ///         }
 ///     })
 ///     .assert_enforced();
