@@ -30,6 +30,23 @@ section, so a merge can never land without a place to record the change.
 
 ### Added
 
+- `TestToken::balance_whole_exact` and `try_balance_whole_exact`, with
+  `to_whole_units_exact` and `tokens::base_to_whole_units_exact`, read a
+  whole-unit balance and refuse a fractional one instead of truncating it,
+  naming the base units left over. `balance_whole` is unchanged.
+- `TestToken::tracked_holders`, `tracked_holder_count`, `is_tracked_holder`,
+  `tracked_balances` and `snapshot_tracked` enumerate every address the double
+  minted to, in first-mint order. A failed mint does not add its recipient.
+- `tokens::TokenMetadata` and `TestToken::{name, symbol, metadata, set_metadata,
+  try_set_metadata, format_amount}`, plus `TestEnv::token_with_metadata`, give
+  a token a display name and a symbol (1 to 12 ASCII letters or digits) and
+  print amounts as `1.5 USDC`. The metadata is a label held by the double, not
+  on-chain Stellar Asset Contract metadata.
+- `tokens::TokenSet` with `TestEnv::token_set` and `try_token_set` deploy
+  several labelled tokens at once and fund or assert them together
+  (`mint_each`, `mint_each_raw`, `balances_of`, `assert_balances`);
+  `TestEnv::tokens(n)` deploys `n` plain tokens. None of them advance the
+  address stream.
 - `audit --format json` lists inputs the scanner could not read or parse under
   `summary.parser_limitations`, separate from `findings`. `finding_count` is
   unchanged, and the stderr parse warnings are still printed.
