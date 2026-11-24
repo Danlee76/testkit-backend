@@ -2859,3 +2859,26 @@ mod tests {
         assert_eq!(timeline.remaining_at(u32::MAX), 0);
     }
 }
+
+
+// Regression coverage for issue #176: expiry must preserve unrelated ledger fields.
+#[cfg(test)]
+mod ledger_field_preservation_tests {
+    use super::{StorageKind, TestEnv};
+    use soroban_sdk::testutils::Ledger as _;
+
+    #[test]
+    fn expiry_preserves_unrelated_fields() {
+        let env = TestEnv::new();
+        let before = env.env().ledger().get();
+        env.expire(StorageKind::Persistent);
+        let after = env.env().ledger().get();
+        assert!(after.sequence_number > before.sequence_number);
+        assert_eq!(after.protocol_version, before.protocol_version);
+        assert_eq!(after.base_reserve, before.base_reserve);
+        assert_eq!(after.network_id, before.network_id);
+        assert_eq!(after.min_temp_entry_ttl, before.min_temp_entry_ttl);
+        assert_eq!(after.min_persistent_entry_ttl, before.min_persistent_entry_ttl);
+        assert_eq!(after.max_entry_ttl, before.max_entry_ttl);
+    }
+}
