@@ -140,6 +140,25 @@ impl<'a> AuthMatrix<'a> {
     pub fn csv_report(&self) -> String {
         self.to_csv()
     }
+
+    /// Render the authorization matrix as a deterministic Markdown table.
+    ///
+    /// The output is suitable for README files and CI artifacts. One row is
+    /// emitted per entry-point/caller cell, preserving registration order.
+    pub fn to_markdown(&self) -> String {
+        let mut markdown = String::from("| Entry point | Actor | Role | Allowed | Expected error | Observed | Matches |\n|---|---|---|---:|---|---|---:|\n");
+        for cell in &self.cells {
+            let expected = cell.expected_label().replace('|', "\\\\|");
+            let observed = cell.observed.to_string().replace('|', "\\\\|");
+            markdown.push_str(&format!("| {} | {:?} | {} | {} | {} | {} | {} |\n", cell.entry_point.replace('|', "\\\\|"), cell.caller, cell.role.replace('|', "\\\\|"), cell.allowed, expected, observed, cell.matches));
+        }
+        markdown
+    }
+
+    /// Alias for the Markdown report.
+    pub fn markdown_report(&self) -> String {
+        self.to_markdown()
+    }
     /// Register a privileged entry point: its name (for failure messages),
     /// the addresses permitted to call it, and a closure that attempts the
     /// call as a given caller, returning `Ok(())` if it succeeded and
