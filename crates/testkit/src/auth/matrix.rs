@@ -83,6 +83,16 @@ impl<'a> AuthMatrix<'a> {
             .unwrap_or("")
     }
 
+    fn matrix_actors(&self) -> Vec<Address> {
+        let mut actors = self.known_actors();
+        for (addr, _) in &self.roles {
+            if !actors.contains(addr) {
+                actors.push(addr.clone());
+            }
+        }
+        actors
+    }
+
     /// Return the known actors denied by an entry point.
     pub fn denied_addresses(&self, name: &str) -> Vec<Address> {
         let allowed = self
@@ -93,6 +103,7 @@ impl<'a> AuthMatrix<'a> {
         match allowed {
             Some(allowed) => self
                 .known_actors()
+                .matrix_actors()
                 .into_iter()
                 .filter(|actor| !allowed.contains(actor))
                 .collect(),
@@ -105,6 +116,7 @@ impl<'a> AuthMatrix<'a> {
         let mut csv = String::from("entry_point,actor,role,allowed,expected_error\n");
         for entry in &self.entry_points {
             for actor in self.known_actors() {
+            for actor in self.matrix_actors() {
                 let expected_error = entry
                     .expected_errors
                     .iter()
@@ -636,6 +648,43 @@ impl MatrixReport {
             Err(TestkitError::AssertionFailed(self.to_string()))
         }
     }
+        for ep in &self.entry_points {
+            let denied = self.denied_addresses(&ep.name);
+            grid.push_str(&format!("  [{}] denied={denied:?}\n", ep.name));
+            for addr in &known {
+                let expected = ep.allowed.contains(addr);
+                self.reset_auth();
+                // Isolate every cell: a panic must not prevent later
+                // callers from being checked.
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (ep.invoke)(addr)));
+                let actual = matches!(&outcome, Ok(Ok(())));
+                let error_text = match &outcome {
+                    Ok(Err(error)) => Some(format!("{error:?}")),
+                    Err(_) => Some("invocation panicked".to_string()),
+                    _ => None,
+                };
+                let expected_error = ep
+                    .expected_errors
+                    .iter()
+                    .find(|(actor, _)| actor == addr)
+                    .map(|(_, text)| text.as_str());
+                let error_matches = expected_error
+                    .map(|expected| {
+                        error_text
+                            .as_deref()
+                            .is_some_and(|actual| actual.contains(expected))
+                    })
+                    .unwrap_or(true);
+                let cell_matches = if expected {
+                    actual && expected_error.is_none()
+                } else {
+                    !actual && error_matches
+                };
+
+                // Reset auth state immediately after invocation to keep the
+                // slate clean for the next actor case.
+                self.reset_auth();
 
     fn grid(&self) -> String {
         let mut grid = format!(
@@ -667,6 +716,21 @@ impl MatrixReport {
                     },
                     if cell.matches { "" } else { "  <-- MISMATCH" },
                 ));
+                if !cell_matches {
+                    violations.push(format!(
+                        "entry point {:?}: caller {addr:?} expected {} but observed {}",
+                        ep.name,
+                        if expected {
+                            "success".to_string()
+                        } else {
+                            format!(
+                                "error containing {:?}",
+                                expected_error.unwrap_or("an error")
+                            )
+                        },
+                        error_text.unwrap_or_else(|| "success".to_string()),
+                    ));
+                }
             }
         }
         grid
@@ -1074,6 +1138,7 @@ mod tests {
         let allowed = env.address();
         let denied = env.address();
         let allowed_caller = allowed.clone();
+        let allowed_for_closure = allowed.clone();
         AuthMatrix::new(&env)
             .entry_point_with_expected_errors(
                 "role_guard",
@@ -1081,6 +1146,7 @@ mod tests {
                 &[(denied.clone(), "Contract")],
                 move |caller| {
                     if *caller == allowed_caller {
+                    if *caller == allowed_for_closure {
                         Ok(())
                     } else {
                         Err(soroban_sdk::Error::from_contract_error(1))
