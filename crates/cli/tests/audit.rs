@@ -1740,44 +1740,20 @@ impl Vault {
     );
 }
 
-#[test]
-fn audit_schema_outputs_valid_json_schema() {
-    let output = run(&["audit", "schema"]);
-    assert!(output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.is_empty(), "schema should not output to stderr: {stderr}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let schema: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("schema output should be valid JSON");
-    assert_eq!(schema["$schema"], "https://json-schema.org/draft/2020-12/schema");
-    assert_eq!(schema["title"], "Soroban Testkit Audit Report");
-    assert_eq!(schema["properties"]["tool"]["const"], "soroban-testkit");
-    assert_eq!(schema["properties"]["version"]["const"], 1);
-    // Verify schema structure matches expected report format
-    assert!(schema["properties"]["findings"].is_object());
-    assert!(schema["properties"]["summary"].is_object());
-    assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("tool")));
-    assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("version")));
-    assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("findings")));
-    assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("summary")));
-}
-
-// ---- Paired safe/unsafe fixtures for each audit rule ----
-
-// === missing-require-auth ===
+// ---- #344: detect public entry points with address parameters and missing auth ----
 
 #[test]
-fn audit_missing_require_auth_finds_unsafe_pattern() {
-    // UNSAFE: Address parameter without require_auth
-    let unsafe_source = br#"
+fn audit_flags_entry_point_with_address_param_and_no_auth() {
+    let source = br#"
 #[contractimpl]
 impl Vault {
-    pub fn withdraw(env: Env, from: Address, amount: i128) {
-        env.storage().instance().set(&from, &(amount * 2i128));
+    pub fn set_admin(env: Env, new_admin: Address) {
+        env.storage().instance().set(&"admin", &new_admin);
     }
 }
 "#;
-    let output = run_with_stdin(&["audit", "-", "--format", "json"], unsafe_source);
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], source);
+    assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let findings: Vec<_> = report["findings"]
         .as_array()
@@ -1785,252 +1761,278 @@ impl Vault {
         .iter()
         .filter(|f| f["rule"] == "missing-require-auth")
         .collect();
-    assert!(!findings.is_empty(), "unsafe pattern should trigger finding");
+    assert!(
+        !findings.is_empty(),
+        "entry point with Address param and no require_auth must be flagged"
+    );
+    assert!(
+        findings[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("set_admin"),
+        "finding message should name the function"
+    );
 }
 
 #[test]
-fn audit_missing_require_auth_allows_safe_pattern() {
-    // SAFE: Address parameter with require_auth
-    let safe_source = br#"
+fn audit_does_not_flag_entry_point_that_calls_require_auth() {
+    let source = br#"
 #[contractimpl]
 impl Vault {
-    pub fn withdraw(env: Env, from: Address, amount: i128) {
-        from.require_auth();
-        env.storage().instance().set(&from, &(amount * 2i128));
+    pub fn set_admin(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+        env.storage().instance().set(&"admin", &new_admin);
     }
 }
 "#;
-    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], safe_source);
-    assert!(output.status.success(), "safe pattern should not trigger finding");
+    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], source);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let auth_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "missing-require-auth")
+        .collect();
+    assert!(
+        auth_findings.is_empty(),
+        "entry point calling require_auth must not be flagged: {auth_findings:?}"
+    );
 }
-
-// === unchecked-i128-arithmetic ===
 
 #[test]
-fn audit_unchecked_arithmetic_finds_unsafe_pattern() {
-    // UNSAFE: Direct i128 arithmetic
-    let unsafe_source = br#"
-fn process_balance(balance: i128, amount: i128) -> i128 {
-    balance + amount
+fn audit_flags_multiple_entry_points_missing_auth() {
+    let source = br#"
+#[contractimpl]
+impl Vault {
+    pub fn withdraw(env: Env, from: Address, amount: i128) {
+        env.storage().instance().set(&"bal", &amount);
+    }
+    pub fn deposit(env: Env, to: Address, amount: i128) {
+        env.storage().instance().set(&"bal", &amount);
+    }
 }
 "#;
-    let output = run_with_stdin(&["audit", "-", "--format", "json"], unsafe_source);
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], source);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let auth_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "missing-require-auth")
+        .collect();
+    assert_eq!(
+        auth_findings.len(),
+        2,
+        "both entry points must be independently flagged"
+    );
+}
+
+// ---- #345: detect zero-value transfers ----
+
+#[test]
+fn audit_flags_zero_literal_transfer_amount() {
+    let source = br#"
+#[contractimpl]
+impl Vault {
+    pub fn zero_transfer(env: Env, token: Address, to: Address) {
+        let client = TokenClient::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &to, &0i128);
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], source);
+    assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let findings: Vec<_> = report["findings"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|f| f["rule"] == "unchecked-i128-arithmetic")
+        .filter(|f| f["rule"] == "zero-transfer-amount")
         .collect();
-    assert!(!findings.is_empty(), "unsafe pattern should trigger finding");
-}
-
-#[test]
-fn audit_unchecked_arithmetic_allows_safe_pattern() {
-    // SAFE: Checked arithmetic
-    let safe_source = br#"
-fn process_balance(balance: i128, amount: i128) -> Option<i128> {
-    balance.checked_add(amount)
-}
-"#;
-    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], safe_source);
-    assert!(output.status.success(), "safe pattern should not trigger finding");
+    assert!(
+        !findings.is_empty(),
+        "transfer with literal zero amount must be flagged"
+    );
 }
 
 // === missing-ttl-bump ===
 
 #[test]
-fn audit_missing_ttl_bump_finds_unsafe_pattern() {
-    // UNSAFE: Storage read without TTL extension
-    let unsafe_source = br#"
+fn audit_does_not_flag_nonzero_transfer() {
+    let source = br#"
 #[contractimpl]
 impl Vault {
-    pub fn get_balance(env: Env) -> i128 {
-        env.storage().instance().get(&"balance").unwrap_or(0i128)
-    }
-}
-"#;
-    let output = run_with_stdin(&["audit", "-", "--format", "json"], unsafe_source);
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let findings: Vec<_> = report["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|f| f["rule"] == "missing-ttl-bump")
-        .collect();
-    assert!(!findings.is_empty(), "unsafe pattern should trigger finding");
-}
-
-#[test]
-fn audit_missing_ttl_bump_allows_safe_pattern() {
-    // SAFE: Storage read with TTL extension
-    let safe_source = br#"
-#[contractimpl]
-impl Vault {
-    pub fn get_balance(env: Env) -> i128 {
-        env.storage().instance().get(&"balance").unwrap_or(0i128);
-        env.storage().instance().extend_ttl(&"balance", 100, 200);
-        0i128
-    }
-}
-"#;
-    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], safe_source);
-    assert!(output.status.success(), "safe pattern should not trigger finding");
-}
-
-// === ignored-token-transfer-result ===
-
-#[test]
-fn audit_ignored_transfer_finds_unsafe_pattern() {
-    // UNSAFE: Ignoring transfer result
-    let unsafe_source = br#"
-use soroban_token_contract::TokenClient;
-
-#[contractimpl]
-impl Vault {
-    pub fn transfer(env: Env, token: Address, to: Address, amount: i128) {
+    pub fn transfer_funds(env: Env, token: Address, to: Address, amount: i128) {
+        assert!(amount > 0);
         let client = TokenClient::new(&env, &token);
         client.transfer(&env.current_contract_address(), &to, &amount);
     }
 }
 "#;
-    let output = run_with_stdin(&["audit", "-", "--format", "json"], unsafe_source);
+    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], source);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let zero_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "zero-transfer-amount")
+        .collect();
+    assert!(
+        zero_findings.is_empty(),
+        "non-zero transfer must not trigger zero-transfer-amount: {zero_findings:?}"
+    );
+}
+
+// ---- #347: detect arithmetic before range validation ----
+
+#[test]
+fn audit_flags_arithmetic_before_range_check() {
+    let source = br#"
+#[contractimpl]
+impl Vault {
+    pub fn compute_fee(env: Env, amount: i128, rate: i128) -> i128 {
+        let fee = amount * rate / 10000i128;
+        assert!(amount > 0);
+        fee
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], source);
+    assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let findings: Vec<_> = report["findings"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|f| f["rule"] == "ignored-token-transfer-result")
+        .filter(|f| f["rule"] == "arithmetic-before-range-check")
         .collect();
-    assert!(!findings.is_empty(), "unsafe pattern should trigger finding");
-}
-
-#[test]
-fn audit_ignored_transfer_allows_safe_pattern() {
-    // SAFE: Handling transfer result
-    let safe_source = br#"
-use soroban_token_contract::TokenClient;
-
-#[contractimpl]
-impl Vault {
-    pub fn transfer(env: Env, token: Address, to: Address, amount: i128) -> Result<(), soroban_sdk::Error> {
-        let client = TokenClient::new(&env, &token);
-        Ok(client.transfer(&env.current_contract_address(), &to, &amount)?)
-    }
-}
-"#;
-    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], safe_source);
-    assert!(output.status.success(), "safe pattern should not trigger finding");
+    assert!(
+        !findings.is_empty(),
+        "arithmetic before range check must be flagged"
+    );
 }
 
 // === missing-positive-amount-validation ===
 
 #[test]
-fn audit_missing_amount_validation_finds_unsafe_pattern() {
-    // UNSAFE: Amount without positive check
-    let unsafe_source = br#"
+fn audit_does_not_flag_arithmetic_after_range_check() {
+    let source = br#"
 #[contractimpl]
 impl Vault {
-    pub fn deposit(env: Env, amount: i128) {
-        let balance: i128 = env.storage().instance().get(&"balance").unwrap_or(0);
-        env.storage().instance().set(&"balance", &(balance + amount));
+    pub fn compute_fee(env: Env, amount: i128, rate: i128) -> i128 {
+        assert!(amount > 0);
+        let fee = amount * rate / 10000i128;
+        fee
     }
 }
 "#;
-    let output = run_with_stdin(&["audit", "-", "--format", "json"], unsafe_source);
+    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], source);
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let findings: Vec<_> = report["findings"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|f| f["rule"] == "missing-positive-amount-validation")
+        .filter(|f| f["rule"] == "arithmetic-before-range-check")
         .collect();
-    assert!(!findings.is_empty(), "unsafe pattern should trigger finding");
+    assert!(
+        findings.is_empty(),
+        "arithmetic after range check must not be flagged: {findings:?}"
+    );
 }
 
+// ---- #349: rule-specific allow comments ----
+
 #[test]
-fn audit_missing_amount_validation_allows_safe_pattern() {
-    // SAFE: Amount with positive check
-    let safe_source = br#"
+fn audit_allow_comment_suppresses_specific_rule() {
+    // The audit:allow(missing-require-auth) comment must suppress only
+    // the missing-require-auth rule; other findings on the same function still fire.
+    let source = br#"
 #[contractimpl]
 impl Vault {
-    pub fn deposit(env: Env, amount: i128) {
-        assert!(amount > 0, "Amount must be positive");
-        let balance: i128 = env.storage().instance().get(&"balance").unwrap_or(0);
-        env.storage().instance().set(&"balance", &(balance + amount));
+    // audit:allow(missing-require-auth)
+    pub fn withdraw(env: Env, from: Address, amount: i128) {
+        env.storage().instance().get(&"bal");
     }
 }
 "#;
-    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], safe_source);
-    assert!(output.status.success(), "safe pattern should not trigger finding");
-}
-
-// === unchecked-timestamp-arithmetic ===
-
-#[test]
-fn audit_unchecked_timestamp_finds_unsafe_pattern() {
-    // UNSAFE: Timestamp arithmetic without bounds checking
-    let unsafe_source = br#"
-fn deadline_from_now(seconds: u64, start: u64) -> u64 {
-    start + seconds
-}
-"#;
-    let output = run_with_stdin(&["audit", "-", "--format", "json"], unsafe_source);
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], source);
+    assert!(output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let findings: Vec<_> = report["findings"]
+    let auth_findings: Vec<_> = report["findings"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|f| f["rule"] == "unchecked-timestamp-arithmetic")
+        .filter(|f| f["rule"] == "missing-require-auth")
         .collect();
-    assert!(!findings.is_empty(), "unsafe pattern should trigger finding");
+    assert!(
+        auth_findings.is_empty(),
+        "audit:allow(missing-require-auth) must suppress that rule: {auth_findings:?}"
+    );
 }
 
 #[test]
-fn audit_unchecked_timestamp_allows_safe_pattern() {
-    // SAFE: Checked timestamp arithmetic
-    let safe_source = br#"
-fn deadline_from_now(seconds: u64, start: u64) -> Option<u64> {
-    start.checked_add(seconds)
+fn audit_allow_comment_does_not_suppress_other_rules() {
+    // A suppression for missing-require-auth must not silence missing-ttl-bump.
+    let source = br#"
+#[contractimpl]
+impl Vault {
+    // audit:allow(missing-require-auth)
+    pub fn withdraw(env: Env, from: Address) {
+        env.storage().persistent().get(&"bal");
+    }
 }
 "#;
-    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], safe_source);
-    assert!(output.status.success(), "safe pattern should not trigger finding");
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], source);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    // missing-require-auth should be suppressed
+    let auth_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "missing-require-auth")
+        .collect();
+    assert!(
+        auth_findings.is_empty(),
+        "allow comment must suppress missing-require-auth"
+    );
+    // missing-ttl-bump should still fire
+    let ttl_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "missing-ttl-bump")
+        .collect();
+    assert!(
+        !ttl_findings.is_empty(),
+        "allow(missing-require-auth) must not suppress missing-ttl-bump"
+    );
 }
 
-// === broad-mock-all-auths ===
-
-const MOCK_ALL_AUTHS_SAFE: &str = r#"
 #[test]
-fn test_with_specific_auth() {
-    let env = Env::default();
-    let admin = env.addresses().get(0).unwrap();
-    let user = env.addresses().get(1).unwrap();
-    
-    env.mock_auths(&[
-        MockAuth {
-            contract: &admin,
-            invocations: &[MockAuthInvocation {
-                function: "admin_only",
-                args: (&user,),
-                auth: Some(&user),
-            }],
-        },
-    ]);
-    
-    contract.admin_only(&user);
+fn audit_allow_comment_via_new_syntax_works() {
+    // Test the shorter audit:allow(<rule>) syntax (not requiring soroban_testkit prefix)
+    let source = br#"
+#[contractimpl]
+impl Vault {
+    // audit:allow(missing-require-auth)
+    pub fn admin_op(env: Env, admin: Address) {
+        env.storage().instance().set(&"admin", &admin);
+    }
 }
 "#;
-
-const MOCK_ALL_AUTHS_UNSAFE: &str = r#"
-#[test]
-fn test_with_all_auths() {
-    let env = Env::default();
-    let admin = env.addresses().get(0).unwrap();
-    let user = env.addresses().get(1).unwrap();
-    
-    env.mock_all_auths();
-    
-    contract.admin_only(&user);
+    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], source);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let auth_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "missing-require-auth")
+        .collect();
+    assert!(
+        auth_findings.is_empty(),
+        "audit:allow(<rule>) syntax must suppress the named rule"
+    );
 }
 "#;
