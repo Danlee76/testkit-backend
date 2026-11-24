@@ -238,9 +238,10 @@ fn failure_report_contains_deterministic_metadata() {
     assert!(env_report.contains("assertion failed: invalid invariant"));
     assert!(env_report.contains("env_seed: 42"));
 
-    let err = TestkitError::assertion_failed("unauthorized caller")
-        .with_env_metadata(&meta);
-    assert!(err.to_string().contains("environment metadata: [timestamp=0, sequence=0, seed=42]"));
+    let err = TestkitError::assertion_failed("unauthorized caller").with_env_metadata(&meta);
+    assert!(err
+        .to_string()
+        .contains("environment metadata: [timestamp=0, sequence=0, seed=42]"));
 
     let err_report = err.to_failure_report(&meta);
     assert!(err_report.contains("unauthorized caller"));

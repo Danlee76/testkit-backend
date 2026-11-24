@@ -263,7 +263,7 @@ impl Finding {
 }
 
 /// Static checks over a contract crate. **Not a security product** — a
-/// linter with seven heuristics, each independently useful and each
+/// linter with built-in heuristics, each independently useful and each
 /// capable of missing real bugs or flagging non-bugs. The absence of a
 /// finding here is never a security guarantee.
 ///
@@ -303,6 +303,20 @@ impl Finding {
 /// 7. `unchecked-timestamp-arithmetic` [low]: Unchecked timestamp arithmetic operations.
 ///    Limitations: Substring match on `timestamp`; flags unrelated arithmetic in the
 ///    same function; no semantic type checking.
+/// 8. `unchecked-amount-division` [medium]: Unchecked `/` or `/=` in amount calculations.
+///    Limitations: Matches amount-related identifier stems syntactically; non-zero
+///    positive literal divisors are skipped; control-flow zero checks are not tracked.
+/// 9. `unchecked-narrowing-conversion` [medium]: Integer `as` casts that can truncate.
+///    Limitations: Tracks parameter and annotated local types; when source type is
+///    unknown, casts to `< 128`-bit integer types are flagged as potentially narrowing.
+/// 10. `ignored-contract-call-result` [medium]: Contract calls (`try_*`,
+///     `try_invoke_contract`) whose `Result` return value is discarded.
+///     Limitations: Syntactic heuristic matching `try_*` contract call patterns;
+///     excludes `try_transfer`/`try_transfer_from` (covered by `ignored-token-transfer-result`).
+/// 11. `storage-write-missing-ttl` [medium]: Persistent or temporary storage writes
+///     (`.set`, `.update`) without a matching `.extend_ttl(` in the same function.
+///     Limitations: Does not check `instance()` storage; does not verify key equivalence
+///     between write and `extend_ttl`; does not inspect helper functions.
 ///
 /// # Scan roots and exclusions
 ///
@@ -853,7 +867,9 @@ pub fn matches_filter(
 
     // 2. Include patterns: if specified, must match at least one
     if !include_patterns.is_empty() {
-        return include_patterns.iter().any(|pat| glob_matches(pat, rel_norm));
+        return include_patterns
+            .iter()
+            .any(|pat| glob_matches(pat, rel_norm));
     }
 
     // 3. Otherwise included by default
@@ -917,7 +933,9 @@ fn collect_rust_sources_filtered_with_exclusions(
                 return false;
             }
             let rel = workspace_relative_path(entry.path(), workspace);
-            !exclusions.iter().any(|excl| rel == *excl || rel.starts_with(excl))
+            !exclusions
+                .iter()
+                .any(|excl| rel == *excl || rel.starts_with(excl))
         })
     {
         let entry = match entry {
@@ -941,7 +959,9 @@ fn collect_rust_sources_filtered_with_exclusions(
                 sources.push(entry.path().to_path_buf());
             } else {
                 let rel = workspace_relative_path(entry.path(), workspace);
-                let is_excluded = exclusions.iter().any(|excl| rel == *excl || rel.starts_with(excl));
+                let is_excluded = exclusions
+                    .iter()
+                    .any(|excl| rel == *excl || rel.starts_with(excl));
                 if !is_excluded {
                     sources.push(entry.path().to_path_buf());
                 }
@@ -972,6 +992,16 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
              Fix: Replace with granular auth checks for specific callers to ensure auth is properly tested.\n\
              Reference: https://developers.stellar.org/docs/build/smart-contracts/guides/testing",
         remediation: "Replace broad mock_all_auths() with granular mock_auths(&[...]) or targeted caller authorizations so unintended missing auth checks are not masked.",
+    },
+    RuleDefinition {
+        id: "ignored-contract-call-result",
+        severity: "warning",
+        description: "Contract calls returning Result can fail; their results must be handled.",
+        explanation: "ignored-contract-call-result: Cross-contract and try_invoke_contract calls return a Result that must be handled.\n\
+             This rule detects `try_*` contract calls and `try_invoke_contract` calls whose Result is discarded via `;` or `let _ = ...`.\n\
+             Fix: Propagate the Result with `?`, match on it, or bind and inspect the outcome.\n\
+             Reference: https://developers.stellar.org/docs/build/smart-contracts/getting-started/storing-data",
+        remediation: "Propagate the Result with `?`, match on it, or unwrap/handle the error explicitly so failed contract calls cannot fail silently.",
     },
     RuleDefinition {
         id: "ignored-token-transfer-result",
@@ -1014,6 +1044,26 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
         remediation: "Call env.storage().persistent().extend_ttl(...) or temporary().extend_ttl(...) for accessed keys to prevent state expiration before the next interaction.",
     },
     RuleDefinition {
+        id: "storage-write-missing-ttl",
+        severity: "warning",
+        description: "Storage writes without a neighboring extend_ttl can expire prematurely.",
+        explanation: "storage-write-missing-ttl: Persistent or temporary storage writes without a matching extend_ttl() call can expire.\n\
+             This rule detects .persistent().set/.update or .temporary().set/.update without a matching .extend_ttl() in the same function.\n\
+             Fix: Call .extend_ttl() on the same storage tier after writing to storage.\n\
+             Reference: https://developers.stellar.org/docs/smart-contracts/storing-data",
+        remediation: "Call env.storage().persistent().extend_ttl(...) or temporary().extend_ttl(...) for written keys so state does not expire prematurely.",
+    },
+    RuleDefinition {
+        id: "unchecked-amount-division",
+        severity: "warning",
+        description: "Unchecked division in amount calculations can panic on zero or overflow.",
+        explanation: "unchecked-amount-division: Division in amount calculations can panic on division by zero or signed overflow.\n\
+             This rule detects `/` and `/=` operations involving amount-related bindings outside checked_div().\n\
+             Fix: Use .checked_div(...) or validate the divisor is non-zero before dividing.\n\
+             Reference: https://doc.rust-lang.org/std/primitive.i128.html#method.checked_div",
+        remediation: "Use .checked_div(...) and handle None explicitly (or validate the divisor is non-zero) to prevent panics in amount calculations.",
+    },
+    RuleDefinition {
         id: "unchecked-i128-arithmetic",
         severity: "warning",
         description: "Arithmetic on i128 values can silently overflow; use checked/saturating/wrapping variants.",
@@ -1022,6 +1072,16 @@ pub const RULE_REGISTRY: &[RuleDefinition] = &[
              Fix: Use .checked_add(), .saturating_add(), or .wrapping_add() for safe overflow handling.\n\
              Reference: https://doc.rust-lang.org/std/primitive.i128.html",
         remediation: "Use .checked_add(), .checked_sub(), .checked_mul(), or .checked_div() and handle overflow, or use saturating/wrapping arithmetic if truncation is intended.",
+    },
+    RuleDefinition {
+        id: "unchecked-narrowing-conversion",
+        severity: "warning",
+        description: "Unchecked narrowing `as` casts can silently truncate integer values.",
+        explanation: "unchecked-narrowing-conversion: Using `as` to cast a wider integer to a narrower integer type silently truncates high bits.\n\
+             This rule detects narrowing integer `as` casts (e.g. `u128 as u64`, `i128 as i64`, `u64 as u32`).\n\
+             Fix: Use `.try_into()` or `TryFrom::try_from(...)` and handle conversion errors explicitly.\n\
+             Reference: https://doc.rust-lang.org/std/convert/trait.TryFrom.html",
+        remediation: "Replace the narrowing `as` cast with `.try_into()` or `TryFrom::try_from(...)` and propagate or handle out-of-range errors.",
     },
     RuleDefinition {
         id: "unchecked-timestamp-arithmetic",
@@ -1077,12 +1137,18 @@ const RULES: &[(&str, &str, &str)] = &[
 fn list_rules(format: AuditOutputFormat) -> Result<(), CliError> {
     match format {
         AuditOutputFormat::Text => {
-            println!("{:<36} {:<10} {:<12} DESCRIPTION", "RULE", "SEVERITY", "CONFIDENCE");
+            println!(
+                "{:<36} {:<10} {:<12} DESCRIPTION",
+                "RULE", "SEVERITY", "CONFIDENCE"
+            );
             println!("{}", "-".repeat(100));
             for rule in RULE_REGISTRY {
                 let meta = RULES.iter().find(|m| m.id == rule.id);
                 let confidence = meta.map_or("not assessed", |m| m.confidence);
-                println!("{:<36} {:<10} {:<12} {}", rule.id, rule.severity, confidence, rule.description);
+                println!(
+                    "{:<36} {:<10} {:<12} {}",
+                    rule.id, rule.severity, confidence, rule.description
+                );
                 if let Some(m) = meta {
                     for lim in m.limitations {
                         println!("    * limitation: {lim}");
@@ -1127,11 +1193,7 @@ pub fn visible_width(s: &str) -> usize {
 /// Wraps the human-readable message part of a finding at word boundaries,
 /// leaving the location prefix intact on line 1, and indenting continuation
 /// lines with 4 spaces. Unbreakable tokens longer than the width are not split.
-pub fn wrap_finding_message(
-    prefix: &str,
-    message: &str,
-    width: Option<usize>,
-) -> String {
+pub fn wrap_finding_message(prefix: &str, message: &str, width: Option<usize>) -> String {
     let Some(max_width) = width else {
         return format!("{prefix}{message}\n");
     };
@@ -1197,7 +1259,10 @@ fn validate_width_str(val: &str) -> Result<usize, CliError> {
     }
 }
 
-fn resolve_width(cli_width: &Option<String>, config: &AuditConfig) -> Result<Option<usize>, CliError> {
+fn resolve_width(
+    cli_width: &Option<String>,
+    config: &AuditConfig,
+) -> Result<Option<usize>, CliError> {
     if let Some(w) = cli_width {
         return validate_width_str(w).map(Some);
     }
@@ -1463,20 +1528,25 @@ impl<'a> DiagnosticRenderer<'a> {
 
             let loc = match finding.end_line {
                 Some(end) if end > finding.line => {
-                    format!("{}:{}:-{}:", display_audit_path(&finding.file), finding.line, end)
+                    format!(
+                        "{}:{}:-{}:",
+                        display_audit_path(&finding.file),
+                        finding.line,
+                        end
+                    )
                 }
                 _ => format!("{}:{}:", display_audit_path(&finding.file), finding.line),
             };
             output.push_str(&format!(
                 "{} [{}] {}: {}\n",
-                loc,
-                finding.severity,
-                finding.rule,
-                finding.message
+                loc, finding.severity, finding.rule, finding.message
             ));
             if let Some(snippet) = &finding.source_snippet {
                 if color {
-                    output.push_str(&format!("    \x1b[1;34m-->\x1b[0m {}\n", sanitize_snippet(snippet)));
+                    output.push_str(&format!(
+                        "    \x1b[1;34m-->\x1b[0m {}\n",
+                        sanitize_snippet(snippet)
+                    ));
                 } else {
                     output.push_str(&format!("    --> {}\n", sanitize_snippet(snippet)));
                 }
@@ -1816,11 +1886,15 @@ fn config_error_context(content: &str, err: &toml::de::Error) -> String {
 
 pub const VALID_RULES: &[&str] = &[
     "broad-mock-all-auths",
+    "ignored-contract-call-result",
     "ignored-token-transfer-result",
     "missing-positive-amount-validation",
     "missing-require-auth",
     "missing-ttl-bump",
+    "storage-write-missing-ttl",
+    "unchecked-amount-division",
     "unchecked-i128-arithmetic",
+    "unchecked-narrowing-conversion",
     "unchecked-timestamp-arithmetic",
 ];
 
@@ -1938,7 +2012,9 @@ fn validate_audit_config_table(
                                 errors.push(ConfigValidationError {
                                     line,
                                     key_path: full_key.clone(),
-                                    message: "key `exclude` elements must be directory path strings".to_string(),
+                                    message:
+                                        "key `exclude` elements must be directory path strings"
+                                            .to_string(),
                                 });
                                 break;
                             }
@@ -1949,7 +2025,9 @@ fn validate_audit_config_table(
                         errors.push(ConfigValidationError {
                             line,
                             key_path: full_key,
-                            message: "key `exclude` must be a string or list of directory path strings".to_string(),
+                            message:
+                                "key `exclude` must be a string or list of directory path strings"
+                                    .to_string(),
                         });
                     }
                 }
@@ -2039,9 +2117,7 @@ fn validate_rules_table(
             errors.push(ConfigValidationError {
                 line,
                 key_path: rule_key_path,
-                message: format!(
-                    "unknown rule `{rule_name}`; valid rules are: {valid_rules_list}"
-                ),
+                message: format!("unknown rule `{rule_name}`; valid rules are: {valid_rules_list}"),
             });
             continue;
         }
@@ -2118,15 +2194,11 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
             validate_audit_config_table(&table, &content, "", &mut validation_errors);
 
             if !validation_errors.is_empty() {
-                validation_errors.sort_by(|a, b| a.line.cmp(&b.line).then(a.key_path.cmp(&b.key_path)));
+                validation_errors
+                    .sort_by(|a, b| a.line.cmp(&b.line).then(a.key_path.cmp(&b.key_path)));
                 let formatted_errors: Vec<String> = validation_errors
                     .into_iter()
-                    .map(|e| {
-                        format!(
-                            "at line {} (key `{}`): {}",
-                            e.line, e.key_path, e.message
-                        )
-                    })
+                    .map(|e| format!("at line {} (key `{}`): {}", e.line, e.key_path, e.message))
                     .collect();
                 return Err(CliError(format!(
                     "failed to validate audit config {}:\n  - {}",
@@ -2733,6 +2805,10 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         if !self.test_context {
             self.audit_function(&node.sig, &node.block, body_src.clone(), line, fn_range);
             self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
+            self.audit_amount_division(&node.sig, &node.block, fn_range);
+            self.audit_narrowing_conversions(&node.sig, &node.block, fn_range);
+            self.audit_ignored_contract_call_results(&node.sig, &node.block, fn_range);
+            self.audit_storage_write_ttl(&node.sig, &node.block, fn_range);
             self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
         }
         self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
@@ -2750,6 +2826,10 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         if !self.test_context {
             self.audit_function(&node.sig, &node.block, body_src.clone(), line, fn_range);
             self.audit_i128_arithmetic(&node.sig, &node.block, line, fn_range);
+            self.audit_amount_division(&node.sig, &node.block, fn_range);
+            self.audit_narrowing_conversions(&node.sig, &node.block, fn_range);
+            self.audit_ignored_contract_call_results(&node.sig, &node.block, fn_range);
+            self.audit_storage_write_ttl(&node.sig, &node.block, fn_range);
             self.audit_ignored_transfer_results(&node.sig, &node.block, fn_range);
         }
         self.audit_mock_all_auths(&body_src, line, &fn_name, fn_range);
@@ -2991,9 +3071,7 @@ impl FunctionVisitor<'_> {
         // struct; sanitizing happens in the renderer.
         let source_snippet = self.source.get(line).cloned();
 
-        let end_line = fn_range
-            .map(|(_, end)| end)
-            .filter(|&end| end > line);
+        let end_line = fn_range.map(|(_, end)| end).filter(|&end| end > line);
 
         self.findings.push(Finding {
             file: self.path.clone(),
@@ -3042,6 +3120,73 @@ impl FunctionVisitor<'_> {
         visitor.visit_block(body);
     }
 
+    fn audit_ignored_contract_call_results(
+        &mut self,
+        sig: &Signature,
+        body: &syn::Block,
+        fn_range: (usize, usize),
+    ) {
+        if !self.is_enabled("ignored-contract-call-result") {
+            return;
+        }
+
+        let mut visitor = IgnoredContractCallVisitor {
+            path: self.path.clone(),
+            fn_name: sig.ident.to_string(),
+            fn_range,
+            findings: self.findings,
+            config: self.config,
+            suppressions: self.suppressions,
+            source: self.source,
+        };
+        visitor.visit_block(body);
+    }
+
+    fn audit_storage_write_ttl(
+        &mut self,
+        sig: &Signature,
+        body: &syn::Block,
+        fn_range: (usize, usize),
+    ) {
+        if !self.is_enabled("storage-write-missing-ttl") {
+            return;
+        }
+
+        let mut visitor = StorageWriteTtlVisitor {
+            tier_bindings: HashMap::new(),
+            writes: Vec::new(),
+            ttl_extensions: Vec::new(),
+        };
+        visitor.visit_block(body);
+
+        let fn_name = sig.ident.to_string();
+        for (line, end_line, tier) in visitor.writes {
+            let has_neighboring_ttl = visitor
+                .ttl_extensions
+                .iter()
+                .any(|ext_tier| ext_tier.is_none() || *ext_tier == Some(tier));
+            if !has_neighboring_ttl {
+                FindingEmitter {
+                    path: &self.path,
+                    fn_range,
+                    findings: self.findings,
+                    config: self.config,
+                    suppressions: self.suppressions,
+                    source: self.source,
+                }
+                .emit(
+                    "storage-write-missing-ttl",
+                    line,
+                    Some(end_line),
+                    format!(
+                        "fn {fn_name} writes to {} storage without a neighboring extend_ttl call; state may expire prematurely",
+                        tier.as_str()
+                    ),
+                );
+            }
+        }
+    }
+
     fn audit_ignored_transfer_results(
         &mut self,
         sig: &Signature,
@@ -3056,6 +3201,63 @@ impl FunctionVisitor<'_> {
             path: self.path.clone(),
             fn_name: sig.ident.to_string(),
             fn_range,
+            findings: self.findings,
+            config: self.config,
+            suppressions: self.suppressions,
+            source: self.source,
+        };
+        visitor.visit_block(body);
+    }
+
+    fn audit_amount_division(
+        &mut self,
+        sig: &Signature,
+        body: &syn::Block,
+        fn_range: (usize, usize),
+    ) {
+        if !self.is_enabled("unchecked-amount-division") {
+            return;
+        }
+
+        let mut visitor = AmountDivisionVisitor {
+            path: self.path.clone(),
+            fn_name: sig.ident.to_string(),
+            fn_range,
+            in_amount_local: false,
+            findings: self.findings,
+            config: self.config,
+            suppressions: self.suppressions,
+            source: self.source,
+        };
+        visitor.visit_block(body);
+    }
+
+    fn audit_narrowing_conversions(
+        &mut self,
+        sig: &Signature,
+        body: &syn::Block,
+        fn_range: (usize, usize),
+    ) {
+        if !self.is_enabled("unchecked-narrowing-conversion") {
+            return;
+        }
+
+        let mut bindings = HashMap::new();
+        for arg in &sig.inputs {
+            if let FnArg::Typed(pat_type) = arg {
+                if let Some(info) = parse_int_type(&pat_type.ty) {
+                    if let Pat::Ident(ident) = &*pat_type.pat {
+                        bindings.insert(ident.ident.unraw().to_string(), info);
+                    }
+                }
+            }
+        }
+
+        let mut visitor = NarrowingConversionVisitor {
+            path: self.path.clone(),
+            fn_name: sig.ident.to_string(),
+            fn_range,
+            bindings,
             findings: self.findings,
             config: self.config,
             suppressions: self.suppressions,
@@ -3195,6 +3397,187 @@ fn line_of(node: impl quote::ToTokens) -> usize {
         .next()
         .map(|token| token.span().start().line)
         .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageTier {
+    Persistent,
+    Temporary,
+}
+
+impl StorageTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            StorageTier::Persistent => "persistent",
+            StorageTier::Temporary => "temporary",
+        }
+    }
+}
+
+struct StorageWriteTtlVisitor {
+    tier_bindings: HashMap<String, StorageTier>,
+    writes: Vec<(usize, usize, StorageTier)>,
+    ttl_extensions: Vec<Option<StorageTier>>,
+}
+
+impl StorageWriteTtlVisitor {
+    fn infer_storage_tier(&self, expr: &Expr) -> Option<StorageTier> {
+        match expr {
+            Expr::MethodCall(call) => match call.method.unraw().to_string().as_str() {
+                "persistent" => Some(StorageTier::Persistent),
+                "temporary" => Some(StorageTier::Temporary),
+                _ => None,
+            },
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .and_then(|ident| self.tier_bindings.get(&ident.unraw().to_string()).copied()),
+            Expr::Paren(p) => self.infer_storage_tier(&p.expr),
+            Expr::Group(g) => self.infer_storage_tier(&g.expr),
+            _ => None,
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for StorageWriteTtlVisitor {
+    fn visit_local(&mut self, node: &'ast Local) {
+        if let Pat::Ident(ident) = &node.pat {
+            if let Some(init) = &node.init {
+                if let Some(tier) = self.infer_storage_tier(&init.expr) {
+                    self.tier_bindings
+                        .insert(ident.ident.unraw().to_string(), tier);
+                }
+            }
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        let method = node.method.unraw().to_string();
+        match method.as_str() {
+            "set" | "update" => {
+                if let Some(tier) = self.infer_storage_tier(&node.receiver) {
+                    let line = line_of(node);
+                    let (_, end) = item_line_range(node);
+                    self.writes.push((line, end, tier));
+                }
+            }
+            "extend_ttl" => {
+                let tier = self.infer_storage_tier(&node.receiver);
+                self.ttl_extensions.push(tier);
+            }
+            _ => {}
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+}
+
+struct IgnoredContractCallVisitor<'a> {
+    path: PathBuf,
+    fn_name: String,
+    fn_range: (usize, usize),
+    findings: &'a mut Vec<Finding>,
+    config: &'a AuditConfig,
+    suppressions: &'a [Suppression],
+    source: &'a SourceLines,
+}
+
+impl<'ast> Visit<'ast> for IgnoredContractCallVisitor<'_> {
+    fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
+        let ignored = match node {
+            syn::Stmt::Expr(expr, Some(_)) => {
+                contract_call_method_name(expr).map(|m| (expr, m))
+            }
+            syn::Stmt::Local(local) if pattern_is_wildcard(&local.pat) => local
+                .init
+                .as_ref()
+                .and_then(|init| contract_call_method_name(&init.expr).map(|m| (&*init.expr, m))),
+            _ => None,
+        };
+
+        if let Some((expr, method)) = ignored {
+            let line = line_of(expr);
+            let (_, end) = item_line_range(expr);
+            FindingEmitter {
+                path: &self.path,
+                fn_range: self.fn_range,
+                findings: self.findings,
+                config: self.config,
+                suppressions: self.suppressions,
+                source: self.source,
+            }
+            .emit(
+                "ignored-contract-call-result",
+                line,
+                Some(end),
+                format!(
+                    "fn {} ignores the Result returned by contract call `{method}`; propagate with `?`, match, or handle the error",
+                    self.fn_name
+                ),
+            );
+        }
+
+        visit::visit_stmt(self, node);
+    }
+}
+
+const NON_CONTRACT_TRY_METHODS: &[&str] = &[
+    "try_transfer",
+    "try_transfer_from",
+    "try_into",
+    "try_from",
+    "try_fold",
+    "try_for_each",
+    "try_reduce",
+    "try_borrow",
+    "try_borrow_mut",
+    "try_lock",
+    "try_read",
+    "try_write",
+    "try_recv",
+    "try_send",
+    "try_reserve",
+    "try_reserve_exact",
+    "try_clone",
+    "try_exists",
+];
+
+fn contract_call_method_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::MethodCall(call) => {
+            let method = call.method.unraw().to_string();
+            if matches!(
+                method.as_str(),
+                "try_invoke_contract" | "try_invoke_contract_check_auth"
+            ) {
+                return Some(method);
+            }
+            if method.starts_with("try_") && !NON_CONTRACT_TRY_METHODS.contains(&method.as_str()) {
+                return Some(method);
+            }
+            if matches!(method.as_str(), "ok" | "err") {
+                return contract_call_method_name(&call.receiver);
+            }
+            None
+        }
+        Expr::Call(call) => match &*call.func {
+            Expr::Path(path) => path.path.segments.last().and_then(|seg| {
+                let name = seg.ident.unraw().to_string();
+                if matches!(
+                    name.as_str(),
+                    "try_invoke_contract" | "try_invoke_contract_check_auth"
+                ) {
+                    Some(name)
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        },
+        Expr::Paren(paren) => contract_call_method_name(&paren.expr),
+        Expr::Group(group) => contract_call_method_name(&group.expr),
+        _ => None,
+    }
 }
 
 struct IgnoredTransferVisitor<'a> {
@@ -3364,6 +3747,155 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IntTypeInfo {
+    name: &'static str,
+    bits: u8,
+    is_pointer_sized: bool,
+    max_unsigned: u128,
+}
+
+fn parse_int_type_name(name: &str) -> Option<IntTypeInfo> {
+    match name {
+        "u8" => Some(IntTypeInfo { name: "u8", bits: 8, is_pointer_sized: false, max_unsigned: u8::MAX as u128 }),
+        "i8" => Some(IntTypeInfo { name: "i8", bits: 8, is_pointer_sized: false, max_unsigned: i8::MAX as u128 }),
+        "u16" => Some(IntTypeInfo { name: "u16", bits: 16, is_pointer_sized: false, max_unsigned: u16::MAX as u128 }),
+        "i16" => Some(IntTypeInfo { name: "i16", bits: 16, is_pointer_sized: false, max_unsigned: i16::MAX as u128 }),
+        "u32" => Some(IntTypeInfo { name: "u32", bits: 32, is_pointer_sized: false, max_unsigned: u32::MAX as u128 }),
+        "i32" => Some(IntTypeInfo { name: "i32", bits: 32, is_pointer_sized: false, max_unsigned: i32::MAX as u128 }),
+        "u64" => Some(IntTypeInfo { name: "u64", bits: 64, is_pointer_sized: false, max_unsigned: u64::MAX as u128 }),
+        "i64" => Some(IntTypeInfo { name: "i64", bits: 64, is_pointer_sized: false, max_unsigned: i64::MAX as u128 }),
+        "u128" => Some(IntTypeInfo { name: "u128", bits: 128, is_pointer_sized: false, max_unsigned: u128::MAX }),
+        "i128" => Some(IntTypeInfo { name: "i128", bits: 128, is_pointer_sized: false, max_unsigned: i128::MAX as u128 }),
+        "usize" => Some(IntTypeInfo { name: "usize", bits: 32, is_pointer_sized: true, max_unsigned: u32::MAX as u128 }),
+        "isize" => Some(IntTypeInfo { name: "isize", bits: 32, is_pointer_sized: true, max_unsigned: i32::MAX as u128 }),
+        _ => None,
+    }
+}
+
+fn parse_int_type(ty: &Type) -> Option<IntTypeInfo> {
+    match ty {
+        Type::Reference(r) => parse_int_type(&r.elem),
+        Type::Group(g) => parse_int_type(&g.elem),
+        Type::Paren(p) => parse_int_type(&p.elem),
+        Type::Path(p) => p
+            .path
+            .get_ident()
+            .and_then(|ident| parse_int_type_name(&ident.unraw().to_string())),
+        _ => None,
+    }
+}
+
+fn is_narrowing_cast(src: IntTypeInfo, dst: IntTypeInfo) -> bool {
+    if src.is_pointer_sized && dst.is_pointer_sized {
+        return false;
+    }
+    if src.is_pointer_sized {
+        // On 64-bit targets `usize`/`isize` is 64 bits, so casting to <=32 bits narrows.
+        return dst.bits <= 32;
+    }
+    if dst.is_pointer_sized {
+        // On wasm32 (Soroban's target) `usize`/`isize` is 32 bits, so >=64 bits narrows.
+        return src.bits >= 64;
+    }
+    src.bits > dst.bits
+}
+
+struct NarrowingConversionVisitor<'a> {
+    path: PathBuf,
+    fn_name: String,
+    fn_range: (usize, usize),
+    bindings: HashMap<String, IntTypeInfo>,
+    findings: &'a mut Vec<Finding>,
+    config: &'a AuditConfig,
+    suppressions: &'a [Suppression],
+    source: &'a SourceLines,
+}
+
+impl NarrowingConversionVisitor<'_> {
+    fn infer_expr_int_type(&self, expr: &Expr) -> Option<IntTypeInfo> {
+        match expr {
+            Expr::Paren(p) => self.infer_expr_int_type(&p.expr),
+            Expr::Group(g) => self.infer_expr_int_type(&g.expr),
+            Expr::Path(p) => p
+                .path
+                .get_ident()
+                .and_then(|ident| self.bindings.get(&ident.unraw().to_string()).copied()),
+            Expr::Cast(cast) => parse_int_type(&cast.ty),
+            Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(lit),
+                ..
+            }) => {
+                let suffix = lit.suffix();
+                if suffix.is_empty() {
+                    None
+                } else {
+                    parse_int_type_name(suffix)
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for NarrowingConversionVisitor<'_> {
+    fn visit_local(&mut self, node: &'ast Local) {
+        if let Pat::Type(pat_type) = &node.pat {
+            if let Some(info) = parse_int_type(&pat_type.ty) {
+                if let Pat::Ident(ident) = &*pat_type.pat {
+                    self.bindings.insert(ident.ident.unraw().to_string(), info);
+                }
+            }
+        } else if let Pat::Ident(ident) = &node.pat {
+            if let Some(init) = &node.init {
+                if let Some(info) = self.infer_expr_int_type(&init.expr) {
+                    self.bindings.insert(ident.ident.unraw().to_string(), info);
+                }
+            }
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_expr_cast(&mut self, node: &'ast syn::ExprCast) {
+        if let Some(dst) = parse_int_type(&node.ty) {
+            let is_unsuffixed_fitting_lit = matches!(
+                &*node.expr,
+                Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(lit), .. })
+                    if lit.suffix().is_empty()
+                        && lit.base10_parse::<u128>().is_ok_and(|v| v <= dst.max_unsigned)
+            );
+            if !is_unsuffixed_fitting_lit {
+                let should_flag = match self.infer_expr_int_type(&node.expr) {
+                    Some(src) => is_narrowing_cast(src, dst),
+                    None => dst.bits < 128,
+                };
+                if should_flag {
+                    let line = line_of(node);
+                    let (_, end) = item_line_range(node);
+                    FindingEmitter {
+                        path: &self.path,
+                        fn_range: self.fn_range,
+                        findings: self.findings,
+                        config: self.config,
+                        suppressions: self.suppressions,
+                        source: self.source,
+                    }
+                    .emit(
+                        "unchecked-narrowing-conversion",
+                        line,
+                        Some(end),
+                        format!(
+                            "fn {} performs unchecked narrowing cast `as {}`; use try_into() or TryFrom to avoid silent truncation",
+                            self.fn_name, dst.name
+                        ),
+                    );
+                }
+            }
+        }
+        visit::visit_expr_cast(self, node);
+    }
+}
+
 impl I128ArithmeticVisitor<'_> {
     fn touches_i128(&self, expr: &Expr) -> bool {
         match expr {
@@ -3381,6 +3913,324 @@ impl I128ArithmeticVisitor<'_> {
 
 fn type_is_i128(ty: &Type) -> bool {
     matches!(ty, Type::Path(p) if p.path.get_ident().is_some_and(|ident| ident.unraw() == "i128"))
+}
+
+struct FindingEmitter<'a> {
+    path: &'a Path,
+    fn_range: (usize, usize),
+    findings: &'a mut Vec<Finding>,
+    config: &'a AuditConfig,
+    suppressions: &'a [Suppression],
+    source: &'a SourceLines,
+}
+
+impl FindingEmitter<'_> {
+    fn emit(&mut self, rule: &'static str, line: usize, end_line: Option<usize>, message: String) {
+        if is_finding_suppressed(self.suppressions, rule, line, Some(self.fn_range)) {
+            return;
+        }
+        let severity = self
+            .config
+            .rules
+            .get(rule)
+            .and_then(|r| r.severity.as_deref())
+            .unwrap_or("warning");
+        self.findings.push(Finding {
+            file: self.path.to_path_buf(),
+            line,
+            end_line: end_line.filter(|&end| end > line),
+            rule,
+            severity: severity.to_string(),
+            message,
+            source_snippet: self.source.get(line).cloned(),
+        });
+    }
+}
+
+const AMOUNT_STEMS: &[&str] = &[
+    "amount",
+    "amt",
+    "balance",
+    "fee",
+    "price",
+    "rate",
+    "reward",
+    "payout",
+    "share",
+    "deposit",
+    "withdraw",
+    "collateral",
+    "principal",
+    "interest",
+    "supply",
+    "total",
+    "reserve",
+    "mint",
+    "burn",
+    "swap",
+    "liquidity",
+];
+
+fn ident_is_amount_related(ident: &str) -> bool {
+    let lower = ident.to_ascii_lowercase();
+    AMOUNT_STEMS.iter().any(|stem| lower.contains(stem))
+}
+
+fn pat_touches_amount(pat: &Pat) -> bool {
+    match pat {
+        Pat::Ident(ident) => ident_is_amount_related(&ident.ident.unraw().to_string()),
+        Pat::Type(typed) => pat_touches_amount(&typed.pat),
+        Pat::Tuple(tuple) => tuple.elems.iter().any(pat_touches_amount),
+        Pat::Reference(r) => pat_touches_amount(&r.pat),
+        _ => false,
+    }
+}
+
+fn expr_touches_amount(expr: &Expr) -> bool {
+    match expr {
+        Expr::Path(path) => path
+            .path
+            .segments
+            .iter()
+            .any(|seg| ident_is_amount_related(&seg.ident.unraw().to_string())),
+        Expr::Field(field) => {
+            expr_touches_amount(&field.base)
+                || match &field.member {
+                    syn::Member::Named(ident) => ident_is_amount_related(&ident.unraw().to_string()),
+                    syn::Member::Unnamed(_) => false,
+                }
+        }
+        Expr::MethodCall(call) => {
+            ident_is_amount_related(&call.method.unraw().to_string())
+                || expr_touches_amount(&call.receiver)
+                || call.args.iter().any(expr_touches_amount)
+        }
+        Expr::Call(call) => {
+            expr_touches_amount(&call.func) || call.args.iter().any(expr_touches_amount)
+        }
+        Expr::Binary(bin) => expr_touches_amount(&bin.left) || expr_touches_amount(&bin.right),
+        Expr::Unary(un) => expr_touches_amount(&un.expr),
+        Expr::Cast(cast) => expr_touches_amount(&cast.expr),
+        Expr::Reference(r) => expr_touches_amount(&r.expr),
+        Expr::Index(idx) => expr_touches_amount(&idx.expr) || expr_touches_amount(&idx.index),
+        Expr::Paren(p) => expr_touches_amount(&p.expr),
+        Expr::Group(g) => expr_touches_amount(&g.expr),
+        _ => false,
+    }
+}
+
+fn is_nonzero_positive_int_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(p) => is_nonzero_positive_int_literal(&p.expr),
+        Expr::Group(g) => is_nonzero_positive_int_literal(&g.expr),
+        Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(lit),
+            ..
+        }) => lit.base10_parse::<u128>().is_ok_and(|v| v > 0),
+        _ => false,
+    }
+}
+
+struct AmountDivisionVisitor<'a> {
+    path: PathBuf,
+    fn_name: String,
+    fn_range: (usize, usize),
+    in_amount_local: bool,
+    findings: &'a mut Vec<Finding>,
+    config: &'a AuditConfig,
+    suppressions: &'a [Suppression],
+    source: &'a SourceLines,
+}
+
+impl<'ast> Visit<'ast> for AmountDivisionVisitor<'_> {
+    fn visit_local(&mut self, node: &'ast Local) {
+        let prev = self.in_amount_local;
+        if pat_touches_amount(&node.pat) {
+            self.in_amount_local = true;
+        }
+        visit::visit_local(self, node);
+        self.in_amount_local = prev;
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        let is_div = matches!(node.op, BinOp::Div(_) | BinOp::DivAssign(_));
+        if is_div
+            && !is_nonzero_positive_int_literal(&node.right)
+            && (self.in_amount_local
+                || expr_touches_amount(&node.left)
+                || expr_touches_amount(&node.right))
+        {
+            let line = line_of(node);
+            let (_, end) = item_line_range(node);
+            FindingEmitter {
+                path: &self.path,
+                fn_range: self.fn_range,
+                findings: self.findings,
+                config: self.config,
+                suppressions: self.suppressions,
+                source: self.source,
+            }
+            .emit(
+                "unchecked-amount-division",
+                line,
+                Some(end),
+                format!(
+                    "fn {} performs unchecked division in amount calculation; use checked_div() to handle division by zero and overflow",
+                    self.fn_name
+                ),
+            );
+        }
+        visit::visit_expr_binary(self, node);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IntTypeInfo {
+    name: &'static str,
+    bits: u8,
+    is_pointer_sized: bool,
+    max_unsigned: u128,
+}
+
+fn parse_int_type_name(name: &str) -> Option<IntTypeInfo> {
+    match name {
+        "u8" => Some(IntTypeInfo { name: "u8", bits: 8, is_pointer_sized: false, max_unsigned: u8::MAX as u128 }),
+        "i8" => Some(IntTypeInfo { name: "i8", bits: 8, is_pointer_sized: false, max_unsigned: i8::MAX as u128 }),
+        "u16" => Some(IntTypeInfo { name: "u16", bits: 16, is_pointer_sized: false, max_unsigned: u16::MAX as u128 }),
+        "i16" => Some(IntTypeInfo { name: "i16", bits: 16, is_pointer_sized: false, max_unsigned: i16::MAX as u128 }),
+        "u32" => Some(IntTypeInfo { name: "u32", bits: 32, is_pointer_sized: false, max_unsigned: u32::MAX as u128 }),
+        "i32" => Some(IntTypeInfo { name: "i32", bits: 32, is_pointer_sized: false, max_unsigned: i32::MAX as u128 }),
+        "u64" => Some(IntTypeInfo { name: "u64", bits: 64, is_pointer_sized: false, max_unsigned: u64::MAX as u128 }),
+        "i64" => Some(IntTypeInfo { name: "i64", bits: 64, is_pointer_sized: false, max_unsigned: i64::MAX as u128 }),
+        "u128" => Some(IntTypeInfo { name: "u128", bits: 128, is_pointer_sized: false, max_unsigned: u128::MAX }),
+        "i128" => Some(IntTypeInfo { name: "i128", bits: 128, is_pointer_sized: false, max_unsigned: i128::MAX as u128 }),
+        "usize" => Some(IntTypeInfo { name: "usize", bits: 32, is_pointer_sized: true, max_unsigned: u32::MAX as u128 }),
+        "isize" => Some(IntTypeInfo { name: "isize", bits: 32, is_pointer_sized: true, max_unsigned: i32::MAX as u128 }),
+        _ => None,
+    }
+}
+
+fn parse_int_type(ty: &Type) -> Option<IntTypeInfo> {
+    match ty {
+        Type::Reference(r) => parse_int_type(&r.elem),
+        Type::Group(g) => parse_int_type(&g.elem),
+        Type::Paren(p) => parse_int_type(&p.elem),
+        Type::Path(p) => p
+            .path
+            .get_ident()
+            .and_then(|ident| parse_int_type_name(&ident.unraw().to_string())),
+        _ => None,
+    }
+}
+
+fn is_narrowing_cast(src: IntTypeInfo, dst: IntTypeInfo) -> bool {
+    if src.is_pointer_sized && dst.is_pointer_sized {
+        return false;
+    }
+    if src.is_pointer_sized {
+        // On 64-bit targets `usize`/`isize` is 64 bits, so casting to <=32 bits narrows.
+        return dst.bits <= 32;
+    }
+    if dst.is_pointer_sized {
+        // On wasm32 (Soroban's target) `usize`/`isize` is 32 bits, so >=64 bits narrows.
+        return src.bits >= 64;
+    }
+    src.bits > dst.bits
+}
+
+struct NarrowingConversionVisitor<'a> {
+    path: PathBuf,
+    fn_name: String,
+    fn_range: (usize, usize),
+    bindings: HashMap<String, IntTypeInfo>,
+    findings: &'a mut Vec<Finding>,
+    config: &'a AuditConfig,
+    suppressions: &'a [Suppression],
+    source: &'a SourceLines,
+}
+
+impl NarrowingConversionVisitor<'_> {
+    fn infer_expr_int_type(&self, expr: &Expr) -> Option<IntTypeInfo> {
+        match expr {
+            Expr::Paren(p) => self.infer_expr_int_type(&p.expr),
+            Expr::Group(g) => self.infer_expr_int_type(&g.expr),
+            Expr::Path(p) => p
+                .path
+                .get_ident()
+                .and_then(|ident| self.bindings.get(&ident.unraw().to_string()).copied()),
+            Expr::Cast(cast) => parse_int_type(&cast.ty),
+            Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(lit),
+                ..
+            }) => {
+                let suffix = lit.suffix();
+                if suffix.is_empty() {
+                    None
+                } else {
+                    parse_int_type_name(suffix)
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for NarrowingConversionVisitor<'_> {
+    fn visit_local(&mut self, node: &'ast Local) {
+        if let Pat::Type(pat_type) = &node.pat {
+            if let Some(info) = parse_int_type(&pat_type.ty) {
+                if let Pat::Ident(ident) = &*pat_type.pat {
+                    self.bindings.insert(ident.ident.unraw().to_string(), info);
+                }
+            }
+        } else if let Pat::Ident(ident) = &node.pat {
+            if let Some(init) = &node.init {
+                if let Some(info) = self.infer_expr_int_type(&init.expr) {
+                    self.bindings.insert(ident.ident.unraw().to_string(), info);
+                }
+            }
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_expr_cast(&mut self, node: &'ast syn::ExprCast) {
+        if let Some(dst) = parse_int_type(&node.ty) {
+            let is_unsuffixed_fitting_lit = matches!(
+                &*node.expr,
+                Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(lit), .. })
+                    if lit.suffix().is_empty()
+                        && lit.base10_parse::<u128>().is_ok_and(|v| v <= dst.max_unsigned)
+            );
+            if !is_unsuffixed_fitting_lit {
+                let should_flag = match self.infer_expr_int_type(&node.expr) {
+                    Some(src) => is_narrowing_cast(src, dst),
+                    None => dst.bits < 128,
+                };
+                if should_flag {
+                    let line = line_of(node);
+                    let (_, end) = item_line_range(node);
+                    FindingEmitter {
+                        path: &self.path,
+                        fn_range: self.fn_range,
+                        findings: self.findings,
+                        config: self.config,
+                        suppressions: self.suppressions,
+                        source: self.source,
+                    }
+                    .emit(
+                        "unchecked-narrowing-conversion",
+                        line,
+                        Some(end),
+                        format!(
+                            "fn {} performs unchecked narrowing cast `as {}`; use try_into() or TryFrom to avoid silent truncation",
+                            self.fn_name, dst.name
+                        ),
+                    );
+                }
+            }
+        }
+        visit::visit_expr_cast(self, node);
+    }
 }
 
 #[cfg(test)]
@@ -3807,13 +4657,9 @@ mod tests {
     fn json_report_lists_parser_limitations_apart_from_findings() {
         let findings = audit_source_for_test("pub fn deposit(amount: i128) { save(amount); }");
         let limitations = vec!["failed to parse Rust source broken.rs:1:8".to_string()];
-        let output = render_findings_with_limitations(
-            &findings,
-            AuditOutputFormat::Json,
-            &limitations,
-            1,
-        )
-        .unwrap();
+        let output =
+            render_findings_with_limitations(&findings, AuditOutputFormat::Json, &limitations, 1)
+                .unwrap();
         let report: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(report["summary"]["finding_count"], findings.len());
         assert_eq!(report["findings"].as_array().unwrap().len(), findings.len());
@@ -4174,18 +5020,34 @@ mod tests {
         let colored = renderer.render_text_colored(true);
         let plain = renderer.render_text_colored(false);
 
-        assert!(colored.contains("\x1b["), "colored text must contain ANSI escape codes");
-        assert!(!plain.contains("\x1b["), "plain text must not contain ANSI escape codes");
+        assert!(
+            colored.contains("\x1b["),
+            "colored text must contain ANSI escape codes"
+        );
+        assert!(
+            !plain.contains("\x1b["),
+            "plain text must not contain ANSI escape codes"
+        );
 
         let summary_colored = renderer.render_text_summary_colored(true);
         let summary_plain = renderer.render_text_summary_colored(false);
 
-        assert!(summary_colored.contains("\x1b["), "colored summary must contain ANSI escape codes");
-        assert!(!summary_plain.contains("\x1b["), "plain summary must not contain ANSI escape codes");
+        assert!(
+            summary_colored.contains("\x1b["),
+            "colored summary must contain ANSI escape codes"
+        );
+        assert!(
+            !summary_plain.contains("\x1b["),
+            "plain summary must not contain ANSI escape codes"
+        );
 
         let empty_renderer = DiagnosticRenderer::new(&[]);
-        assert!(empty_renderer.render_text_summary_colored(true).contains("\x1b["));
-        assert!(!empty_renderer.render_text_summary_colored(false).contains("\x1b["));
+        assert!(empty_renderer
+            .render_text_summary_colored(true)
+            .contains("\x1b["));
+        assert!(!empty_renderer
+            .render_text_summary_colored(false)
+            .contains("\x1b["));
     }
 
     #[test]
@@ -4215,18 +5077,32 @@ mod tests {
 
         // "hello!" is 6. Total = 36. At width 35, it wraps!
         let one_over = wrap_finding_message(prefix, "hello!", Some(35));
-        assert_eq!(one_over.lines().count(), 2, "one over must wrap: {one_over}");
+        assert_eq!(
+            one_over.lines().count(),
+            2,
+            "one over must wrap: {one_over}"
+        );
 
         // Unbreakable token longer than width is not split
         let long_token = "verylongunbreakabletokenlongerthanwidth";
         let wrapped_token = wrap_finding_message(prefix, long_token, Some(25));
-        assert!(wrapped_token.contains(long_token), "token must not be split: {wrapped_token}");
+        assert!(
+            wrapped_token.contains(long_token),
+            "token must not be split: {wrapped_token}"
+        );
 
         // Width smaller than prefix
         let small_width = wrap_finding_message(prefix, "a b c", Some(20));
         let lines: Vec<_> = small_width.lines().collect();
-        assert_eq!(lines[0], prefix.trim_end(), "prefix must remain intact on line 1");
-        assert!(lines[1].starts_with("    "), "continuation line must be indented");
+        assert_eq!(
+            lines[0],
+            prefix.trim_end(),
+            "prefix must remain intact on line 1"
+        );
+        assert!(
+            lines[1].starts_with("    "),
+            "continuation line must be indented"
+        );
 
         // Colored prefix wraps at identical word boundaries
         let colored_prefix = "\x1b[1msrc/lib.rs:1:\x1b[0m \x1b[1;33m[warning]\x1b[0m rule: ";
@@ -4262,7 +5138,11 @@ mod tests {
                 rule.id
             );
             for lim in rule.limitations {
-                assert!(!lim.trim().is_empty(), "rule {} has empty limitation string", rule.id);
+                assert!(
+                    !lim.trim().is_empty(),
+                    "rule {} has empty limitation string",
+                    rule.id
+                );
             }
         }
     }
@@ -4376,7 +5256,9 @@ mod tests {
             assert!(!json_rule["remediation"].as_str().unwrap().is_empty());
             assert!(!json_rule["limitations"].as_array().unwrap().is_empty());
             assert_eq!(
-                sarif_rule["defaultConfiguration"]["level"].as_str().unwrap(),
+                sarif_rule["defaultConfiguration"]["level"]
+                    .as_str()
+                    .unwrap(),
                 sarif_level(json_rule["severity"].as_str().unwrap())
             );
         }
@@ -4406,5 +5288,212 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unchecked_amount_division_detects_positive_negative_and_edge_cases() {
+        // Positive: variable divisor in amount calculation
+        let findings = audit_source_for_test(
+            "pub fn share(amount: u64, total_shares: u64) -> u64 { amount / total_shares }",
+        );
+        assert!(
+            findings.iter().any(|f| f.rule == "unchecked-amount-division"),
+            "expected unchecked-amount-division finding: {findings:?}"
+        );
+
+        // Positive: compound division assignment and division by zero literal
+        let div_assign = audit_source_for_test(
+            "pub fn split(mut balance: u64, n: u64) -> u64 { balance /= n; balance }",
+        );
+        assert!(div_assign
+            .iter()
+            .any(|f| f.rule == "unchecked-amount-division"));
+
+        let div_zero = audit_source_for_test("pub fn zero(amount: u64) -> u64 { amount / 0 }");
+        assert!(div_zero
+            .iter()
+            .any(|f| f.rule == "unchecked-amount-division"));
+
+        // Positive: local binding named fee with non-amount operands
+        let local_fee =
+            audit_source_for_test("pub fn calc(x: u64, y: u64) -> u64 { let fee = x / y; fee }");
+        assert!(local_fee
+            .iter()
+            .any(|f| f.rule == "unchecked-amount-division"));
+
+        // Negative: checked_div, non-zero positive literal divisor, and non-amount division
+        let checked = audit_source_for_test(
+            "pub fn share(amount: u64, total_shares: u64) -> Option<u64> { amount.checked_div(total_shares) }",
+        );
+        assert!(!checked
+            .iter()
+            .any(|f| f.rule == "unchecked-amount-division"));
+
+        let nonzero_lit =
+            audit_source_for_test("pub fn half(amount: u64) -> u64 { amount / 2 }");
+        assert!(!nonzero_lit
+            .iter()
+            .any(|f| f.rule == "unchecked-amount-division"));
+
+        let unrelated = audit_source_for_test("pub fn ratio(a: u64, b: u64) -> u64 { a / b }");
+        assert!(!unrelated
+            .iter()
+            .any(|f| f.rule == "unchecked-amount-division"));
+    }
+
+    #[test]
+    fn unchecked_narrowing_conversion_detects_positive_negative_and_edge_cases() {
+        // Positive: explicit narrowing from wider parameter and local binding
+        let narrowing = audit_source_for_test("pub fn shrink(amount: u128) -> u64 { amount as u64 }");
+        assert!(
+            narrowing
+                .iter()
+                .any(|f| f.rule == "unchecked-narrowing-conversion"),
+            "expected unchecked-narrowing-conversion finding: {narrowing:?}"
+        );
+
+        let local_narrowing = audit_source_for_test(
+            "pub fn shrink_local() -> u32 { let big: u64 = 100; big as u32 }",
+        );
+        assert!(local_narrowing
+            .iter()
+            .any(|f| f.rule == "unchecked-narrowing-conversion"));
+
+        // Positive: overflowing unsuffixed literal cast
+        let overflow_lit = audit_source_for_test("pub fn bad_lit() -> u8 { 300 as u8 }");
+        assert!(overflow_lit
+            .iter()
+            .any(|f| f.rule == "unchecked-narrowing-conversion"));
+
+        // Negative: widening cast, same-width cast, fitting unsuffixed literal, and try_into()
+        let widening = audit_source_for_test("pub fn widen(x: u32) -> u128 { x as u128 }");
+        assert!(!widening
+            .iter()
+            .any(|f| f.rule == "unchecked-narrowing-conversion"));
+
+        let same_width = audit_source_for_test("pub fn same(x: u64) -> u64 { x as u64 }");
+        assert!(!same_width
+            .iter()
+            .any(|f| f.rule == "unchecked-narrowing-conversion"));
+
+        let fitting_lit = audit_source_for_test("pub fn ok_lit() -> u32 { 42 as u32 }");
+        assert!(!fitting_lit
+            .iter()
+            .any(|f| f.rule == "unchecked-narrowing-conversion"));
+
+        let checked = audit_source_for_test(
+            "pub fn safe(amount: u128) -> Result<u64, ()> { amount.try_into().map_err(|_| ()) }",
+        );
+        assert!(!checked
+            .iter()
+            .any(|f| f.rule == "unchecked-narrowing-conversion"));
+    }
+
+    #[test]
+    fn ignored_contract_call_result_detects_positive_negative_and_edge_cases() {
+        // Positive: bare semicolon-terminated try_invoke_contract and client.try_*
+        let bare = audit_source_for_test(
+            "pub fn call_it(env: Env, id: Address) { env.try_invoke_contract(&id, &sym, args); }",
+        );
+        assert!(
+            bare.iter()
+                .any(|f| f.rule == "ignored-contract-call-result"),
+            "expected ignored-contract-call-result finding: {bare:?}"
+        );
+
+        let wildcard = audit_source_for_test(
+            "pub fn swap_it(client: PoolClient) { let _ = client.try_swap(&100); }",
+        );
+        assert!(wildcard
+            .iter()
+            .any(|f| f.rule == "ignored-contract-call-result"));
+
+        let ok_discarded = audit_source_for_test(
+            "pub fn swap_ok(client: PoolClient) { client.try_swap(&100).ok(); }",
+        );
+        assert!(ok_discarded
+            .iter()
+            .any(|f| f.rule == "ignored-contract-call-result"));
+
+        // Negative: propagated with ?, bound to variable, returned as tail expr, or std try_into
+        let propagated = audit_source_for_test(
+            "pub fn swap_prop(client: PoolClient) -> Result<(), ()> { client.try_swap(&100)?; Ok(()) }",
+        );
+        assert!(!propagated
+            .iter()
+            .any(|f| f.rule == "ignored-contract-call-result"));
+
+        let bound = audit_source_for_test(
+            "pub fn swap_bound(client: PoolClient) { let res = client.try_swap(&100); res.unwrap(); }",
+        );
+        assert!(!bound
+            .iter()
+            .any(|f| f.rule == "ignored-contract-call-result"));
+
+        let tail_return = audit_source_for_test(
+            "pub fn swap_ret(client: PoolClient) -> Result<(), ()> { client.try_swap(&100) }",
+        );
+        assert!(!tail_return
+            .iter()
+            .any(|f| f.rule == "ignored-contract-call-result"));
+
+        // Edge: try_transfer is handled by ignored-token-transfer-result, not double-reported
+        let transfer = audit_source_for_test(
+            "pub fn pay(token: TokenClient) { token.try_transfer(&a, &b, &1); }",
+        );
+        assert!(!transfer
+            .iter()
+            .any(|f| f.rule == "ignored-contract-call-result"));
+    }
+
+    #[test]
+    fn storage_write_missing_ttl_detects_positive_negative_and_edge_cases() {
+        // Positive: persistent and temporary writes without extend_ttl
+        let persistent_write = audit_source_for_test(
+            "pub fn save(env: Env, k: Symbol, v: i128) { env.storage().persistent().set(&k, &v); }",
+        );
+        assert!(
+            persistent_write
+                .iter()
+                .any(|f| f.rule == "storage-write-missing-ttl"),
+            "expected storage-write-missing-ttl finding: {persistent_write:?}"
+        );
+
+        let temp_update = audit_source_for_test(
+            "pub fn upd(env: Env, k: Symbol) { let t = env.storage().temporary(); t.update(&k, |v| v); }",
+        );
+        assert!(temp_update
+            .iter()
+            .any(|f| f.rule == "storage-write-missing-ttl"));
+
+        // Positive (tier mismatch): persistent write with only temporary extend_ttl
+        let tier_mismatch = audit_source_for_test(
+            "pub fn mismatch(env: Env, k: Symbol, v: i128) { env.storage().persistent().set(&k, &v); env.storage().temporary().extend_ttl(&k, 1, 2); }",
+        );
+        assert!(tier_mismatch
+            .iter()
+            .any(|f| f.rule == "storage-write-missing-ttl"));
+
+        // Negative: matching extend_ttl on chained call or bound handle, and instance storage
+        let with_ttl = audit_source_for_test(
+            "pub fn save_ok(env: Env, k: Symbol, v: i128) { env.storage().persistent().set(&k, &v); env.storage().persistent().extend_ttl(&k, 100, 1000); }",
+        );
+        assert!(!with_ttl
+            .iter()
+            .any(|f| f.rule == "storage-write-missing-ttl"));
+
+        let bound_with_ttl = audit_source_for_test(
+            "pub fn save_bound(env: Env, k: Symbol, v: i128) { let p = env.storage().persistent(); p.set(&k, &v); p.extend_ttl(&k, 100, 1000); }",
+        );
+        assert!(!bound_with_ttl
+            .iter()
+            .any(|f| f.rule == "storage-write-missing-ttl"));
+
+        let instance_write = audit_source_for_test(
+            "pub fn save_inst(env: Env, k: Symbol, v: i128) { env.storage().instance().set(&k, &v); }",
+        );
+        assert!(!instance_write
+            .iter()
+            .any(|f| f.rule == "storage-write-missing-ttl"));
     }
 }
